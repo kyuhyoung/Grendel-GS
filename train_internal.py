@@ -374,15 +374,23 @@ def training_report(
     ):
         testing_iterations.pop(0)
         utils.print_rank_0("\n[ITER {}] Start Testing".format(iteration))
-
-        validation_configs = (
-            {"name": "test", "cameras": scene.getTestCameras(), "num_cameras": len(scene.getTestCameras())},
-            {
-                "name": "train",
-                "cameras": scene.getTrainCameras(),
-                "num_cameras": max(len(scene.getTrainCameras()) // args.llffhold, args.bsz),
-            },
-        )
+        if scene.getTestCameras() is None:
+            validation_configs = (
+                {
+                    "name": "train",
+                    "cameras": scene.getTrainCameras(),
+                    "num_cameras": max(len(scene.getTrainCameras()) // args.llffhold, args.bsz),
+                }
+            )
+        else:
+            validation_configs = (
+                {"name": "test", "cameras": scene.getTestCameras(), "num_cameras": len(scene.getTestCameras())},
+                {
+                    "name": "train",
+                    "cameras": scene.getTrainCameras(),
+                    "num_cameras": max(len(scene.getTrainCameras()) // args.llffhold, args.bsz),
+                },
+            )
 
         # init workload division strategy
         for config in validation_configs:
