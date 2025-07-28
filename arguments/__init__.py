@@ -69,7 +69,8 @@ class AuxiliaryParams(ParamGroup):
         #self.save_iterations = [7_000, 30_000]
         self.save_iterations = [100, 500, 1_000, 2_000, 4_000, 7_000, 12_000, 20_000, 30_000, 50_000, 80_000, 120_000]
         self.quiet = False
-        self.checkpoint_iterations = []
+        #self.checkpoint_iterations = []
+        self.checkpoint_iterations = self.save_iterations 
         self.start_checkpoint = ""
         self.auto_start_checkpoint = False
         self.log_folder = "/tmp/gaussian_splatting"
