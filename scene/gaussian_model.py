@@ -422,7 +422,9 @@ class GaussianModel:
         _xyz = _features_dc = _features_rest = _opacity = _scaling = _rotation = None
         utils.log_cpu_memory_usage("start save_ply")
         group = utils.DEFAULT_GROUP
+        #print(f'args.distributed_save : {args.distributed_save}');  exit(1) 
         if args.gaussians_distribution and not args.distributed_save:
+            #print('aaa')
             # gather all gaussians at rank 0
             def gather_uneven_tensors(tensor):
                 # gather size of tensors on different ranks
@@ -471,6 +473,7 @@ class GaussianModel:
                 return
 
         elif args.gaussians_distribution and args.distributed_save:
+            #print('bbb')
             assert (
                 utils.DEFAULT_GROUP.size() > 1
             ), "distributed_save should be used with more than 1 rank."
@@ -490,6 +493,7 @@ class GaussianModel:
                     + ".ply"
                 )
         elif not args.gaussians_distribution:
+            #print('ccc')
             if group.rank() != 0:
                 return
             _xyz = self._xyz
@@ -508,6 +512,7 @@ class GaussianModel:
                     + ".ply"
                 )
 
+        #exit(1)
         mkdir_p(os.path.dirname(path))
 
         xyz = _xyz.detach().cpu().numpy()

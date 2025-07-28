@@ -32,7 +32,7 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
     log_file = get_log_file()
     resolution = orig_w, orig_h
     # NOTE: we do not support downsampling here.
-
+    #print(f'args.distributed_dataset_storage : {args.distributed_dataset_storage}');    exit(1) 
     # may use cam_info.uid
     if (
         (

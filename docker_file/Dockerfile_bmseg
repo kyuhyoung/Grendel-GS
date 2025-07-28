@@ -1,0 +1,37 @@
+# Use a Miniconda base image
+FROM continuumio/miniconda3
+
+# Set non-interactive mode to avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git fish && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates gnupg && rm -rf /var/lib/apt/lists/*
+
+RUN wget -qO cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && dpkg -i cuda-keyring.deb && rm cuda-keyring.deb   # keyring 설치 후 .deb 파일 삭제 :contentReference[oaicite:0]{index=0}
+
+# 3) CUDA APT 레포가 신뢰된 상태가 되었으니 툴킷 설치
+RUN apt-get update && apt-get install -y --no-install-recommends cuda-toolkit-12-4 && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y libtiff-dev zlib1g-dev
+
+# 4) 환경 변수 설정
+ENV CUDA_HOME=/usr/local/cuda-12.4
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+
+COPY requirements.yml /tmp/requirements.yml
+
+RUN conda env create --file /tmp/requirements.yml
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1-mesa-glx potrace && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y libglm-dev
+
+RUN echo ". activate SEG_Env" >> ~/.bashrc
+#RUN apt install -y xvfb
+
+# Set the default shell to bash and activate Conda environment
+SHELL ["/bin/bash", "-c", "source activate SEG_Env && bash"]
+RUN conda init bash && conda info --envs

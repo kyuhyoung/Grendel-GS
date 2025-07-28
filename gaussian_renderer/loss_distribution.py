@@ -2549,7 +2549,7 @@ def final_system_loss_computation(
         strategy.division_pos[rank + 1],
     )
     coverage_min_y, coverage_max_y = get_coverage_y_min_max(tile_ids_l, tile_ids_r)
-
+    #print(f'coverage_min_y : {coverage_min_y}, coverage_max_y : {coverage_max_y}');
     local_image_rect = image[:, coverage_min_y:coverage_max_y, :].contiguous()
     local_image_rect_pixels_compute_locally = torch.ones(
         (coverage_max_y - coverage_min_y, utils.IMG_W), dtype=torch.bool, device="cuda"
@@ -2592,6 +2592,15 @@ def batched_loss_computation(
     batched_strategies,
     batched_statistic_collector,
 ):
+    '''
+    print(f'len(batched_image) : {len(batched_image)}');    #exit(1)    #   4   #   1
+    for iI, im in enumerate(batched_image):
+        print(f'iI : {iI}, type(im) : {type(im)}')
+        if im is not None:
+            print(f'iI : {iI}, im.shape : {im.shape}, batched_cameras[iI].original_image.shape : {batched_cameras[iI].original_image.shape}')
+            # iI : 0, im.shape : torch.Size([3, 17310, 11310]), batched_cameras[iI].original_image.shape : torch.Size([3, 5774, 11310])
+    exit(1)       
+    '''
     args = utils.get_args()
     timers = utils.get_timers()
 
@@ -2621,6 +2630,10 @@ def batched_loss_computation(
             loss = image * 0
             batched_losses.append([loss, 0.0])
         else:
+            '''
+            print(f'idx : {idx}, image.shape : {image.shape}, camera.original_image.shape : {camera.original_image.shape}')
+            #idx : 0, image.shape : torch.Size([3, 17310, 11310]), camera.original_image.shape : torch.Size([3, 5776, 11310])
+            '''
             Ll1, ssim_loss = final_system_loss_computation(
                 image, camera, compute_locally, strategy, statistic_collector
             )
@@ -2630,6 +2643,7 @@ def batched_loss_computation(
             # print(f"ssim_loss: {1-ssim_loss}")
 
             batched_losses.append([Ll1, ssim_loss])
+        #exit(1)
         loss_sum += loss
 
     assert loss_sum.dim() == 0, "The loss_sum must be a scalar tensor."

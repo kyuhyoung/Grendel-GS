@@ -96,8 +96,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         start_from_this_iteration, opt_args.iterations + 1, args.bsz
     ):
         # Step Initialization
+        '''
         if iteration // args.bsz % 30 == 0:
             progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+        '''
+        if iteration > 0:
+            progress_bar.set_postfix({
+            "#G": f"{len(gaussians.get_xyz)}",
+            "Loss": f"{ema_loss_for_log:.{4}f}"
+            })
         progress_bar.update(args.bsz)
         utils.set_cur_iter(iteration)
         gaussians.update_learning_rate(iteration)
@@ -110,6 +117,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             gaussians.oneupSHdegree()
 
         # Prepare data: Pick random Cameras for training
+        #print(f'args.local_sampling : {args.local_sampling}');    exit(1)
         if args.local_sampling:
             assert (
                 args.bsz % utils.WORLD_SIZE == 0
@@ -147,7 +155,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 batched_cameras, batched_strategies, gpuid2tasks
             )
             timers.stop("load_cameras")
-
+        #print(f'args.backend : {args.backend}');    exit(1)
         if args.backend == "gsplat":
             batched_screenspace_pkg = (
                 gsplat_distributed_preprocess3dgs_and_all2all_final(
@@ -355,6 +363,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 def training_report(
     iteration, l1_loss, testing_iterations, scene: Scene, pipe_args, background, backend
 ):
+    #print(f'backend : {backend}');  exit(1)
     args = utils.get_args()
     log_file = utils.get_log_file()
     # Report test and samples of training set

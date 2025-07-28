@@ -12,7 +12,12 @@
 import os
 import sys
 import glob
+import warnings
 from PIL import Image
+
+warnings.filterwarnings("ignore", "(Possibly )?[Cc]orrupt EXIF data", UserWarning)
+Image.MAX_IMAGE_PIXELS = None
+
 from typing import NamedTuple
 from scene.colmap_loader import (
     read_extrinsics_text,
@@ -92,6 +97,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
+        #print(f'intr.params : {intr.params}');  exit(1)
         height = intr.height
         width = intr.width
 
@@ -113,6 +119,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
             FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+        elif intr.model == "RADIAL":
+            focal_length_x = intr.params[0]
+            FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         else:
             assert (
@@ -191,16 +201,52 @@ def storePly(path, xyz, rgb):
 
 
 def readColmapSceneInfo(path, images, eval, llffhold=10):
-    try:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
-        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-    except:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
-        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+
+    cameras_ext_bin = os.path.join(path, "sparse/0", "images.bin")
+    cameras_int_bin = os.path.join(path, "sparse/0", "cameras.bin")
+    has_binary = (os.path.exists(cameras_ext_bin) and os.path.exists(cameras_int_file))
+
+    cameras_ext_txt = os.path.join(path, "sparse/0", "images.txt")
+    cameras_int_txt = os.path.join(path, "sparse/0", "cameras.txt")
+
+    # 텍스트 파일 존재 여부 확인
+    has_text = (os.path.exists(cameras_ext_txt) and os.path.exists(cameras_int_txt))
+
+    if has_binary:
+        try:
+            print("Loading binary COLMAP files...")
+            cam_extrinsics = read_extrinsics_binary(cameras_ext_bin)
+            cam_intrinsics = read_intrinsics_binary(cameras_int_bin)
+            '''
+            if os.path.exists(points3D_file):
+                points3D = read_points3D_binary(points3D_file)
+            else:
+                points3D = {}
+            '''    
+        except Exception as e:
+            print(f"Failed to load binary files: {e}")
+            if has_text:
+                print("Falling back to text files...")
+                has_binary = False
+            else:
+                raise Exception("Binary files failed and no text files available")
+
+
+    if not has_binary and has_text:
+        try:
+            print("Loading text COLMAP files...")
+            cam_extrinsics = read_extrinsics_text(cameras_ext_txt)
+            cam_intrinsics = read_intrinsics_text(cameras_int_txt)
+            '''
+            if os.path.exists(points3D_file_txt):
+                points3D = read_points3D_text(points3D_file_txt)
+            else:
+                points3D = {}
+            '''    
+        except Exception as e:
+            print(f"Failed to load text files: {e}")
+            raise
+
 
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(

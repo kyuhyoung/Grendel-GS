@@ -66,7 +66,8 @@ class AuxiliaryParams(ParamGroup):
         self.debug_from = -1
         self.detect_anomaly = False
         self.test_iterations = [7_000, 30_000]
-        self.save_iterations = [7_000, 30_000]
+        #self.save_iterations = [7_000, 30_000]
+        self.save_iterations = [100, 500, 1_000, 2_000, 4_000, 7_000, 12_000, 20_000, 30_000, 50_000, 80_000, 120_000]
         self.quiet = False
         self.checkpoint_iterations = []
         self.start_checkpoint = ""
@@ -106,7 +107,8 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        #self.iterations = 30_000
+        self.iterations = 130_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -121,8 +123,10 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
-        self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
+        #self.densify_from_iter = 500
+        self.densify_from_iter = 50
+        #self.densify_until_iter = 15_000
+        self.densify_until_iter = 150_000
         self.densify_grad_threshold = 0.0002
         self.densify_memory_limit_percentage = 0.9
         self.disable_auto_densification = False
@@ -159,8 +163,10 @@ class DistributionParams(ParamGroup):
         # Dataset and Model save
         self.bsz = 1  # batch size.
         self.distributed_dataset_storage = True  # if True, we store dataset only on rank 0 and broadcast to other ranks.
-        self.distributed_save = True
-        self.local_sampling = False
+        #self.distributed_save = True
+        self.distributed_save = False
+        self.local_sampling = False #   ori
+        #self.local_sampling = True
         self.preload_dataset_to_gpu = (
             False  # By default, we do not preload dataset to GPU.
         )
@@ -284,6 +290,7 @@ def init_args(args):
         args.start_checkpoint = find_latest_checkpoint(args.log_folder)
 
     if utils.DEFAULT_GROUP.size() == 1:
+        #print('aaa')
         args.gaussians_distribution = False
         args.image_distribution = False
         args.image_distribution_mode = ""
@@ -292,17 +299,20 @@ def init_args(args):
         args.local_sampling = False
 
     if args.preload_dataset_to_gpu:
+        #print('bbb')
         args.distributed_dataset_storage = False
         args.local_sampling = False
         # TODO: args.preload_dataset_to_gpu should be independent of args.local_sampling and args.distributed_dataset_storage
         # We can distributedly save dataset and preload every shard to GPU at the same time.
 
     if args.local_sampling:
+        #print('ccc')
         assert args.distributed_dataset_storage, "local_sampling works only when distributed_dataset_storage==True"
 
     if not args.gaussians_distribution:
+        #print('ddd')
         args.distributed_save = False
-
+    #print('eee')    exit(1)
     # sort test_iterations
     args.test_iterations.sort()
     args.save_iterations.sort()

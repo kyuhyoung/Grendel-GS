@@ -32,6 +32,7 @@ class Scene:
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
+        #print(f'self.model_path : {self.model_path}');  exit(1)
         self.loaded_iter = None
         self.gaussians = gaussians
         log_file = utils.get_log_file()
@@ -107,9 +108,10 @@ class Scene:
             / 1e9
         )
         log_file.write(f"Dataset size: {dataset_size_in_GB} GB\n")
-        if (
-            dataset_size_in_GB < args.preload_dataset_to_gpu_threshold
-        ):  # 10GB memory limit for dataset
+            
+        #print(f'dataset_size_in_GB : {dataset_size_in_GB}, args.preload_dataset_to_gpu_threshold : {args.preload_dataset_to_gpu_threshold}'); exit(1)
+
+        if dataset_size_in_GB < args.preload_dataset_to_gpu_threshold:  # 10GB memory limit for dataset
             log_file.write(
                 f"[NOTE]: Preloading dataset({dataset_size_in_GB}GB) to GPU. Disable local_sampling and distributed_dataset_storage.\n"
             )

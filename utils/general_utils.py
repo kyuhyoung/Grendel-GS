@@ -342,7 +342,7 @@ def check_memory_usage(log_file, args, iteration, gaussians, before_densificatio
             log_file.write(
                 "Reserved Memory usage is reaching the upper bound of GPU memory. stop densification.\n"
             )
-            args.disable_auto_densification = True
+            #args.disable_auto_densification = True
 
 
 def PILtoTorch(pil_image, resolution, args, log_file, decompressed_image=None):

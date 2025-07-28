@@ -89,7 +89,10 @@ def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
     args = utils.get_args()
     timers = utils.get_timers()
     log_file = utils.get_log_file()
-
+    '''
+    print(f'args.disable_auto_densification : {args.disable_auto_densification}')  
+    print(f'iteration : {iteration} / {args.densify_from_iter} ~ {args.densify_until_iter}');  exit(1)
+    '''
     # Densification
     if not args.disable_auto_densification and iteration <= args.densify_until_iter:
         # Keep track of max radii in image-space for pruning
