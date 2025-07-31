@@ -100,9 +100,14 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if iteration // args.bsz % 30 == 0:
             progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
         '''
+        n_gauss = len(gaussians.get_xyz)
+        '''
+        if n_gauss > args.n_g_per_proc:
+            args.disable_auto_densification = True
+        '''
         if iteration > 0:
             progress_bar.set_postfix({
-            "#G": f"{len(gaussians.get_xyz)}",
+            "#G": f"{n_gauss}/{args.n_g_per_proc}",
             "Loss": f"{ema_loss_for_log:.{4}f}"
             })
         progress_bar.update(args.bsz)
@@ -259,12 +264,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             end2end_timers.start()
 
             # Densification
+            #print(f'n_gauss : {n_gauss}, args.n_g_per_proc : {args.n_g_per_proc}'); exit(1)
+            #if n_gauss <= args.n_g_per_proc:
             if args.backend == "gsplat":
-                gsplat_densification(
-                    iteration, scene, gaussians, batched_screenspace_pkg
-                )
+                gsplat_densification(iteration, scene, gaussians, args.n_g_per_proc, batched_screenspace_pkg)
             else:
-                densification(iteration, scene, gaussians, batched_screenspace_pkg)
+                densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
 
             # Save Gaussians
             if any(
@@ -277,7 +282,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 end2end_timers.print_time(log_file, iteration + args.bsz)
                 utils.print_rank_0("\n[ITER {}] Saving Gaussians".format(iteration))
                 log_file.write("[ITER {}] Saving Gaussians\n".format(iteration))
-                scene.save(iteration)
+                scene.save(iteration, ema_loss_for_log)
 
                 if args.save_strategy_history:
                     with open(
@@ -363,6 +368,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 def training_report(
     iteration, l1_loss, testing_iterations, scene: Scene, pipe_args, background, backend
 ):
+
+    if scene.getTestCameras() is None:
+        return
+ 
+
     #print(f'backend : {backend}');  exit(1)
     args = utils.get_args()
     log_file = utils.get_log_file()
@@ -374,23 +384,14 @@ def training_report(
     ):
         testing_iterations.pop(0)
         utils.print_rank_0("\n[ITER {}] Start Testing".format(iteration))
-        if scene.getTestCameras() is None:
-            validation_configs = (
-                {
-                    "name": "train",
-                    "cameras": scene.getTrainCameras(),
-                    "num_cameras": max(len(scene.getTrainCameras()) // args.llffhold, args.bsz),
-                }
-            )
-        else:
-            validation_configs = (
-                {"name": "test", "cameras": scene.getTestCameras(), "num_cameras": len(scene.getTestCameras())},
-                {
-                    "name": "train",
-                    "cameras": scene.getTrainCameras(),
-                    "num_cameras": max(len(scene.getTrainCameras()) // args.llffhold, args.bsz),
-                },
-            )
+        validation_configs = (
+            {"name": "test", "cameras": scene.getTestCameras(), "num_cameras": len(scene.getTestCameras())},
+            {
+                "name": "train",
+                "cameras": scene.getTrainCameras(),
+                "num_cameras": max(len(scene.getTrainCameras()) // args.llffhold, args.bsz),
+            },
+        )
 
         # init workload division strategy
         for config in validation_configs:

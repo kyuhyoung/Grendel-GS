@@ -67,7 +67,7 @@ class AuxiliaryParams(ParamGroup):
         self.detect_anomaly = False
         self.test_iterations = [7_000, 30_000]
         #self.save_iterations = [7_000, 30_000]
-        self.save_iterations = [100, 500, 1_000, 2_000, 4_000, 7_000, 12_000, 20_000, 30_000, 50_000, 80_000, 120_000]
+        self.save_iterations = [50, 500, 1_000, 2_000, 4_000, 7_000, 12_000, 20_000, 30_000, 50_000, 80_000, 120_000]
         self.quiet = False
         #self.checkpoint_iterations = []
         self.checkpoint_iterations = self.save_iterations 
@@ -122,6 +122,7 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.n_g_per_proc = 400000
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         #self.densify_from_iter = 500
@@ -129,7 +130,9 @@ class OptimizationParams(ParamGroup):
         #self.densify_until_iter = 15_000
         self.densify_until_iter = 150_000
         self.densify_grad_threshold = 0.0002
-        self.densify_memory_limit_percentage = 0.9
+        #self.densify_memory_limit_percentage = 0.9 #   ori
+        self.densify_memory_limit_percentage = 0.98
+        #self.densify_memory_limit_percentage = 0.999999
         self.disable_auto_densification = False
         self.opacity_reset_until_iter = -1
         self.random_background = False
@@ -164,8 +167,8 @@ class DistributionParams(ParamGroup):
         # Dataset and Model save
         self.bsz = 1  # batch size.
         self.distributed_dataset_storage = True  # if True, we store dataset only on rank 0 and broadcast to other ranks.
-        #self.distributed_save = True
-        self.distributed_save = False
+        self.distributed_save = True   #ori
+        #self.distributed_save = False
         self.local_sampling = False #   ori
         #self.local_sampling = True
         self.preload_dataset_to_gpu = (

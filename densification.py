@@ -2,13 +2,15 @@ import torch
 import utils.general_utils as utils
 
 
-def densification(iteration, scene, gaussians, batched_screenspace_pkg):
+def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg):
     args = utils.get_args()
     timers = utils.get_timers()
     log_file = utils.get_log_file()
 
+    n_gauss = len(gaussians.get_xyz)
     # Densification
     if not args.disable_auto_densification and iteration <= args.densify_until_iter:
+    #if not args.disable_auto_densification and iteration <= args.densify_until_iter and n_gauss <= n_g_max:
         # Keep track of max radii in image-space for pruning
         timers.start("densification")
 
@@ -85,7 +87,7 @@ def densification(iteration, scene, gaussians, batched_screenspace_pkg):
             )
 
 
-def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
+def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg):
     args = utils.get_args()
     timers = utils.get_timers()
     log_file = utils.get_log_file()
@@ -94,7 +96,10 @@ def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
     print(f'iteration : {iteration} / {args.densify_from_iter} ~ {args.densify_until_iter}');  exit(1)
     '''
     # Densification
+
+    n_gauss = len(gaussians.get_xyz)
     if not args.disable_auto_densification and iteration <= args.densify_until_iter:
+    #if not args.disable_auto_densification and iteration <= args.densify_until_iter and n_gauss <= n_g_max:
         # Keep track of max radii in image-space for pruning
         timers.start("densification")
 
