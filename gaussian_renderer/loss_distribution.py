@@ -2534,7 +2534,7 @@ def load_camera_from_cpu_to_all_gpu(batched_cameras, batched_strategies, gpuid2t
 
 
 def final_system_loss_computation(
-    image, viewpoint_cam, compute_locally, strategy, statistic_collector
+    image, viewpoint_cam, compute_locally, strategy, statistic_collector, use_chunk
 ):
     timers = utils.get_timers()
     args = utils.get_args()
@@ -2570,9 +2570,7 @@ def final_system_loss_computation(
     )
     Ll1 = pixelwise_Ll1.sum() / (utils.get_num_pixels() * 3)
     # utils.check_initial_gpu_memory_usage("after l1_loss")
-    pixelwise_ssim_loss = pixelwise_ssim_with_mask(
-        local_image_rect, local_image_rect_gt, local_image_rect_pixels_compute_locally
-    )
+    pixelwise_ssim_loss = pixelwise_ssim_with_mask(local_image_rect, local_image_rect_gt, local_image_rect_pixels_compute_locally, use_chunk)
     ssim_loss = pixelwise_ssim_loss.sum() / (utils.get_num_pixels() * 3)
 
     torch.cuda.synchronize()
@@ -2591,6 +2589,7 @@ def batched_loss_computation(
     batched_compute_locally,
     batched_strategies,
     batched_statistic_collector,
+    use_chunk
 ):
     '''
     print(f'len(batched_image) : {len(batched_image)}');    #exit(1)    #   4   #   1
@@ -2634,9 +2633,7 @@ def batched_loss_computation(
             print(f'idx : {idx}, image.shape : {image.shape}, camera.original_image.shape : {camera.original_image.shape}')
             #idx : 0, image.shape : torch.Size([3, 17310, 11310]), camera.original_image.shape : torch.Size([3, 5776, 11310])
             '''
-            Ll1, ssim_loss = final_system_loss_computation(
-                image, camera, compute_locally, strategy, statistic_collector
-            )
+            Ll1, ssim_loss = final_system_loss_computation(image, camera, compute_locally, strategy, statistic_collector, use_chunk)
             loss = (1.0 - args.lambda_dssim) * Ll1 + args.lambda_dssim * (
                 1.0 - ssim_loss
             )

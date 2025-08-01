@@ -578,13 +578,15 @@ def pixelwise_ssim_with_mask_mixed_precision(img1, img2, pixel_mask):
     
     return pixelwise_ssim_loss
 
-def pixelwise_ssim_with_mask(img1, img2, pixel_mask):
-    #return pixelwise_ssim_with_mask_ori(img1, img2, pixel_mask)
+def pixelwise_ssim_with_mask(img1, img2, pixel_mask, use_chunk):
     #return pixelwise_ssim_with_mask_mem_eff(img1, img2, pixel_mask)
     #return pixelwise_ssim_with_mask_checkpointed(img1, img2, pixel_mask)
     #return pixelwise_ssim_with_mask_safe_efficient(img1, img2, pixel_mask)
     #return pixelwise_ssim_with_mask_mixed_precision(img1, img2, pixel_mask)
-    return pixelwise_ssim_with_mask_improved_chunked(img1, img2, pixel_mask, 4096)
+    if use_chunk:
+        return pixelwise_ssim_with_mask_improved_chunked(img1, img2, pixel_mask, 4096)
+    else:
+        return pixelwise_ssim_with_mask_ori(img1, img2, pixel_mask)
     #return pixelwise_ssim_with_mask_improved_chunked(img1, img2, pixel_mask, 256)
     #return pixelwise_ssim_with_mask_fp16(img1, img2, pixel_mask)
     #return pixelwise_ssim_with_mask_simple_chunked(img1, img2, pixel_mask, 256)

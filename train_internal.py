@@ -204,6 +204,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             batched_compute_locally,
             batched_strategies,
             batch_statistic_collector,
+            args.use_chunk
         )
 
         timers.start("backward")

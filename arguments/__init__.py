@@ -134,6 +134,7 @@ class OptimizationParams(ParamGroup):
         self.densify_memory_limit_percentage = 0.98
         #self.densify_memory_limit_percentage = 0.999999
         self.disable_auto_densification = False
+        self.use_chunk = False
         self.opacity_reset_until_iter = -1
         self.random_background = False
         self.min_opacity = 0.005
