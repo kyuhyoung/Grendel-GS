@@ -20,6 +20,7 @@ from gaussian_renderer.loss_distribution import (
     load_camera_from_cpu_to_all_gpu_for_eval,
     batched_loss_computation,
 )
+from utils.system_utils import mkdir_p
 from utils.general_utils import prepare_output_and_logger, globally_sync_for_timer
 import utils.general_utils as utils
 from utils.timer import Timer, End2endTimer
@@ -27,6 +28,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 import torch.distributed as dist
 from densification import densification, gsplat_densification
+import torchvision.transforms.functional as tvf
 
 
 def training(dataset_args, opt_args, pipe_args, args, log_file):
@@ -282,7 +284,17 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 end2end_timers.print_time(log_file, iteration + args.bsz)
                 utils.print_rank_0("\n[ITER {}] Saving Gaussians".format(iteration))
                 log_file.write("[ITER {}] Saving Gaussians\n".format(iteration))
-                scene.save(iteration, ema_loss_for_log)
+                scene.save(iteration, ema_loss_for_log, utils.WORLD_SIZE)
+                neim = batched_cameras[0].image_name
+                #n_g = n_gauss * utils.WORLD_SIZE 
+                fn_gt = f'{iteration:06d}_l_{ema_loss_for_log:.3f}_{neim}_gt.png'
+                fn_rd = f'{iteration:06d}_l_{ema_loss_for_log:.3f}_{neim}_rd.png'
+                path_gt = os.path.join(scene.model_path, 'im_dbg', fn_gt)
+                path_rd = os.path.join(scene.model_path, 'im_dbg', fn_rd)
+                mkdir_p(os.path.dirname(path_gt))
+                #print(f'\nfn_gt : {fn_gt}, viewpoint_cam.original_image.shape : {viewpoint_cam.original_image.shape}\n');   #exit(1) 
+                tvf.to_pil_image(batched_cameras[0].original_image).save(path_gt);
+                tvf.to_pil_image(batched_image[0]).save(path_rd);
 
                 if args.save_strategy_history:
                     with open(

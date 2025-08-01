@@ -179,11 +179,11 @@ class Scene:
         utils.check_initial_gpu_memory_usage("after initializing point cloud")
         utils.log_cpu_memory_usage("after loading initial 3dgs points")
 
-    def save(self, iteration, loss):
+    def save(self, iteration, loss, n_gpu):
         point_cloud_path = os.path.join(
             self.model_path, "point_cloud/iteration_{}".format(iteration)
         )
-        n_gauss = self.gaussians.get_xyz.shape[0]
+        n_gauss = self.gaussians.get_xyz.shape[0] * n_gpu
         self.gaussians.save_ply(os.path.join(point_cloud_path, f'point_cloud_i_{iteration:05d}_g_{n_gauss:08d}_l_{loss:.3f}.ply'))
 
     def getTrainCameras(self):
