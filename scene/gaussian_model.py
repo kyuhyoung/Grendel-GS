@@ -557,6 +557,148 @@ class GaussianModel:
         utils.log_cpu_memory_usage("finish write ply file")
         # remark: max_radii2D, xyz_gradient_accum and denom are not saved here; they are save elsewhere.
 
+    def save_ply_debug(self, path):
+        """Save PLY with additional GPU-specific highlighted PLY files for debugging."""
+        # First, perform normal save_ply functionality
+        self.save_ply(path)
+        
+        # Then, create GPU-specific highlighted PLY files
+        args = utils.get_args()
+        if args.gaussians_distribution and not args.distributed_save:
+            self._create_gpu_highlighted_plys(path)
+
+    def _create_gpu_highlighted_plys(self, path):
+        """Create GPU-specific highlighted PLY files using gather logic from save_ply."""
+        import torch.distributed as dist
+        import os
+        
+        group = utils.DEFAULT_GROUP
+        
+        # Reuse the gather_uneven_tensors logic from save_ply
+        def gather_uneven_tensors_with_sizes(tensor):
+            # Gather size of tensors on different ranks
+            tensor_sizes = torch.zeros((group.size()), dtype=torch.int, device="cuda")
+            tensor_sizes[group.rank()] = tensor.shape[0]
+            dist.all_reduce(tensor_sizes, op=dist.ReduceOp.SUM)
+            tensor_sizes = tensor_sizes.cpu().numpy().tolist()
+
+            # Gather tensors using grouped send/recv
+            gathered_tensors = []
+            if group.rank() == 0:
+                for i in range(group.size()):
+                    if i == group.rank():
+                        gathered_tensors.append(tensor)
+                    else:
+                        tensor_from_rk_i = torch.zeros(
+                            (tensor_sizes[i],) + tensor.shape[1:],
+                            dtype=tensor.dtype,
+                            device="cuda",
+                        )
+                        dist.recv(tensor_from_rk_i, src=i)
+                        gathered_tensors.append(tensor_from_rk_i)
+                gathered_tensors = torch.cat(gathered_tensors, dim=0)
+            else:
+                dist.send(tensor, dst=0)
+
+            return (gathered_tensors if group.rank() == 0 else None, tensor_sizes)
+
+        # Only proceed on rank 0
+        if group.rank() != 0:
+            # Non-rank0 processes just send their data and exit
+            gather_uneven_tensors_with_sizes(self._xyz)
+            gather_uneven_tensors_with_sizes(self._features_dc)
+            gather_uneven_tensors_with_sizes(self._features_rest)
+            gather_uneven_tensors_with_sizes(self._opacity)
+            gather_uneven_tensors_with_sizes(self._scaling)
+            gather_uneven_tensors_with_sizes(self._rotation)
+            return
+
+        # Rank 0: Gather all data and create highlighted PLYs
+        try:
+            _xyz, gpu_sizes = gather_uneven_tensors_with_sizes(self._xyz)
+            _features_dc, _ = gather_uneven_tensors_with_sizes(self._features_dc)
+            _features_rest, _ = gather_uneven_tensors_with_sizes(self._features_rest)
+            _opacity, _ = gather_uneven_tensors_with_sizes(self._opacity)
+            _scaling, _ = gather_uneven_tensors_with_sizes(self._scaling)
+            _rotation, _ = gather_uneven_tensors_with_sizes(self._rotation)
+
+            print(f"Creating GPU highlighted PLYs. GPU sizes: {gpu_sizes}")
+
+            # Create highlighted PLY for each GPU
+            current_idx = 0
+            for gpu_rank in range(group.size()):
+                gpu_count = gpu_sizes[gpu_rank]
+                if gpu_count > 0:
+                    start_idx = current_idx
+                    end_idx = current_idx + gpu_count
+
+                    # Create highlighted version
+                    highlight_features_dc = _features_dc.clone()
+                    
+                    # Get unique color for this GPU using HSV color wheel
+                    gpu_color = self._get_gpu_color(gpu_rank, group.size())
+                    
+                    # Highlight this GPU's gaussians with its unique color
+                    highlight_features_dc[start_idx:end_idx, 0, 0] = gpu_color[0]  # R
+                    highlight_features_dc[start_idx:end_idx, 0, 1] = gpu_color[1]  # G
+                    highlight_features_dc[start_idx:end_idx, 0, 2] = gpu_color[2]  # B
+
+                    # Save GPU-specific highlighted PLY
+                    base_name = os.path.splitext(path)[0]
+                    gpu_path = f"{base_name}_gpu_{gpu_rank}.ply"
+                    self._save_highlighted_ply(gpu_path, _xyz, highlight_features_dc, _features_rest, 
+                                             _opacity, _scaling, _rotation)
+                    
+                    # Convert color back to 0-1 range for display
+                    display_color = [(c + 1.0) / 3.0 for c in gpu_color]
+                    print(f"Saved GPU {gpu_rank} highlighted PLY: {os.path.basename(gpu_path)} (gaussians {start_idx}-{end_idx-1}, count: {gpu_count}, color: RGB{display_color})")
+
+                    current_idx = end_idx
+
+        except Exception as e:
+            print(f"Warning: Failed to create GPU highlighted PLY files: {e}")
+
+    def _get_gpu_color(self, gpu_rank, total_gpus):
+        """Generate unique color for each GPU using HSV color wheel sampling."""
+        import colorsys
+        
+        # Sample hue from color wheel (0 to 1), starting from red (hue=0)
+        hue = (gpu_rank / total_gpus) % 1.0
+        
+        # Use high saturation and value for bright, vivid colors
+        saturation = 1.0
+        value = 1.0
+        
+        # Convert HSV to RGB
+        r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+        
+        # Scale to appropriate range for Gaussian Splatting features
+        # Features are typically in range [-2, 2] for good rendering
+        return [r * 3.0 - 1.0, g * 3.0 - 1.0, b * 3.0 - 1.0]
+
+    def _save_highlighted_ply(self, path, xyz, features_dc, features_rest, opacity, scaling, rotation):
+        """Save highlighted PLY file with custom colors."""
+        # Convert tensors to CPU and numpy
+        xyz = xyz.detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+        
+        f_dc = features_dc.detach().cpu().numpy()
+        f_rest = features_rest.detach().cpu().numpy()
+        opacities = opacity.detach().cpu().numpy()
+        scale = scaling.detach().cpu().numpy()
+        rotation = rotation.detach().cpu().numpy()
+
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc.reshape((f_dc.shape[0], -1)), 
+                                   f_rest.reshape((f_rest.shape[0], -1)), opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        
+        from plyfile import PlyData, PlyElement
+        el = PlyElement.describe(elements, 'vertex')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        PlyData([el]).write(path)
+
     def reset_opacity(self):
         utils.LOG_FILE.write("Resetting opacity to 0.01\n")
         opacities_new = inverse_sigmoid(

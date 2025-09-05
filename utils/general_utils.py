@@ -300,19 +300,22 @@ def check_initial_gpu_memory_usage(prefix):
         )
 
 
-def check_memory_usage(log_file, args, iteration, gaussians, before_densification_stop):
+def check_memory_usage(log_file, args, iteration, gaussians, n_gauss_max, before_densification_stop):
     global DEFAULT_GROUP
 
     memory_usage = torch.cuda.memory_allocated() / 1024 / 1024 / 1024
     max_memory_usage = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
     max_reserved_memory = torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024
     now_reserved_memory = torch.cuda.memory_reserved() / 1024 / 1024 / 1024
+    n_gauss_cur = gaussians.get_xyz.shape[0]
+    print('n_gauss_cur : {} / {}'.format(n_gauss_cur, n_gauss_max if n_gauss_max > 0 else "")); #exit(1)
     log_str = ""
-    log_str += "iteration[{},{}) {}Now num of 3dgs: {}. Now Memory usage: {} GB. Max Memory usage: {} GB. Max Reserved Memory: {} GB. Now Reserved Memory: {} GB. \n".format(
+    log_str += "iteration[{},{}] {}. Now # of Gaussians: {} / {}. Now Memory usage: {} GB. Max Memory usage: {} GB. Max Reserved Memory: {} GB. Now Reserved Memory: {} GB. \n".format(
         iteration,
         iteration + args.bsz,
         "densify_and_prune. " if not before_densification_stop else "",
-        gaussians.get_xyz.shape[0],
+        n_gauss_cur,
+        n_gauss_max if n_gauss_max is not None else "",
         memory_usage,
         max_memory_usage,
         max_reserved_memory,
@@ -332,10 +335,13 @@ def check_memory_usage(log_file, args, iteration, gaussians, before_densificatio
         total_memory = (
             torch.cuda.get_device_properties(0).total_memory / 1024 / 1024 / 1024
         )
-        if (
-            max([a[0] for a in memory_usage_list])
-            > args.densify_memory_limit_percentage * total_memory
-        ):  # If memory usage is reaching the upper bound of GPU memory, stop densification to avoid OOM by fragmentation and etc.
+        mem_cur = max([a[0] for a in memory_usage_list])
+        mem_max = args.densify_memory_limit_percentage * total_memory
+        is_over_memory = mem_cur > mem_max
+        is_over_gauss = n_gauss_cur > n_gauss_max if n_gauss_max is not None else False
+        if is_over_memory or is_over_gauss:  
+        #if (max([a[0] for a in memory_usage_list]) > args.densify_memory_limit_percentage * total_memory):  
+        # If memory usage is reaching the upper bound of GPU memory, stop densification to avoid OOM by fragmentation and etc.
             print(
                 "Reserved Memory usage is reaching the upper bound of GPU memory. stop densification.\n"
             )

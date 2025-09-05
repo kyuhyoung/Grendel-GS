@@ -130,7 +130,11 @@ class Scene:
             train_cameras = scene_info.train_cameras[: args.num_train_cameras]
         else:
             train_cameras = scene_info.train_cameras
-        self.train_cameras = cameraList_from_camInfos(train_cameras, args)
+        #print(f'args.normalize : {args.normalize}')
+        if args.normalize:
+            self.train_cameras = cameraList_from_camInfos(train_cameras, scene_info.nerf_normalization, args)
+        else:
+            self.train_cameras = cameraList_from_camInfos(train_cameras, None, args)
         # output the number of cameras in the training set and image size to the log file
         log_file.write(
             "Number of local training cameras: {}\n".format(len(self.train_cameras))
@@ -181,10 +185,27 @@ class Scene:
 
     def save(self, iteration, loss, n_gpu):
         point_cloud_path = os.path.join(
-            self.model_path, "point_cloud/iteration_{}".format(iteration)
+            self.model_path, "point_cloud/iteration_{:06d}".format(iteration)
         )
         n_gauss = self.gaussians.get_xyz.shape[0] * n_gpu
-        self.gaussians.save_ply(os.path.join(point_cloud_path, f'point_cloud_i_{iteration:05d}_g_{n_gauss:08d}_l_{loss:.3f}.ply'))
+        
+        # Save main combined PLY file
+        main_ply_path = os.path.join(point_cloud_path, f'point_cloud_i_{iteration:05d}_g_{n_gauss:08d}_l_{loss:.3f}.ply')
+        
+        # Track save count to decide between save_ply and save_ply_debug
+        if not hasattr(self, '_gaussian_save_count'):
+            self._gaussian_save_count = 0
+        self._gaussian_save_count += 1
+        
+        if self._gaussian_save_count == 1 or self._gaussian_save_count == 5:
+            # Use save_ply_debug to create both main PLY and GPU-specific highlighted PLYs
+            if utils.LOCAL_RANK == 0:
+                print(f"Saving with GPU highlighting (save #{self._gaussian_save_count})")
+            self.gaussians.save_ply_debug(main_ply_path)
+        else:
+            # Use normal save_ply for regular saves
+            self.gaussians.save_ply(main_ply_path)
+
 
     def getTrainCameras(self):
         return self.train_cameras

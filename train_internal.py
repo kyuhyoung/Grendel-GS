@@ -40,6 +40,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     prepare_output_and_logger(dataset_args)
     utils.log_cpu_memory_usage("at the beginning of training")
     start_from_this_iteration = 1
+    n_g_max = args.n_g_per_proc
 
     # Init parameterized scene
     gaussians = GaussianModel(dataset_args.sh_degree)
@@ -89,11 +90,14 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         range(1, opt_args.iterations + 1),
         desc="Training progress",
         disable=(utils.LOCAL_RANK != 0),
+        bar_format='{desc}:{percentage:3.0f}%|{bar:2}| {n_fmt}/{total_fmt} [{elapsed}<{remaining},{postfix}]'
+        #, miniters=10,  # Update every 10 iterations minimum
     )
     progress_bar.update(start_from_this_iteration - 1)
     num_trained_batches = 0
 
     ema_loss_for_log = 0
+    debug_info_printed = False  # Print debug info only once during entire training
     for iteration in range(
         start_from_this_iteration, opt_args.iterations + 1, args.bsz
     ):
@@ -110,7 +114,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if iteration > 0:
             progress_bar.set_postfix({
             "#G": f"{n_gauss}/{args.n_g_per_proc}",
-            "Loss": f"{ema_loss_for_log:.{4}f}"
+            "Loss": f"{ema_loss_for_log:.{3}f}"
             })
         progress_bar.update(args.bsz)
         utils.set_cur_iter(iteration)
@@ -270,7 +274,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             #print(f'n_gauss : {n_gauss}, args.n_g_per_proc : {args.n_g_per_proc}'); exit(1)
             #if n_gauss <= args.n_g_per_proc:
             if args.backend == "gsplat":
-                gsplat_densification(iteration, scene, gaussians, args.n_g_per_proc, batched_screenspace_pkg)
+                gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
             else:
                 densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
 
@@ -286,16 +290,53 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 utils.print_rank_0("\n[ITER {}] Saving Gaussians".format(iteration))
                 log_file.write("[ITER {}] Saving Gaussians\n".format(iteration))
                 scene.save(iteration, ema_loss_for_log, utils.WORLD_SIZE)
+                # Save images from all GPUs with different names
                 neim = batched_cameras[0].image_name
                 #n_g = n_gauss * utils.WORLD_SIZE 
-                fn_gt = f'{iteration:06d}_l_{ema_loss_for_log:.3f}_{neim}_gt.png'
-                fn_rd = f'{iteration:06d}_l_{ema_loss_for_log:.3f}_{neim}_rd.png'
+                fn_gt = f'{iteration:06d}_l_{ema_loss_for_log:.3f}_{neim}_rank{utils.LOCAL_RANK}_gt.png'
+                fn_rd = f'{iteration:06d}_l_{ema_loss_for_log:.3f}_{neim}_rank{utils.LOCAL_RANK}_rd.png'
                 path_gt = os.path.join(scene.model_path, 'im_dbg', fn_gt)
                 path_rd = os.path.join(scene.model_path, 'im_dbg', fn_rd)
                 mkdir_p(os.path.dirname(path_gt))
                 #print(f'\nfn_gt : {fn_gt}, viewpoint_cam.original_image.shape : {viewpoint_cam.original_image.shape}\n');   #exit(1) 
-                tvf.to_pil_image(batched_cameras[0].original_image).save(path_gt);
-                tvf.to_pil_image(batched_image[0]).save(path_rd);
+                # Debug: Check memory and tensor status before saving (only once during entire training, only on rank 0)
+                if not debug_info_printed and utils.LOCAL_RANK == 0:
+                    debug_info_printed = True
+                    print(f"\n=== Debug Info at iteration {iteration} (Rank {utils.LOCAL_RANK}) ===")
+                    print(f"GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+                    print(f"GPU memory reserved: {torch.cuda.memory_reserved()/1024**3:.2f}GB")
+                    
+                    # Check original image
+                    orig_img = batched_cameras[0].original_image
+                    print(f"Original image shape: {orig_img.shape}, device: {orig_img.device}, dtype: {orig_img.dtype}")
+                    print(f"Original image min: {orig_img.min():.3f}, max: {orig_img.max():.3f}")
+                    
+                    # Check rendered image
+                    rend_img = batched_image[0]
+                    print(f"Rendered image shape: {rend_img.shape}, device: {rend_img.device}, dtype: {rend_img.dtype}")
+                    print(f"Rendered image min: {rend_img.min():.3f}, max: {rend_img.max():.3f}")
+                    
+                    # Check for NaN or Inf
+                    print(f"Rendered image has NaN: {torch.isnan(rend_img).any()}")
+                    print(f"Rendered image has Inf: {torch.isinf(rend_img).any()}")
+                    
+                    # Check RAM usage
+                    import psutil
+                    process = psutil.Process()
+                    ram_usage = process.memory_info().rss / 1024**3  # GB
+                    print(f"Process RAM usage: {ram_usage:.2f}GB")
+                    print(f"System RAM available: {psutil.virtual_memory().available / 1024**3:.2f}GB")
+                    
+                    # Count non-zero pixels in rendered image
+                    rend_cpu = rend_img.detach().cpu()
+                    non_zero_ratio = (rend_cpu > 0.01).float().mean()
+                    print(f"Non-black pixel ratio: {non_zero_ratio:.2%}")
+                    print("=" * 50)
+                
+                # Ensure GPU/CPU sync before saving
+                torch.cuda.synchronize()
+                tvf.to_pil_image(batched_cameras[0].original_image.cpu()).save(path_gt);
+                tvf.to_pil_image(batched_image[0].detach().cpu()).save(path_rd);
 
                 if args.save_strategy_history:
                     with open(

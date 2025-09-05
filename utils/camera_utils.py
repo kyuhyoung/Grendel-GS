@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 
 
-def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
+def loadCam(args, id, cam_info, nerf_norm, decompressed_image=None, return_image=False):
     orig_w, orig_h = cam_info.width, cam_info.height
     assert (
         orig_w == utils.get_img_width() and orig_h == utils.get_img_height()
@@ -70,10 +70,18 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
     if return_image:
         return gt_image
 
+    # Apply NeRF++ normalization if provided
+    if nerf_norm is not None:
+        # Apply translation and scaling normalization
+        T_normalized = cam_info.T + nerf_norm["translate"]
+        T_normalized = T_normalized / nerf_norm["radius"]
+    else:
+        T_normalized = cam_info.T
+
     return Camera(
         colmap_id=cam_info.uid,
         R=cam_info.R,
-        T=cam_info.T,
+        T=T_normalized,
         FoVx=cam_info.FovX,
         FoVy=cam_info.FovY,
         image=gt_image,
@@ -84,12 +92,12 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
 
 
 def load_decompressed_image(params):
-    args, id, cam_info = params
-    return loadCam(args, id, cam_info, decompressed_image=None, return_image=True)
+    args, id, cam_info, nerf_norm = params
+    return loadCam(args, id, cam_info, nerf_norm, decompressed_image=None, return_image=True)
 
 
 # Modify this code to support shared_memory.SharedMemory to make inter-process communication faster
-def decompressed_images_from_camInfos_multiprocess(cam_infos, args):
+def decompressed_images_from_camInfos_multiprocess(cam_infos, nerf_norm, args):
     args = get_args()
     decompressed_images = []
     total_cameras = len(cam_infos)
@@ -97,7 +105,7 @@ def decompressed_images_from_camInfos_multiprocess(cam_infos, args):
     # Create a pool of processes
     with multiprocessing.Pool(processes=2) as pool:
         # Prepare data for processing
-        tasks = [(args, id, cam_info) for id, cam_info in enumerate(cam_infos)]
+        tasks = [(args, id, cam_info, nerf_norm) for id, cam_info in enumerate(cam_infos)]
 
         # Map load_camera_data to the tasks
         # results = pool.map(load_decompressed_image, tasks)
@@ -207,12 +215,12 @@ def decompressed_images_from_camInfos_multiprocess_sharedmem(
     return decompressed_images
 
 
-def cameraList_from_camInfos(cam_infos, args):
+def cameraList_from_camInfos(cam_infos, nerf_norm, args):
     args = get_args()
 
     if args.multiprocesses_image_loading:
         decompressed_images = decompressed_images_from_camInfos_multiprocess(
-            cam_infos, args
+            cam_infos, nerf_norm, args
         )
         # decompressed_images = decompressed_images_from_camInfos_multiprocess_sharedmem(cam_infos, resolution_scale, args)
     else:
@@ -227,6 +235,7 @@ def cameraList_from_camInfos(cam_infos, args):
                 args,
                 id,
                 c,
+                nerf_norm,
                 decompressed_image=decompressed_images[id],
                 return_image=False,
             )

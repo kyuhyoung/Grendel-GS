@@ -34,42 +34,72 @@ magick_command = (
     if len(args.magick_executable) > 0
     else "magick"
 )
-use_gpu = 1 if not args.no_gpu else 0
+use_gpu = 1  # Force GPU usage
+
+# Check if we should skip feature extraction
+skip_extraction = os.environ.get('SKIP_EXTRACTION_FLAG', 'false').lower() == 'true'
 
 if not args.skip_matching:
     os.makedirs(args.source_path + "/distorted/sparse", exist_ok=True)
 
+    ## Extract GPS coordinates if available
+    print("Extracting GPS coordinates from images...")
+    gps_file = args.source_path + "/gps_coords.txt"
+    extract_gps_cmd = f"python extract_gps.py --image_path {args.source_path}/input --output {gps_file}"
+    os.system(extract_gps_cmd)
+    
     ## Feature extraction
-    feat_extracton_cmd = (
-        colmap_command + " feature_extractor "
-        "--database_path "
-        + args.source_path
-        + "/distorted/database.db \
-        --image_path "
-        + args.source_path
-        + "/input \
-        --ImageReader.single_camera 1 \
-        --ImageReader.camera_model "
-        + args.camera
-        + " \
-        --SiftExtraction.use_gpu "
-        + str(use_gpu)
-    )
-    exit_code = os.system(feat_extracton_cmd)
-    if exit_code != 0:
-        logging.error(f"Feature extraction failed with code {exit_code}. Exiting.")
-        exit(exit_code)
+    if not skip_extraction:
+        print(f"=== FEATURE EXTRACTION CONFIGURATION ===")
+        print(f"GPU Usage: {'ENABLED' if use_gpu else 'DISABLED'}")
+        print(f"GPU Index: 0")
+        print(f"Feature Type: SIFT")
+        print(f"Camera Model: {args.camera}")
+        print(f"============================================")
+        
+        feat_extracton_cmd = (
+            colmap_command + " feature_extractor "
+            "--database_path "
+            + args.source_path
+            + "/distorted/database.db \
+            --image_path "
+            + args.source_path
+            + "/input \
+            --ImageReader.single_camera 1 \
+            --ImageReader.camera_model "
+            + args.camera
+            + " \
+            --FeatureExtraction.type SIFT \
+            --FeatureExtraction.use_gpu "
+            + str(use_gpu)
+            + " \
+            --FeatureExtraction.gpu_index 0"
+        )
+        print(f"Executing command: {feat_extracton_cmd}")
+        # Execute without filtering to ensure no data is lost
+        exit_code = os.system(feat_extracton_cmd)
+        if exit_code != 0:
+            logging.error(f"Feature extraction failed with code {exit_code}. Exiting.")
+            exit(exit_code)
+    else:
+        print("=== SKIPPING FEATURE EXTRACTION ===")
+        print("Proceeding directly to feature matching...")
 
     ## Feature matching
+    print(f"=== FEATURE MATCHING CONFIGURATION ===")
+    print(f"GPU Usage: {'ENABLED' if use_gpu else 'DISABLED'}")
+    print(f"==========================================")
+    
     feat_matching_cmd = (
         colmap_command
         + " exhaustive_matcher \
         --database_path "
         + args.source_path
         + "/distorted/database.db \
-        --SiftMatching.use_gpu "
+        --FeatureMatching.use_gpu "
         + str(use_gpu)
     )
+    print(f"Executing matching command: {feat_matching_cmd}")
     exit_code = os.system(feat_matching_cmd)
     if exit_code != 0:
         logging.error(f"Feature matching failed with code {exit_code}. Exiting.")

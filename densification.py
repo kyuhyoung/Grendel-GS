@@ -61,9 +61,7 @@ def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
                     )
                 )
 
-            utils.check_memory_usage(
-                log_file, args, iteration, gaussians, before_densification_stop=True
-            )
+            utils.check_memory_usage(log_file, args, iteration, gaussians, n_g_max, before_densification_stop = True)
 
             utils.inc_densify_iter()
 
@@ -82,9 +80,7 @@ def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
         if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
             iteration, args.bsz, args.densification_interval, 0
         ):
-            utils.check_memory_usage(
-                log_file, args, iteration, gaussians, before_densification_stop=False
-            )
+            utils.check_memory_usage(log_file, args, iteration, gaussians, n_g_max, before_densification_stop = False)
 
 
 def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg):
@@ -163,9 +159,7 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
                     )
                 )
 
-            utils.check_memory_usage(
-                log_file, args, iteration, gaussians, before_densification_stop=True
-            )
+            utils.check_memory_usage(log_file, args, iteration, gaussians, n_g_max, before_densification_stop=True)
 
             utils.inc_densify_iter()
 
@@ -184,6 +178,4 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
         if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
             iteration, args.bsz, args.densification_interval, 0
         ):
-            utils.check_memory_usage(
-                log_file, args, iteration, gaussians, before_densification_stop=False
-            )
+            utils.check_memory_usage(log_file, args, iteration, gaussians, n_g_max,before_densification_stop = False)
