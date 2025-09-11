@@ -1,0 +1,111 @@
+# Use Miniconda for Grendel-GS
+FROM continuumio/miniconda3
+
+# Set non-interactive mode to avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends apt-utils build-essential git fish && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates gnupg && rm -rf /var/lib/apt/lists/*
+
+RUN wget -qO cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && dpkg -i cuda-keyring.deb && rm cuda-keyring.deb   # keyring 설치 후 .deb 파일 삭제 :contentReference[oaicite:0]{index=0}
+
+# 3) CUDA APT 레포가 신뢰된 상태가 되었으니 툴킷 설치
+RUN apt-get update && apt-get install -y --no-install-recommends cuda-toolkit-12-4 && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y libtiff-dev zlib1g-dev
+
+# 4) 환경 변수 설정
+ENV CUDA_HOME=/usr/local/cuda-12.4
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+
+COPY requirements.yml /tmp/requirements.yml
+
+RUN conda env create --file /tmp/requirements.yml
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1-mesa-glx potrace && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y libglm-dev
+
+# COLMAP installation removed - use host system's COLMAP instead
+
+# Install general dependencies
+RUN apt-get update && apt-get install -y \
+    python3-pip \
+    exiftool \
+    ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set the default shell to bash and activate Conda environment
+SHELL ["/bin/bash", "-c", "source activate Grendel && bash"]
+RUN conda init bash && conda info --envs
+
+# Set Grendel as default environment
+RUN echo "conda activate Grendel" >> ~/.bashrc
+
+# Cache buster for forcing rebuild when needed
+ARG CACHEBUST=1
+
+# Copy submodules and install gsplat, simple-knn, and diff-gaussian-rasterization during build
+COPY submodules/ /tmp/submodules/
+
+# Force rebuild by showing file checksums
+RUN find /tmp/submodules -name "setup.py" -exec md5sum {} \;
+SHELL ["/bin/bash", "-c", "source activate Grendel && bash"]
+ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0"
+
+# Force rebuild of gsplat and simple-knn layers
+ARG REBUILD_PACKAGES=2
+RUN echo "Rebuild trigger for packages: ${REBUILD_PACKAGES} at $(date)"
+
+# Install each package separately for better error tracking
+RUN echo "==================== Installing gsplat ====================" && \
+    cd /tmp/submodules/gsplat && \
+    echo "Current directory: $(pwd)" && \
+    echo "Files in directory:" && ls -la && \
+    echo "Starting pip install with verbose output..." && \
+    pip install -vvv . --no-cache-dir 2>&1 && \
+    echo "Installation exit code: $?" && \
+    python -c 'import gsplat; print("✓ gsplat installed and imported successfully")' && \
+    pip show gsplat && \
+    echo "==================== gsplat DONE ===================="
+
+RUN echo "==================== Installing simple-knn ====================" && \
+    cd /tmp/submodules/simple-knn && \
+    echo "Current directory: $(pwd)" && \
+    echo "Files in directory:" && ls -la && \
+    echo "Starting pip install with verbose output..." && \
+    pip install -vvv . --no-cache-dir 2>&1 && \
+    echo "Installation exit code: $?" && \
+    python -c 'import simple_knn; print("✓ simple-knn installed and imported successfully")' && \
+    pip show simple-knn && \
+    echo "==================== simple-knn DONE ===================="
+
+RUN echo "==================== Installing diff-gaussian-rasterization ====================" && \
+    cd /tmp/submodules/diff-gaussian-rasterization && \
+    echo "Start time: $(date)" && \
+    pip install -v . --no-cache-dir --force-reinstall && \
+    echo "End time: $(date)" && \
+    python -c 'import diff_gaussian_rasterization; print("✓ diff-gaussian-rasterization installed and imported successfully")' && \
+    pip show diff-gaussian-rasterization && \
+    echo "==================== diff-gaussian-rasterization DONE ===================="
+
+# Verify all imports work together
+RUN echo "==================== FINAL VERIFICATION ====================" && \
+    python -c 'import torch; print(f"✓ PyTorch {torch.__version__}")' && \
+    python -c 'import gsplat; print("✓ gsplat imported")' && \
+    python -c 'import simple_knn; print("✓ simple_knn imported")' && \
+    python -c 'import diff_gaussian_rasterization; print("✓ diff_gaussian_rasterization imported")' && \
+    echo "==================== ALL PACKAGES VERIFIED ===================="
+
+# Clean up
+RUN rm -rf /tmp/submodules
+
+# Copy and run final verification script
+COPY docker_file/verify_packages.py /tmp/verify_packages.py
+RUN python /tmp/verify_packages.py && rm /tmp/verify_packages.py
+
+# Ensure Python path is set correctly in bashrc
+RUN echo 'export PYTHONPATH="/opt/conda/envs/Grendel/lib/python3.11/site-packages:$PYTHONPATH"' >> ~/.bashrc

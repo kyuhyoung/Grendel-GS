@@ -1,0 +1,101 @@
+# Ignore large data files and output
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
+*.mov
+*.ply
+*.pcd
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Ignore COLMAP outputs (36GB total!)
+*_colmap
+2_SN_colmap
+Sillim-dong_colmap
+*_colmap/
+colmap_*/
+sparse/
+dense/
+database.db
+
+# Ignore output directories (MOST IMPORTANT - 246GB!)
+output
+./output
+output/**
+outputs/
+results/
+logs/
+checkpoints/
+models/
+
+# Ignore data directories
+data/
+dataset/
+datasets/
+
+# GPU visualization
+gpu_vis/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# System files
+.DS_Store
+Thumbs.db
+*.log
+
+# Temporary files
+tmp/
+temp/
+cache/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Large binary files
+*.bin
+*.dat
+*.h5
+*.hdf5
+*.tar
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# Model weights
+*.weights
+*.caffemodel
+*.pkl
+
+# Keep only essential files for build
+!requirements.yml
+!submodules/
+!docker_file/
+!extract_docker_info.sh

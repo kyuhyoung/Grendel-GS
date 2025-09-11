@@ -15,6 +15,9 @@ old_files
 *.out
 __pycache__
 *.npy
+# COLMAP processing results
+*_colmap/
+
 scripts/
 data
 results

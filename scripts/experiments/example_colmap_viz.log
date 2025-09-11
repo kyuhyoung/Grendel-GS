@@ -1,0 +1,47 @@
+========================================
+COLMAP Visualization Started at: Mon Sep  8 09:41:06 UTC 2025
+========================================
+[1;33mChecking Python environment...[0m
+Python 3.11.11
+
+[1;33mChecking required packages...[0m
+NumPy version: 1.26.4
+Matplotlib version: 3.10.0
+SciPy version: 1.15.2
+
+[1;33mSearching for COLMAP data...[0m
+DEBUG: Checking path: /data/sillim_ew_mini_100024_20/sparse/0
+DEBUG:   cameras.txt: exists
+DEBUG:   images.txt: exists
+DEBUG:   points3D.txt: exists
+[0;32mFound COLMAP data at: /data/sillim_ew_mini_100024_20/sparse/0[0m
+
+[1;33mBacking up existing output files...[0m
+
+[1;33mRunning COLMAP visualization...[0m
+----------------------------------------
+DEBUG: Python environment info:
+/opt/conda/envs/Grendel/bin/python3
+Python 3.11.11
+DEBUG: Testing matplotlib import:
+matplotlib OK
+DEBUG: About to run Python script...
+DEBUG: Current working directory: /workspace/Grendel-GS
+DEBUG: Files in current directory:
+-rw-rw-r-- 1 kevin kevin 16592 Sep  8 09:35 colmap_visualizer.py
+-rw-rw-r-- 1 kevin kevin  9634 Sep  8 09:31 example_colmap_viz.py
+DEBUG: Running with COLMAP_PATH=/data/sillim_ew_mini_100024_20/sparse/0
+DEBUG: Executing: python3 example_colmap_viz.py
+DEBUG: Python exit code: 130
+DEBUG: Python script execution finished
+----------------------------------------
+
+[0;32m✅ SUCCESS: Visualization completed[0m
+
+[1;33mGenerated files:[0m
+  [0;31m✗[0m colmap_3d_scene.png not found
+  [0;31m✗[0m orthographic_nadir_view.png not found
+
+========================================
+COLMAP Visualization Ended at: Mon Sep  8 09:42:07 UTC 2025
+========================================
