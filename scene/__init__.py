@@ -80,7 +80,8 @@ class Scene:
             with open(os.path.join(self.model_path, "cameras.json"), "w") as file:
                 json.dump(json_cams, file)
 
-        if shuffle:
+        # Only shuffle if not in deterministic mode
+        if shuffle and not args.deterministic:
             random.shuffle(
                 scene_info.train_cameras
             )  # Multi-res consistent random shuffling
@@ -109,7 +110,7 @@ class Scene:
         )
         log_file.write(f"Dataset size: {dataset_size_in_GB} GB\n")
             
-        #print(f'dataset_size_in_GB : {dataset_size_in_GB}, args.preload_dataset_to_gpu_threshold : {args.preload_dataset_to_gpu_threshold}'); exit(1)
+        print(f'dataset_size_in_GB : {dataset_size_in_GB}, args.preload_dataset_to_gpu_threshold : {args.preload_dataset_to_gpu_threshold}'); #exit(1)
 
         if dataset_size_in_GB < args.preload_dataset_to_gpu_threshold:  # 10GB memory limit for dataset
             log_file.write(
@@ -264,8 +265,10 @@ class SceneDataset:
             else:
                 self.cur_epoch_cameras = list(range(self.camera_size))
             # random.shuffle(self.cur_epoch_cameras)
-            indices = torch.randperm(len(self.cur_epoch_cameras))
-            self.cur_epoch_cameras = [self.cur_epoch_cameras[i] for i in indices]
+            if not self.args.deterministic:
+                indices = torch.randperm(len(self.cur_epoch_cameras))
+                self.cur_epoch_cameras = [self.cur_epoch_cameras[i] for i in indices]
+            # In deterministic mode, keep original order (no shuffling)
 
         self.cur_iteration += 1
 

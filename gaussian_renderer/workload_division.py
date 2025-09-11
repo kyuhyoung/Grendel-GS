@@ -76,6 +76,11 @@ def division_pos_heuristic(heuristic, tile_num, world_size, right=False):
     assert (
         heuristic.shape[0] == tile_num
     ), "the length of heuristics should be the same as the number of tiles."
+    
+    # Skip workload division for single GPU
+    if world_size == 1:
+        return [0, tile_num]
+    
     heuristic_prefix_sum = torch.cumsum(heuristic, dim=0)
     heuristic_sum = heuristic_prefix_sum[-1]
     heuristic_per_worker = heuristic_sum / world_size

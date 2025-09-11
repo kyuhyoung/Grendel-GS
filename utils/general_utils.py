@@ -232,6 +232,13 @@ def init_distributed(args):
     else:
         DEFAULT_GROUP = SingleGPUGroup()
         IN_NODE_GROUP = SingleGPUGroup()
+    
+    # Enable deterministic algorithms if requested
+    if args.deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"[INFO] Rank {LOCAL_RANK}: Deterministic algorithms enabled")
 
 
 def one_node_device_count():
@@ -483,10 +490,31 @@ def safe_state(silent):
 
     sys.stdout = F(silent)
 
+    global LOCAL_RANK
+    
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    global LOCAL_RANK
+    torch.cuda.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    
+    # Enhanced deterministic settings
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Set environment variables for deterministic behavior
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:False'
+    
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except:
+        print("Warning: Could not enable deterministic algorithms")
+    
+    # Set CUDA random state for all devices
+    for i in range(torch.cuda.device_count()):
+        torch.cuda.set_rng_state(torch.cuda.get_rng_state(), device=i)
+    
     torch.cuda.set_device(torch.device("cuda", LOCAL_RANK))
 
 

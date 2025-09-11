@@ -272,13 +272,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
             # Densification
             #print(f'n_gauss : {n_gauss}, args.n_g_per_proc : {args.n_g_per_proc}'); exit(1)
-            #if n_gauss <= args.n_g_per_proc:
-            if args.backend == "gsplat":
-                gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
-            else:
-                densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
-
-            # Save Gaussians
+            # Save Gaussians BEFORE densification to save optimized state
             if any(
                 [
                     iteration <= save_iteration < iteration + args.bsz
@@ -350,6 +344,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     ) as f:
                         json.dump(strategy_history.to_json(), f)
                 end2end_timers.start()
+
+            # Densification AFTER saving
+            #if n_gauss <= args.n_g_per_proc:
+            if args.backend == "gsplat":
+                gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
+            else:
+                densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
 
             # Save Checkpoints
             if any(

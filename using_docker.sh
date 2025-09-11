@@ -1,7 +1,4 @@
 #!/bin/bash
-# Set up logging
-LOG_FILE="docker.log"
-{
 
 # Check for options
 NO_CACHE=""
@@ -44,7 +41,13 @@ if [ "$SKIP_BUILD" = false ]; then
     # Update cache buster file with timestamp
     echo "Cache buster: $(date '+%Y-%m-%d %H:%M:%S')" > cache_buster.txt
 
-    docker buildx build --platform linux/amd64 --force-rm --shm-size=64g ${NO_CACHE} --no-cache-filter="*ODM*" --build-arg CACHEBUST=$(date +%s) -t ${docker_name} -f docker_file/Dockerfile_${docker_name} .
+    # Use regular docker build with BuildKit disabled for full output
+    # Only pass CACHEBUST when using -nc option to preserve cache otherwise
+    if [ -n "$NO_CACHE" ]; then
+        DOCKER_BUILDKIT=0 docker build --platform linux/amd64 --force-rm --shm-size=64g ${NO_CACHE} --build-arg CACHEBUST=$(date +%s) -t ${docker_name} -f docker_file/Dockerfile_${docker_name} .
+    else
+        DOCKER_BUILDKIT=0 docker build --platform linux/amd64 --force-rm --shm-size=64g -t ${docker_name} -f docker_file/Dockerfile_${docker_name} .
+    fi
 
     #: << 'END'
     #   docker info.
@@ -67,5 +70,3 @@ docker run --rm -it --name ${container_name} --shm-size=64g --gpus device=0 -e Q
 
 
 #END
-
-} 2>&1 | tee -a "$LOG_FILE"

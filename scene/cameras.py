@@ -63,12 +63,15 @@ class Camera(nn.Module):
             or (not args.distributed_dataset_storage)
         ):
             # load to cpu
+            print('\nCPU load\n')
             self.original_image_backup = image.contiguous()
             if args.preload_dataset_to_gpu:
+                print('\nGPU load\n')
                 self.original_image_backup = self.original_image_backup.to("cuda")
             self.image_width = self.original_image_backup.shape[2]
             self.image_height = self.original_image_backup.shape[1]
         else:
+            print('\nNO load\n')
             self.original_image_backup = None
             self.image_height, self.image_width = utils.get_img_size()
 

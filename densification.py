@@ -26,9 +26,11 @@ def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
             gaussians.add_densification_stats(screenspace_mean2D, visibility_filter)
         timers.stop("densification_update_stats")
 
-        if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
+        should_densify = iteration > args.densify_from_iter and utils.check_update_at_this_iter(
             iteration, args.bsz, args.densification_interval, 0
-        ):
+        )
+        
+        if should_densify:
             assert (
                 args.stop_update_param == False
             ), "stop_update_param must be false for densification; because it is a flag for debugging."
@@ -36,13 +38,17 @@ def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
 
             timers.start("densify_and_prune")
             size_threshold = 20 if iteration > args.opacity_reset_interval else None
+            num_gaussians_before = gaussians.get_xyz.shape[0]
             gaussians.densify_and_prune(
                 args.densify_grad_threshold,
                 args.min_opacity,
                 scene.cameras_extent,
                 size_threshold,
             )
+            num_gaussians_after = gaussians.get_xyz.shape[0]
             timers.stop("densify_and_prune")
+            
+            print(f"[DENSIFY] Iteration {iteration}: {num_gaussians_before} -> {num_gaussians_after} gaussians")
 
             # redistribute after densify_and_prune, because we have new gaussians to distribute evenly.
             if utils.get_denfify_iter() % args.redistribute_gaussians_frequency == 0:
@@ -77,9 +83,11 @@ def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
 
         timers.stop("densification")
     else:
-        if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
+        should_densify = iteration > args.densify_from_iter and utils.check_update_at_this_iter(
             iteration, args.bsz, args.densification_interval, 0
-        ):
+        )
+        
+        if should_densify:
             utils.check_memory_usage(log_file, args, iteration, gaussians, n_g_max, before_densification_stop = False)
 
 
@@ -92,7 +100,6 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
     print(f'iteration : {iteration} / {args.densify_from_iter} ~ {args.densify_until_iter}');  exit(1)
     '''
     # Densification
-
     n_gauss = len(gaussians.get_xyz)
     if not args.disable_auto_densification and iteration <= args.densify_until_iter:
     #if not args.disable_auto_densification and iteration <= args.densify_until_iter and n_gauss <= n_g_max:
@@ -124,9 +131,11 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
             )
         timers.stop("densification_update_stats")
 
-        if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
+        should_densify = iteration > args.densify_from_iter and utils.check_update_at_this_iter(
             iteration, args.bsz, args.densification_interval, 0
-        ):
+        )
+        
+        if should_densify:
             assert (
                 args.stop_update_param == False
             ), "stop_update_param must be false for densification; because it is a flag for debugging."
@@ -134,13 +143,17 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
 
             timers.start("densify_and_prune")
             size_threshold = 20 if iteration > args.opacity_reset_interval else None
+            num_gaussians_before = gaussians.get_xyz.shape[0]
             gaussians.densify_and_prune(
                 args.densify_grad_threshold,
                 args.min_opacity,
                 scene.cameras_extent,
                 size_threshold,
             )
+            num_gaussians_after = gaussians.get_xyz.shape[0]
             timers.stop("densify_and_prune")
+            
+            print(f"[DENSIFY] Iteration {iteration}: {num_gaussians_before} -> {num_gaussians_after} gaussians")
 
             # redistribute after densify_and_prune, because we have new gaussians to distribute evenly.
             if utils.get_denfify_iter() % args.redistribute_gaussians_frequency == 0:
@@ -175,7 +188,9 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
 
         timers.stop("densification")
     else:
-        if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
+        should_densify = iteration > args.densify_from_iter and utils.check_update_at_this_iter(
             iteration, args.bsz, args.densification_interval, 0
-        ):
+        )
+        
+        if should_densify:
             utils.check_memory_usage(log_file, args, iteration, gaussians, n_g_max,before_densification_stop = False)

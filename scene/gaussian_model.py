@@ -199,8 +199,8 @@ class GaussianModel:
             )
             # print("rank", utils.GLOBAL_RANK, "Number of initialized points after gaussians_distribution : ", fused_point_cloud.shape[0])
 
-        if args.drop_initial_3dgs_p > 0.0:
-            # drop each point with probability args.drop_initial_3dgs_p
+        if args.drop_initial_3dgs_p > 0.0 and not args.deterministic:
+            # drop each point with probability args.drop_initial_3dgs_p (skip if deterministic)
             drop_mask = (
                 np.random.rand(fused_point_cloud.shape[0]) > args.drop_initial_3dgs_p
             )
@@ -862,8 +862,8 @@ class GaussianModel:
             rots = np.ascontiguousarray(rots[point_ind_l:point_ind_r])
             opacities = np.ascontiguousarray(opacities[point_ind_l:point_ind_r])
 
-        if args.drop_initial_3dgs_p > 0.0:
-            # drop each point with probability args.drop_initial_3dgs_p
+        if args.drop_initial_3dgs_p > 0.0 and not args.deterministic:
+            # drop each point with probability args.drop_initial_3dgs_p (skip if deterministic)
             drop_mask = np.random.rand(xyz.shape[0]) > args.drop_initial_3dgs_p
             xyz = xyz[drop_mask]
             features_dc = features_dc[drop_mask]
@@ -1080,7 +1080,21 @@ class GaussianModel:
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
-        samples = torch.normal(mean=means, std=stds)
+        
+        # Use deterministic sampling if deterministic mode is enabled
+        args = utils.get_args()
+        if args.deterministic:
+            # Use deterministic offsets instead of random sampling
+            # Create fixed offsets based on scaling for reproducible splits
+            samples = torch.zeros_like(means)
+            for i in range(N):
+                start_idx = i * selected_pts_mask.sum().item()
+                end_idx = (i + 1) * selected_pts_mask.sum().item()
+                # Use a deterministic pattern: alternate positive/negative offsets
+                factor = 0.1 if i % 2 == 0 else -0.1
+                samples[start_idx:end_idx] = stds[start_idx:end_idx] * factor
+        else:
+            samples = torch.normal(mean=means, std=stds)
         # [N * number of selected points, 3]
 
         utils.get_log_file().write(
@@ -1388,7 +1402,14 @@ class GaussianModel:
 
     def get_destination_1(self, world_size):
         # norm p=0
-        return torch.randint(0, world_size, (self.get_xyz.shape[0],), device="cuda")
+        args = utils.get_args()
+        if args.deterministic:
+            # Use deterministic assignment: round-robin distribution
+            gaussian_count = self.get_xyz.shape[0]
+            destinations = torch.arange(gaussian_count, device="cuda") % world_size
+            return destinations
+        else:
+            return torch.randint(0, world_size, (self.get_xyz.shape[0],), device="cuda")
 
     def need_redistribute_gaussians(self, group):
         args = utils.get_args()

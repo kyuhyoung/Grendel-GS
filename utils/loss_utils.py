@@ -583,6 +583,19 @@ def pixelwise_ssim_with_mask(img1, img2, pixel_mask, use_chunk):
     #return pixelwise_ssim_with_mask_checkpointed(img1, img2, pixel_mask)
     #return pixelwise_ssim_with_mask_safe_efficient(img1, img2, pixel_mask)
     #return pixelwise_ssim_with_mask_mixed_precision(img1, img2, pixel_mask)
+    
+    # Skip SSIM computation when lambda_dssim is 0 to avoid OOM
+    import utils.general_utils as utils
+    args = utils.get_args()
+    if hasattr(args, 'lambda_dssim') and args.lambda_dssim == 0.0:
+        # Return zeros with same shape as expected SSIM output
+        # img1 is [H, W, C] format, return single channel zeros
+        if img1.dim() == 3:
+            H, W, C = img1.shape
+            return torch.zeros((H, W, 1), device=img1.device, dtype=img1.dtype)
+        else:
+            return torch.zeros_like(img1[:, 0:1, :, :])
+    
     if use_chunk:
         return pixelwise_ssim_with_mask_improved_chunked(img1, img2, pixel_mask, 4096)
     else:

@@ -67,7 +67,7 @@ class AuxiliaryParams(ParamGroup):
         self.detect_anomaly = False
         self.test_iterations = [7_000, 30_000]
         #self.save_iterations = [7_000, 30_000]
-        self.save_iterations = [50, 500, 1_000, 2_000, 4_000, 6_000, 8_000, 11_000, 14_000, 18_000, 23_000, 29_000, 36_000, 44_000, 53_000, 63_000, 74_000, 86_000, 110_000]
+        self.save_iterations = [50, 300, 600, 1_000, 2_000, 4_000, 6_000, 8_000, 11_000, 14_000, 18_000, 23_000, 29_000, 36_000, 44_000, 53_000, 63_000, 74_000, 86_000, 110_000]
         self.quiet = False
         #self.checkpoint_iterations = []
         self.checkpoint_iterations = self.save_iterations 
@@ -77,6 +77,7 @@ class AuxiliaryParams(ParamGroup):
         self.log_interval = 250
         self.llffhold = 8
         self.backend = "default" # "default", "gsplat"
+        self.deterministic = False  # Enable deterministic execution for reproducible results
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -295,6 +296,14 @@ def init_args(args):
 
     if args.auto_start_checkpoint:
         args.start_checkpoint = find_latest_checkpoint(args.log_folder)
+
+    # Apply deterministic settings if requested
+    if args.deterministic:
+        # Disable random redistribution
+        args.redistribute_gaussians_mode = "no_redistribute"
+        # Disable random background
+        args.random_background = False
+        print("[INFO] Deterministic mode enabled: random redistribution disabled")
 
     if utils.DEFAULT_GROUP.size() == 1:
         #print('aaa')
