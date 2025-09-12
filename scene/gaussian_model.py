@@ -197,7 +197,7 @@ class GaussianModel:
                     utils.GLOBAL_RANK, fused_point_cloud.shape[0]
                 )
             )
-            # print("rank", utils.GLOBAL_RANK, "Number of initialized points after gaussians_distribution : ", fused_point_cloud.shape[0])
+            print("rank", utils.GLOBAL_RANK, "Number of initialized points after gaussians_distribution : ", fused_point_cloud.shape[0])
 
         if args.drop_initial_3dgs_p > 0.0 and not args.deterministic:
             # drop each point with probability args.drop_initial_3dgs_p (skip if deterministic)

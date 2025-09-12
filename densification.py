@@ -48,7 +48,7 @@ def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
             num_gaussians_after = gaussians.get_xyz.shape[0]
             timers.stop("densify_and_prune")
             
-            print(f"[DENSIFY] Iteration {iteration}: {num_gaussians_before} -> {num_gaussians_after} gaussians")
+            # print(f"[DENSIFY] Iteration {iteration}: {num_gaussians_before} -> {num_gaussians_after} gaussians")
 
             # redistribute after densify_and_prune, because we have new gaussians to distribute evenly.
             if utils.get_denfify_iter() % args.redistribute_gaussians_frequency == 0:
@@ -153,7 +153,7 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
             num_gaussians_after = gaussians.get_xyz.shape[0]
             timers.stop("densify_and_prune")
             
-            print(f"[DENSIFY] Iteration {iteration}: {num_gaussians_before} -> {num_gaussians_after} gaussians")
+            # print(f"[DENSIFY] Iteration {iteration}: {num_gaussians_before} -> {num_gaussians_after} gaussians")
 
             # redistribute after densify_and_prune, because we have new gaussians to distribute evenly.
             if utils.get_denfify_iter() % args.redistribute_gaussians_frequency == 0:

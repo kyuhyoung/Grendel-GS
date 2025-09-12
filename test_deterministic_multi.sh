@@ -1,12 +1,26 @@
 #!/bin/bash
-# Deterministic test script with memory optimization
+# Multi-GPU deterministic test script
 
 # Clear existing log and redirect output to both console and log file
-> test_deterministic.log
-exec > >(tee -a test_deterministic.log) 2>&1
+> test_deterministic_multi.log
+exec > >(tee -a test_deterministic_multi.log) 2>&1
 
-echo "===== Deterministic Test Script ====="
-echo "Testing reproducibility of 3DGS training"
+echo "===== Multi-GPU Deterministic Test Script ====="
+echo "Testing reproducibility of 3DGS training on multiple GPUs"
+echo ""
+
+# Check available GPUs
+GPU_COUNT=$(nvidia-smi -L | wc -l)
+echo "Available GPUs: $GPU_COUNT"
+
+if [[ $GPU_COUNT -lt 2 ]]; then
+    echo "❌ At least 2 GPUs required for multi-GPU test"
+    exit 1
+fi
+
+# Use all available GPUs for the test
+NGPUS=$GPU_COUNT
+echo "Using all $NGPUS GPUs for test"
 echo ""
 
 # Set deterministic environment variables
@@ -18,17 +32,17 @@ export PYTHONHASHSEED=0
 # Scene configuration
 SCENE=samsung_dong_mini_5
 DIR_DATA=/data/$SCENE
-OUTPUT_BASE=./output/${SCENE}_deterministic_test
+OUTPUT_BASE=./output/${SCENE}_deterministic_multi_test
 
-# Test parameters for memory efficiency
-N_GAUSSIANS=500000  # Increased for more complete test
-ITERATIONS=155      # Test after multiple densifications (at iter 10, 20, 30, 40, 50, ...)
-DENSIFY_INTERVAL=10 # Densify every 10 iterations
-SH_DEGREE=0         # Minimal SH
-IMAGE_RESOLUTION=1  # Add resolution downscaling if available
+# Test parameters for multi-GPU
+N_GAUSSIANS=5000000  # Increased to 5M total (더 많은 Gaussian)
+ITERATIONS=155       # Same as single GPU test
+DENSIFY_INTERVAL=10  # Densify every 10 iterations
+SH_DEGREE=3          # Full SH degree for better quality (더 많은 메모리 사용)
 
 echo "Configuration:"
 echo "  Scene: $SCENE"
+echo "  GPUs: $NGPUS"
 echo "  Max Gaussians: $N_GAUSSIANS"
 echo "  Iterations: $ITERATIONS"
 echo "  Output: $OUTPUT_BASE"
@@ -39,21 +53,23 @@ run_test() {
     local run_id=$1
     local output_dir="${OUTPUT_BASE}_run_${run_id}"
     
-    echo "Starting Run #${run_id}..."
+    echo "Starting Multi-GPU Run #${run_id}..."
     echo "Output: $output_dir"
     
     # Clear GPU memory before starting
-    nvidia-smi --gpu-reset -i 0 2>/dev/null || true
+    for ((i=0; i<$NGPUS; i++)); do
+        nvidia-smi --gpu-reset -i $i 2>/dev/null || true
+    done
     
-    # Run training with single GPU
-    torchrun --standalone --nnodes=1 --nproc-per-node=1 train.py \
+    # Run training with multiple GPUs
+    torchrun --standalone --nnodes=1 --nproc-per-node=$NGPUS train.py \
         --bsz 1 \
         -s $DIR_DATA \
         --model_path $output_dir \
         --preload_dataset_to_gpu_threshold 0 \
         --densification_interval $DENSIFY_INTERVAL \
         --densify_from_iter 5 \
-        --n_g_per_proc $N_GAUSSIANS \
+        --n_g_per_proc $((N_GAUSSIANS / NGPUS)) \
         --sh_degree $SH_DEGREE \
         --deterministic \
         --backend gsplat \
@@ -62,21 +78,21 @@ run_test() {
         --test_iterations $ITERATIONS \
         --save_iterations $ITERATIONS \
         --checkpoint_iterations $ITERATIONS \
-        --lambda_dssim 0.0 \
-        --use_chunk
+        --use_chunk \
+        --gaussians_distribution
     
-    echo "Run #${run_id} completed"
+    echo "Multi-GPU Run #${run_id} completed"
     echo ""
 }
 
 # Run two tests
-echo "===== Starting deterministic tests ====="
+echo "===== Starting multi-GPU deterministic tests ====="
 run_test 1
 run_test 2
 
 echo "===== Comparing results ====="
 
-# Find PLY files from both runs (specifically the trained models at final iteration)
+# Find PLY files from both runs
 PLY1=$(find ${OUTPUT_BASE}_run_1 -name "*_i_$(printf "%05d" ${ITERATIONS})_*.ply" | head -n 1)
 PLY2=$(find ${OUTPUT_BASE}_run_2 -name "*_i_$(printf "%05d" ${ITERATIONS})_*.ply" | head -n 1)
 
@@ -115,4 +131,4 @@ else
 fi
 
 echo ""
-echo "===== Test completed ====="
+echo "===== Multi-GPU Test completed ====="

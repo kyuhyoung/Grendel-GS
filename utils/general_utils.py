@@ -315,7 +315,10 @@ def check_memory_usage(log_file, args, iteration, gaussians, n_gauss_max, before
     max_reserved_memory = torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024
     now_reserved_memory = torch.cuda.memory_reserved() / 1024 / 1024 / 1024
     n_gauss_cur = gaussians.get_xyz.shape[0]
-    print('n_gauss_cur : {} / {}'.format(n_gauss_cur, n_gauss_max if n_gauss_max > 0 else "")); #exit(1)
+    group = DEFAULT_GROUP
+    rank = group.rank() if group is not None else 0
+    print('[Rank {}] Iteration {}: n_gauss_cur : {} / {}'.format(
+        rank, iteration, n_gauss_cur, n_gauss_max if n_gauss_max > 0 else ""))
     log_str = ""
     log_str += "iteration[{},{}] {}. Now # of Gaussians: {} / {}. Now Memory usage: {} GB. Max Memory usage: {} GB. Max Reserved Memory: {} GB. Now Reserved Memory: {} GB. \n".format(
         iteration,
@@ -463,6 +466,26 @@ def build_scaling_rotation(s, r):
     L = R @ L
     return L
 
+
+def get_total_gaussian_count(gaussians):
+    """Get total Gaussian count across all ranks (only during densification)"""
+    args = get_args()
+    if not args.gaussians_distribution:
+        return gaussians.get_xyz.shape[0]
+    
+    # For distributed case, gather counts from all ranks
+    group = DEFAULT_GROUP
+    local_count = gaussians.get_xyz.shape[0]
+    
+    # Create tensor for all counts
+    all_counts = torch.zeros(group.size(), dtype=torch.long, device="cuda")
+    all_counts[group.rank()] = local_count
+    
+    # All-reduce to get total count on all ranks
+    torch.distributed.all_reduce(all_counts, op=torch.distributed.ReduceOp.SUM)
+    
+    total_count = torch.sum(all_counts).item()
+    return total_count
 
 def safe_state(silent):
     old_f = sys.stdout
