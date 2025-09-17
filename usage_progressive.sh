@@ -91,6 +91,15 @@ if [[ ! -x "./progressive_train.sh" ]]; then
     chmod +x ./progressive_train.sh
 fi
 
+# Install required submodules if not already installed
+print_colored $YELLOW "⚠️  Installing required submodules..."
+if pip install submodules/diff-gaussian-rasterization submodules/gsplat submodules/simple-knn; then
+    print_colored $GREEN "✓ Submodules installed successfully"
+else
+    print_colored $RED "❌ Warning: Some submodules may have failed to install"
+    print_colored $YELLOW "Continuing anyway..."
+fi
+
 # Validate source path
 if [[ ! -d "$SOURCE_PATH" ]]; then
     print_colored $RED "❌ Error: Source path does not exist: $SOURCE_PATH"

@@ -1363,7 +1363,7 @@ class COLMAPVisualizer:
             subset_name = subset.get('name', f'Subset_{idx}')
             camera_ids = subset.get('camera_ids', [])
             color = subset.get('color', default_colors[idx % len(default_colors)])
-            print(f'subset_name : {subset_name}, camera_ids : {camera_ids}, color : {color}');   exit(1);
+            print(f'subset_name : {subset_name}, camera_ids : {camera_ids}, color : {color}');   #exit(1);
             for cam_id in camera_ids:
                 camera_color_map[cam_id] = color
                 camera_subset_map[cam_id] = subset_name
@@ -1372,7 +1372,11 @@ class COLMAPVisualizer:
         default_camera_color = 'gray'
 
         # 4. 카메라들과 ray casting - create_nadir_view와 동일한 로직이지만 색상만 다름
+        #print(f'self.images.keys() : {self.images.keys()}');  exit(1)
+        #self.images.keys() : dict_keys([7, 65, 41, 36, 46])
         for image_id, image in self.images.items():
+            #print(f'image_id : {image_id}, camera_color_map : {camera_color_map}');  exit(1)
+            #image_id : 7, camera_color_map : {41: 'red', 46: 'red', 36: 'red'}
             # Get color for this camera
             camera_color = camera_color_map.get(image_id, default_camera_color)
             is_in_subset = image_id in camera_color_map
@@ -1380,8 +1384,10 @@ class COLMAPVisualizer:
             # Camera marker size and alpha based on whether it's in a subset
             marker_size = 150 if is_in_subset else 50
             marker_alpha = 1.0 if is_in_subset else 0.3
-
+            print(f'image.keys() : {image.keys()}');   #exit(1)
+            #image.keys() : dict_keys(['id', 'qw', 'qx', 'qy', 'qz', 'tx', 'ty', 'tz', 'camera_id', 'name', 'position'])
             camera_center = image['camera_center']
+
             ax.scatter(*camera_center, c=camera_color, s=marker_size, marker='^', alpha=marker_alpha)
 
             # Annotate camera ID for subset cameras
@@ -1393,13 +1399,15 @@ class COLMAPVisualizer:
             try:
                 _, ray_dirs = self.get_camera_corners(image_id)
                 ground_points = []
-
+                print('aaa');   exit(1)
+                
                 for i in range(4):
                     result = self.raycast_to_dtm(camera_center, ray_dirs[:, i])
                     if result[0] is not None:
                         intersection, _ = result
                         ground_points.append(intersection)
 
+                print('bbb');
                 if len(ground_points) >= 3:
                     ground_points = np.array(ground_points)
 
@@ -1422,10 +1430,12 @@ class COLMAPVisualizer:
                                [camera_center[2], point[2]],
                                color=camera_color, linewidth=footprint_linewidth*0.3, alpha=footprint_alpha*0.5)
 
+                print('ccc');
             except Exception as e:
                 if hasattr(self, 'debug') and self.debug:
                     print(f"DEBUG: Error processing camera {image_id}: {e}")
 
+        print('aaaa');  exit(1)
         # 5. Nadir view 설정 (위에서 아래로) - create_nadir_view와 동일
         ax.view_init(elev=90, azim=0)
 
@@ -1488,6 +1498,7 @@ class COLMAPVisualizer:
         plt.close()
 
         print(f"Nadir view saved to {save_path}")
+        exit(1)
 
 def main():
     """메인 실행 함수"""
