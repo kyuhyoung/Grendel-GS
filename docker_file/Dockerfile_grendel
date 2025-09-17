@@ -45,67 +45,12 @@ RUN conda init bash && conda info --envs
 # Set Grendel as default environment
 RUN echo "conda activate Grendel" >> ~/.bashrc
 
-# Cache buster for forcing rebuild when needed
-ARG CACHEBUST=1
-
-# Copy submodules and install gsplat, simple-knn, and diff-gaussian-rasterization during build
-COPY submodules/ /tmp/submodules/
-
-# Force rebuild by showing file checksums
-RUN find /tmp/submodules -name "setup.py" -exec md5sum {} \;
-SHELL ["/bin/bash", "-c", "source activate Grendel && bash"]
-ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0"
-
-# Force rebuild of gsplat and simple-knn layers
-ARG REBUILD_PACKAGES=2
-RUN echo "Rebuild trigger for packages: ${REBUILD_PACKAGES} at $(date)"
-
-# Install each package separately for better error tracking
-RUN echo "==================== Installing gsplat ====================" && \
-    cd /tmp/submodules/gsplat && \
-    echo "Current directory: $(pwd)" && \
-    echo "Files in directory:" && ls -la && \
-    echo "Starting pip install with verbose output..." && \
-    pip install -vvv . --no-cache-dir 2>&1 && \
-    echo "Installation exit code: $?" && \
-    python -c 'import gsplat; print("✓ gsplat installed and imported successfully")' && \
-    pip show gsplat && \
-    echo "==================== gsplat DONE ===================="
-
-RUN echo "==================== Installing simple-knn ====================" && \
-    cd /tmp/submodules/simple-knn && \
-    echo "Current directory: $(pwd)" && \
-    echo "Files in directory:" && ls -la && \
-    echo "Starting pip install with verbose output..." && \
-    pip install -vvv . --no-cache-dir 2>&1 && \
-    echo "Installation exit code: $?" && \
-    python -c 'import simple_knn; print("✓ simple-knn installed and imported successfully")' && \
-    pip show simple-knn && \
-    echo "==================== simple-knn DONE ===================="
-
-RUN echo "==================== Installing diff-gaussian-rasterization ====================" && \
-    cd /tmp/submodules/diff-gaussian-rasterization && \
-    echo "Start time: $(date)" && \
-    pip install -v . --no-cache-dir --force-reinstall && \
-    echo "End time: $(date)" && \
-    python -c 'import diff_gaussian_rasterization; print("✓ diff-gaussian-rasterization installed and imported successfully")' && \
-    pip show diff-gaussian-rasterization && \
-    echo "==================== diff-gaussian-rasterization DONE ===================="
-
-# Verify all imports work together
-RUN echo "==================== FINAL VERIFICATION ====================" && \
-    python -c 'import torch; print(f"✓ PyTorch {torch.__version__}")' && \
-    python -c 'import gsplat; print("✓ gsplat imported")' && \
-    python -c 'import simple_knn; print("✓ simple_knn imported")' && \
-    python -c 'import diff_gaussian_rasterization; print("✓ diff_gaussian_rasterization imported")' && \
-    echo "==================== ALL PACKAGES VERIFIED ===================="
-
-# Clean up
-RUN rm -rf /tmp/submodules
-
-# Copy and run final verification script
-COPY docker_file/verify_packages.py /tmp/verify_packages.py
-RUN python /tmp/verify_packages.py && rm /tmp/verify_packages.py
 
 # Ensure Python path is set correctly in bashrc
 RUN echo 'export PYTHONPATH="/opt/conda/envs/Grendel/lib/python3.11/site-packages:$PYTHONPATH"' >> ~/.bashrc
+RUN apt-get update && apt-get install -y curl && \
+    curl -fsSL https://claude.ai/install.sh -o install.sh && \
+    bash install.sh && \
+    rm install.sh && \
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && \
+    rm -rf /var/lib/apt/lists/*
