@@ -23,12 +23,48 @@ class COLMAPVisualizer:
         self.images = {}
         self.points3d = {}
         self.only_actually_visible = only_actually_visible
+        self.color_cam = [
+            'red', 'blue', 'green', 'orange', 'purple', 'cyan', 'magenta', 'yellow',
+            'lime', 'pink', 'brown', 'olive', 'navy', 'maroon', 'teal', 'gold', 'indigo', 'coral',
+            'tomato', 'orangered', 'deeppink', 'hotpink', 'springgreen', 'mediumseagreen',
+            'royalblue', 'steelblue', 'mediumorchid', 'crimson', 'forestgreen',
+            'dodgerblue', 'sienna', 'orchid', 'turquoise', 'limegreen', 'goldenrod',
+            'mediumblue', 'mediumvioletred', 'peru', 'chocolate', 'saddlebrown',
+            'midnightblue', 'firebrick', 'mediumaquamarine', 'cadetblue',
+            'cornflowerblue', 'mediumturquoise', 'lawngreen', 'aqua', 'fuchsia',
+            'deepskyblue', 'chartreuse', 'yellowgreen', 'palegreen', 'violet',
+            'rosybrown', 'mediumpurple', 'blueviolet', 'tan', 'khaki', 'skyblue',
+            'plum', 'salmon', 'peachpuff', 'palevioletred', 'sandybrown', 'powderblue',
+            'aquamarine', 'wheat', 'moccasin', 'bisque'
+        ]
     
     def set_external_data(self, cameras, images, points3d):
         """외부에서 이미 로드된 데이터를 설정"""
         print("Setting external data...")
         self.cameras = cameras
-        self.images = images
+
+        # Convert images to the same format as load_images()
+        converted_images = {}
+        for img_id, img_data in images.items():
+            # Reconstruct R from quaternion
+            R = self.quaternion_to_rotation_matrix([img_data['qw'], img_data['qx'],
+                                                   img_data['qy'], img_data['qz']])
+            t = img_data['position'] if 'position' in img_data else np.array([img_data['tx'],
+                                                                              img_data['ty'],
+                                                                              img_data['tz']])
+            # Compute camera center in world coordinates
+            camera_center = -R.T @ t
+
+            converted_images[img_id] = {
+                'id': img_id,
+                'R': R,
+                't': t,
+                'camera_center': camera_center,
+                'camera_id': img_data['camera_id'],
+                'name': img_data['name']
+            }
+        self.images = converted_images
+
         # points3d 형식을 colmap_visualizer 형식으로 변환
         converted_points3d = {}
         for pt_id, pt_data in points3d.items():
@@ -480,6 +516,7 @@ class COLMAPVisualizer:
             raise ValueError(f"Image {image_id} not found")
             
         image = self.images[image_id]
+        #print(f'image.keys() : {image.keys()}')
         camera = self.cameras[image['camera_id']]
         
         # 이미지 꼭지점들 (pixel coordinates)
@@ -490,25 +527,37 @@ class COLMAPVisualizer:
             [w, h, 1],      # 오른쪽 하단
             [0, h, 1]       # 왼쪽 하단
         ]).T
-        
+        #print(f'corners_2d : {corners_2d}');    print(f'camera : {camera}')
+
         # Camera intrinsics (자동 파싱된 파라미터 사용)
         fx = camera['params']['fx']
         fy = camera['params']['fy']
         cx = camera['params']['cx']
         cy = camera['params']['cy']
             
+        #print('555')
         K = np.array([
             [fx, 0, cx],
             [0, fy, cy], 
             [0, 0, 1]
         ])
         
+        #print(f'K : {K}')
         # Normalize coordinates
+        '''
+        t0 = np.linalg.inv(K);  print(f't0 : {t0}')
+        t1 = t0 @ corners_2d;   print(f't1 : {t1}')
+        '''
         corners_normalized = np.linalg.inv(K) @ corners_2d
         
+        #print(f"corners_normalized : {corners_normalized}")
+        #print(f"image['R'] : {image['R']}")
         # Camera center and rotation
+
         R = image['R']
+        #print('888')
         camera_center = image['camera_center']
+        #print('999')
         
         # Ray directions in world coordinates
         ray_dirs = R.T @ corners_normalized
@@ -792,17 +841,13 @@ class COLMAPVisualizer:
             'success': 0
         }
         
-        # 카메라별 색상 생성 (색상 팔레트)
-        colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan', 'magenta', 'yellow', 
-                 'lime', 'pink', 'brown', 'gray', 'olive', 'navy', 'maroon', 'teal',
-                 'silver', 'gold', 'indigo', 'coral']
-        
         image_count = 0
         # 모든 이미지 처리
         for image_id, image in self.images.items():
             image_count += 1
             # 카메라별 색상 선택 (순환)
-            camera_color = colors[(image_count - 1) % len(colors)]
+            #camera_color = colors[(image_count - 1) % len(colors)]
+            camera_color = self.color_cam[image_id % len(self.color_cam)]
             
             print(f"DEBUG: Processing image {image_count}/{len(self.images)} (ID: {image_id}) - Color: {camera_color}")
             
@@ -1119,21 +1164,17 @@ class COLMAPVisualizer:
         contour = ax.contourf(self.dtm['x_grid'], self.dtm['y_grid'], self.dtm['z_grid'],
                              levels=50, cmap='terrain', alpha=0.8)
         
-        # 카메라별 색상 생성 (3D 시각화와 동일한 색상 팔레트)
-        colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan', 'magenta', 'yellow', 
-                 'lime', 'pink', 'brown', 'gray', 'olive', 'navy', 'maroon', 'teal',
-                 'silver', 'gold', 'indigo', 'coral']
-        
         # 카메라 위치들 표시
         image_count = 0
         for image_id, image in self.images.items():
             image_count += 1
-            camera_color = colors[(image_count - 1) % len(colors)]
+            #camera_color = colors[(image_count - 1) % len(colors)]
+            camera_color = self.color_cam[image_id % len(self.color_cam)]
             
             camera_center = image['camera_center']
             ax.plot(camera_center[0], camera_center[1], '^', 
                    color=camera_color, markersize=8, alpha=0.8)
-            
+            a
             # 이미지 footprint
             _, ray_dirs = self.get_camera_corners(image_id)
             ground_points = []
@@ -1227,14 +1268,14 @@ class COLMAPVisualizer:
             print(f"Displayed {len(xyz_points)} 3D points")
 
         # 3. 카메라들과 ray casting (동일한 로직)
-        colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan', 'magenta', 'yellow', 
-                 'lime', 'pink', 'brown', 'gray', 'olive', 'navy', 'maroon', 'teal',
-                 'silver', 'gold', 'indigo', 'coral']
         
         image_count = 0
         for image_id, image in self.images.items():
+            #print(f'type(image_id) : {type(image_id)}');    exit(1)
+            #type(image_id) : <class 'int'>
             image_count += 1
-            camera_color = colors[(image_count - 1) % len(colors)]
+            #camera_color = colors[(image_count - 1) % len(colors)]
+            camera_color = self.color_cam[image_id % len(self.color_cam)]
             
             camera_center = image['camera_center']
             ax.scatter(*camera_center, c=camera_color, s=100, marker='^')
@@ -1259,14 +1300,14 @@ class COLMAPVisualizer:
                         ax.plot([ground_points[i][0], ground_points[next_i][0]],
                                [ground_points[i][1], ground_points[next_i][1]],
                                [ground_points[i][2], ground_points[next_i][2]],
-                               color=camera_color, linewidth=1, alpha=0.7)
+                               color=camera_color, linewidth=3, alpha=0.7)
                         
                     # 카메라에서 ground로 연결선
                     for point in ground_points:
                         ax.plot([camera_center[0], point[0]],
                                [camera_center[1], point[1]], 
                                [camera_center[2], point[2]],
-                               color=camera_color, linewidth=0.5, alpha=0.3)
+                               color=camera_color, linewidth=1, alpha=0.3)
                         
             except Exception as e:
                 print(f"DEBUG: Error processing camera {image_id}: {e}")
@@ -1319,7 +1360,7 @@ class COLMAPVisualizer:
         
         print(f"Nadir view saved to {save_path}")
 
-    def create_nadir_view_multi(self, subsets_info, save_path='nadir_view_multi.png'):
+    def create_nadir_view_multi(self, subsets_info, save_path='nadir_view_multi.png', only_selected=False, median_point=None):
         """
         create_nadir_view와 동일하지만 subset 카메라들을 색상으로 구분하여 표시
 
@@ -1331,6 +1372,8 @@ class COLMAPVisualizer:
                     'color': str (optional),  # Color for visualization
                 }
             save_path: Output path for the visualization
+            only_selected: If True, only show cameras in subsets (hide other cameras)
+            median_point: If provided, display median position as a special marker
         """
         if not all([self.cameras, self.images, self.points3d]):
             raise ValueError("Load all COLMAP data first")
@@ -1351,10 +1394,10 @@ class COLMAPVisualizer:
             # Point cloud scatter plot
             ax.scatter(xyz_points[:, 0], xyz_points[:, 1], xyz_points[:, 2],
                       c=rgb_points, s=0.1, alpha=0.6)
-            print(f"Displayed {len(xyz_points)} 3D points")
+            print(f"Displayed {len(xyz_points)} 3D ppoints")
 
         # 3. 카메라 색상 매핑 준비
-        camera_color_map = {}  # camera_id -> color
+        camera_color_map_set = {}  # camera_id -> color
         camera_subset_map = {}  # camera_id -> subset_name
         default_colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan', 'magenta', 'yellow']
 
@@ -1362,10 +1405,12 @@ class COLMAPVisualizer:
         for idx, subset in enumerate(subsets_info):
             subset_name = subset.get('name', f'Subset_{idx}')
             camera_ids = subset.get('camera_ids', [])
-            color = subset.get('color', default_colors[idx % len(default_colors)])
-            print(f'subset_name : {subset_name}, camera_ids : {camera_ids}, color : {color}');   #exit(1);
+            color_set = subset.get('color', default_colors[idx % len(default_colors)])
+            print(f'subset_name : {subset_name}, camera_ids : {camera_ids}, color_set : {color_set}');   #exit(1);
             for cam_id in camera_ids:
-                camera_color_map[cam_id] = color
+                #kolor = self.color_cam[cam_id % len(self.color_cam)]
+                #camera_color_map[cam_id] = kolor
+                camera_color_map_set[cam_id] = color_set
                 camera_subset_map[cam_id] = subset_name
 
         # Default color for cameras not in any subset
@@ -1378,28 +1423,53 @@ class COLMAPVisualizer:
             #print(f'image_id : {image_id}, camera_color_map : {camera_color_map}');  exit(1)
             #image_id : 7, camera_color_map : {41: 'red', 46: 'red', 36: 'red'}
             # Get color for this camera
-            camera_color = camera_color_map.get(image_id, default_camera_color)
-            is_in_subset = image_id in camera_color_map
+            #camera_color = camera_color_map.get(image_id, default_camera_color)
+            camera_color = self.color_cam[image_id % len(self.color_cam)]
+            camera_color_set = camera_color_map_set.get(image_id, default_camera_color)
+            is_in_subset = image_id in camera_color_map_set
+
+            # Skip non-selected cameras if only_selected is True
+            if only_selected and not is_in_subset:
+                continue
 
             # Camera marker size and alpha based on whether it's in a subset
             marker_size = 150 if is_in_subset else 50
             marker_alpha = 1.0 if is_in_subset else 0.3
-            print(f'image.keys() : {image.keys()}');   #exit(1)
+            #print(f'image.keys() : {image.keys()}');   #exit(1)
             #image.keys() : dict_keys(['id', 'qw', 'qx', 'qy', 'qz', 'tx', 'ty', 'tz', 'camera_id', 'name', 'position'])
-            camera_center = image['camera_center']
 
+            # Handle both data structures: camera_center (from load_images) vs position (from progressive_trainer)
+            if 'camera_center' in image:
+                camera_center = image['camera_center']
+                #print('111');
+            elif 'position' in image:
+                # position is just t vector, need to compute actual camera center
+                # Reconstruct rotation matrix from quaternion
+                R = self.quaternion_to_rotation_matrix([image['qw'], image['qx'], image['qy'], image['qz']])
+                #print('222');
+                t = image['position']
+                camera_center = -R.T @ t
+            else:
+                #print('333');
+                raise KeyError(f"Image {image_id} has neither 'camera_center' nor 'position' key")
+
+            #print('4444');
             ax.scatter(*camera_center, c=camera_color, s=marker_size, marker='^', alpha=marker_alpha)
 
             # Annotate camera ID for subset cameras
+            #print('5555');
             if is_in_subset:
+                #print('555');
                 ax.text(camera_center[0], camera_center[1], camera_center[2] + 10,
                        str(image_id), fontsize=10, color=camera_color, weight='bold')
 
+            #print('6666');
             # Ray casting 및 footprint 표시 (기존과 동일)
             try:
+                #print('zzz');
                 _, ray_dirs = self.get_camera_corners(image_id)
+                #print('aaa');
                 ground_points = []
-                print('aaa');   exit(1)
                 
                 for i in range(4):
                     result = self.raycast_to_dtm(camera_center, ray_dirs[:, i])
@@ -1407,13 +1477,13 @@ class COLMAPVisualizer:
                         intersection, _ = result
                         ground_points.append(intersection)
 
-                print('bbb');
+                #print('bbb');
                 if len(ground_points) >= 3:
                     ground_points = np.array(ground_points)
 
                     # Footprint line width and alpha based on subset membership
-                    footprint_linewidth = 1.5 if is_in_subset else 0.5
-                    footprint_alpha = 0.8 if is_in_subset else 0.3
+                    footprint_linewidth = 3.0 if is_in_subset else 1.0  # Increased thickness
+                    footprint_alpha = 0.9 if is_in_subset else 0.4
 
                     # 3D 다각형 그리기
                     for i in range(len(ground_points)):
@@ -1421,21 +1491,29 @@ class COLMAPVisualizer:
                         ax.plot([ground_points[i][0], ground_points[next_i][0]],
                                [ground_points[i][1], ground_points[next_i][1]],
                                [ground_points[i][2], ground_points[next_i][2]],
-                               color=camera_color, linewidth=footprint_linewidth, alpha=footprint_alpha)
+                               color=camera_color, linewidth = footprint_linewidth * 2,alpha=footprint_alpha)
+                        ax.plot([ground_points[i][0], ground_points[next_i][0]],
+                               [ground_points[i][1], ground_points[next_i][1]],
+                               [ground_points[i][2], ground_points[next_i][2]],
+                               color=camera_color_set, linewidth = footprint_linewidth * 0.6,alpha=footprint_alpha)
 
                     # 카메라에서 ground로 연결선
                     for point in ground_points:
                         ax.plot([camera_center[0], point[0]],
                                [camera_center[1], point[1]],
                                [camera_center[2], point[2]],
-                               color=camera_color, linewidth=footprint_linewidth*0.3, alpha=footprint_alpha*0.5)
+                               color=camera_color, linewidth=footprint_linewidth, alpha=footprint_alpha)
+                        ax.plot([camera_center[0], point[0]],
+                               [camera_center[1], point[1]],
+                               [camera_center[2], point[2]],
+                               color=camera_color_set, linewidth=footprint_linewidth * 0.3, alpha=footprint_alpha)
 
-                print('ccc');
+                #print('ccc');
             except Exception as e:
                 if hasattr(self, 'debug') and self.debug:
                     print(f"DEBUG: Error processing camera {image_id}: {e}")
 
-        print('aaaa');  exit(1)
+        #print('aaaa');  #exit(1)
         # 5. Nadir view 설정 (위에서 아래로) - create_nadir_view와 동일
         ax.view_init(elev=90, azim=0)
 
@@ -1492,13 +1570,21 @@ class COLMAPVisualizer:
         if legend_elements:
             ax.legend(handles=legend_elements, loc='upper right')
 
+        # Add median point if provided
+        if median_point is not None:
+            ax.scatter(median_point[0], median_point[1], median_point[2],
+                      c='gold', s=200, marker='*', alpha=1.0,
+                      edgecolors='black', linewidth=2,
+                      label='Median Position')
+            print(f"Added median point at: ({median_point[0]:.2f}, {median_point[1]:.2f}, {median_point[2]:.2f})")
+
         # Save
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
 
-        print(f"Nadir view saved to {save_path}")
-        exit(1)
+        print(f"Nadir multi view saved to {save_path}")
+        #exit(1)
 
 def main():
     """메인 실행 함수"""

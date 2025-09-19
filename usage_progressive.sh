@@ -91,9 +91,9 @@ if [[ ! -x "./progressive_train.sh" ]]; then
     chmod +x ./progressive_train.sh
 fi
 
-# Install required submodules if not already installed
-print_colored $YELLOW "⚠️  Installing required submodules..."
-if pip install submodules/diff-gaussian-rasterization submodules/gsplat submodules/simple-knn; then
+# Install required submodules in editable mode (fast if already installed)
+print_colored $YELLOW "⚠️  Installing required submodules in editable mode..."
+if pip install -e submodules/diff-gaussian-rasterization -e submodules/gsplat -e submodules/simple-knn; then
     print_colored $GREEN "✓ Submodules installed successfully"
 else
     print_colored $RED "❌ Warning: Some submodules may have failed to install"

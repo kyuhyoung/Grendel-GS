@@ -18,6 +18,11 @@ __pycache__
 # COLMAP processing results
 *_colmap/
 
+# Submodule build files
+submodules/*/build/
+submodules/*/*.egg-info/
+submodules/*/dist/
+
 scripts/
 data
 results

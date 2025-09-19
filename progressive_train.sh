@@ -59,6 +59,8 @@ SH_DEGREE=3
 RESOLUTION=1
 BACKEND="gsplat"
 DETERMINISTIC=""
+WINDOW_SIZE=3
+ITERATIONS_PER_WINDOW=60
 EXTRA_ARGS=""
 
 # Parse command line arguments
@@ -106,6 +108,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --backend)
             BACKEND="$2"
+            shift 2
+            ;;
+        --window-size)
+            WINDOW_SIZE="$2"
+            shift 2
+            ;;
+        --iterations-per-window)
+            ITERATIONS_PER_WINDOW="$2"
             shift 2
             ;;
         --deterministic)
@@ -244,6 +254,15 @@ PYTHON_ARGS="$PYTHON_ARGS --sh_degree=$SH_DEGREE"
 PYTHON_ARGS="$PYTHON_ARGS --resolution=$RESOLUTION"
 PYTHON_ARGS="$PYTHON_ARGS --backend=$BACKEND"
 
+# Add sliding window parameters if specified
+if [[ -n "$WINDOW_SIZE" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --window_size=$WINDOW_SIZE"
+fi
+
+if [[ -n "$ITERATIONS_PER_WINDOW" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --iterations_per_window=$ITERATIONS_PER_WINDOW"
+fi
+
 if [[ "$DEBUG" == true ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --debug"
 fi
@@ -296,6 +315,8 @@ def main():
     parser.add_argument('--iterations', type=int, default=30000, help='Training iterations')
     parser.add_argument('--sh_degree', type=int, default=3, help='Spherical harmonics degree')
     parser.add_argument('--resolution', type=int, default=1, help='Resolution downscaling')
+    parser.add_argument('--window_size', type=int, default=3, help='Sliding window size')
+    parser.add_argument('--iterations_per_window', type=int, default=60, help='Iterations per sliding window')
     parser.add_argument('--backend', default='gsplat', help='Rendering backend')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--dtm_module', help='Path to external DTM module')
@@ -334,10 +355,14 @@ def main():
     trainer.resolution = args.resolution
     trainer.backend = args.backend
     trainer.deterministic = args.deterministic
-    
-    # Run the progressive training pipeline
+
+    # Run the progressive training pipeline with sliding window
     try:
-        trainer.run()
+        # Use sliding window approach with configurable parameters
+        window_size = getattr(args, 'window_size', 3)
+        iterations_per_window = getattr(args, 'iterations_per_window', 60)
+        trainer.run(sliding_window_size=window_size,
+                   iterations_per_window=iterations_per_window)
         print("\\n" + "="*60)
         print("Progressive Training Completed Successfully!")
         print(f"Results saved to: {args.output_path}")
