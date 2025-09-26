@@ -11,9 +11,13 @@ SOURCE_PATH="/data/samsung_dong_mini_5"  # Path to COLMAP reconstruction
 OUTPUT_PATH="./output/progressive_test"   # Output directory
 
 # Optional parameters
-INITIAL_CAMERAS=3                         # Number of initial cameras
+INITIAL_CAMERAS=2                         # Number of initial cameras
 GPU_THRESHOLD=0.9                         # GPU memory threshold (0-1)
 ITERATIONS=30000                          # Training iterations
+#ITERATIONS_PER_WINDOW=50                # Iterations per sliding window
+ITERATIONS_PER_WINDOW=25                # Iterations per sliding window
+DENSIFICATION_INTERVAL=20               # Densification every 20 iterations
+DENSIFY_FROM_ITER=10                    # Start densification from iteration 10
 SH_DEGREE=3                              # Spherical harmonics degree
 RESOLUTION=1                             # Resolution downscaling factor
 BACKEND="gsplat"                         # Rendering backend: default or gsplat
@@ -21,8 +25,13 @@ BACKEND="gsplat"                         # Rendering backend: default or gsplat
 # Flags (set to "true" to enable, "false" to disable)
 DETERMINISTIC=false                      # Enable deterministic training
 DEBUG=true                               # Enable debug output
+SHOW_MEMORY_DEBUG_INFO=false          # Show detailed memory debug info (memory, tensor stats)
+USE_CHUNK=true                           # Enable chunked SSIM for memory efficiency
+#USE_CHUNK=false                           # Enable chunked SSIM for memory efficiency
 #ONLY_ACTUALLY_VISIBLE=false             # Only keep points visible in camera frames
 ONLY_ACTUALLY_VISIBLE=true             # Only keep points visible in camera frames
+#TRACK_BY_PROJECTION=false               # Generate tracks by projection instead of using COLMAP tracks
+TRACK_BY_PROJECTION=true               # Generate tracks by projection instead of using COLMAP tracks
 
 # Advanced options (leave empty if not needed)
 DTM_MODULE=""                            # Path to external DTM module
@@ -64,12 +73,18 @@ echo "  Output Path: $OUTPUT_PATH"
 echo "  Initial Cameras: $INITIAL_CAMERAS"
 echo "  GPU Threshold: $GPU_THRESHOLD"
 echo "  Iterations: $ITERATIONS"
+echo "  Iterations Per Window: $ITERATIONS_PER_WINDOW"
+echo "  Densification Interval: $DENSIFICATION_INTERVAL"
+echo "  Densify From Iter: $DENSIFY_FROM_ITER"
 echo "  SH Degree: $SH_DEGREE"
 echo "  Resolution: $RESOLUTION"
 echo "  Backend: $BACKEND"
 echo "  Deterministic: $DETERMINISTIC"
 echo "  Debug: $DEBUG"
+echo "  Show Memory Debug Info: $SHOW_MEMORY_DEBUG_INFO"
+echo "  Use Chunk: $USE_CHUNK"
 echo "  Only Actually Visible: $ONLY_ACTUALLY_VISIBLE"
+echo "  Track By Projection: $TRACK_BY_PROJECTION"
 if [[ -n "$DTM_MODULE" ]]; then
     echo "  DTM Module: $DTM_MODULE"
 fi
@@ -121,6 +136,9 @@ CMD="$CMD -o \"$OUTPUT_PATH\""
 CMD="$CMD -m $INITIAL_CAMERAS"
 CMD="$CMD -t $GPU_THRESHOLD"
 CMD="$CMD --iterations $ITERATIONS"
+CMD="$CMD --iterations_per_window $ITERATIONS_PER_WINDOW"
+CMD="$CMD --densification_interval $DENSIFICATION_INTERVAL"
+CMD="$CMD --densify_from_iter $DENSIFY_FROM_ITER"
 CMD="$CMD --sh-degree $SH_DEGREE"
 CMD="$CMD --resolution $RESOLUTION"
 CMD="$CMD --backend $BACKEND"
@@ -134,8 +152,20 @@ if [[ "$DEBUG" == "true" ]]; then
     CMD="$CMD --debug"
 fi
 
+if [[ "$SHOW_MEMORY_DEBUG_INFO" == "true" ]]; then
+    CMD="$CMD --show-memory-debug-info"
+fi
+
+if [[ "$USE_CHUNK" == "true" ]]; then
+    CMD="$CMD --use_chunk"
+fi
+
 if [[ "$ONLY_ACTUALLY_VISIBLE" == "true" ]]; then
     CMD="$CMD --only-actually-visible"
+fi
+
+if [[ "$TRACK_BY_PROJECTION" == "true" ]]; then
+    CMD="$CMD --track_by_projection"
 fi
 
 # Add DTM module if specified

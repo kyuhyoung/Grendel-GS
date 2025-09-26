@@ -101,7 +101,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         height = intr.height
         width = intr.width
 
-        uid = intr.id
+        uid = key  # Use image ID as uid instead of camera ID
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
@@ -200,14 +200,27 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path, images, eval, llffhold=10):
+def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sparse=None, track_by_projection=False):
+    # Debug info - uncomment if needed for debugging
+    # print(f"🚨 readColmapSceneInfo() called - COLMAP files will be read from: {path}")
+    # import traceback
+    # print("📍 Call stack:")
+    # traceback.print_stack()
 
-    cameras_ext_bin = os.path.join(path, "sparse/0", "images.bin")
-    cameras_int_bin = os.path.join(path, "sparse/0", "cameras.bin")
-    has_binary = (os.path.exists(cameras_ext_bin) and os.path.exists(cameras_int_file))
+    # Determine sparse directory path
+    if dir_sparse and dir_sparse.strip():
+        # Direct sparse directory provided
+        base_sparse_path = dir_sparse
+    else:
+        # Use traditional path/sparse/0 structure
+        base_sparse_path = os.path.join(path, "sparse/0")
 
-    cameras_ext_txt = os.path.join(path, "sparse/0", "images.txt")
-    cameras_int_txt = os.path.join(path, "sparse/0", "cameras.txt")
+    cameras_ext_bin = os.path.join(base_sparse_path, "images.bin")
+    cameras_int_bin = os.path.join(base_sparse_path, "cameras.bin")
+    has_binary = (os.path.exists(cameras_ext_bin) and os.path.exists(cameras_int_bin))
+
+    cameras_ext_txt = os.path.join(base_sparse_path, "images.txt")
+    cameras_int_txt = os.path.join(base_sparse_path, "cameras.txt")
 
     # 텍스트 파일 존재 여부 확인
     has_text = (os.path.exists(cameras_ext_txt) and os.path.exists(cameras_int_txt))
@@ -248,11 +261,24 @@ def readColmapSceneInfo(path, images, eval, llffhold=10):
             raise
 
 
-    reading_dir = "images" if images == None else images
+    # Determine images folder path
+    if dir_images and dir_images.strip():
+        # Direct images directory provided
+        images_folder = dir_images
+    elif images is None:
+        # Use default path/images
+        images_folder = os.path.join(path, "images")
+    elif os.path.isabs(images):
+        # Absolute path provided via --images
+        images_folder = images
+    else:
+        # Relative path provided via --images
+        images_folder = os.path.join(path, images)
+
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics,
         cam_intrinsics=cam_intrinsics,
-        images_folder=os.path.join(path, reading_dir),
+        images_folder=images_folder,
     )
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
@@ -265,28 +291,46 @@ def readColmapSceneInfo(path, images, eval, llffhold=10):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    ply_path = os.path.join(base_sparse_path, "points3D.ply")
+    bin_path = os.path.join(base_sparse_path, "points3D.bin")
+    txt_path = os.path.join(base_sparse_path, "points3D.txt")
+    print(f"🔍 Loading points3D with track_by_projection={track_by_projection}")
+    try:
+        xyz, rgb, errors, tracks = read_points3D_binary(
+            bin_path,
+            track_by_projection=track_by_projection,
+            cameras=cam_intrinsics,
+            images=cam_extrinsics
+        )
+    except:
+        xyz, rgb, errors, tracks = read_points3D_text(
+            txt_path,
+            track_by_projection=track_by_projection,
+            cameras=cam_intrinsics,
+            images=cam_extrinsics
+        )
+    exit(1)
+    '''
+    # Debug: Print tracks for random 5 points
+    import random
+    print(f"Total points: {len(tracks)}")
+    if len(tracks) > 0:
+        random_indices = random.sample(range(len(tracks)), min(5, len(tracks)))
+        for i in random_indices:
+            print(f"Point {i}: tracks = {tracks[i]} (seen in {len(tracks[i])} cameras)")
+    exit(1)
+    '''
     if not os.path.exists(ply_path):
         if utils.GLOBAL_RANK == 0:
             print(
                 "Converting point3d.bin to .ply, will happen only the first time you open the scene."
             )
-            try:
-                xyz, rgb, _ = read_points3D_binary(bin_path)
-            except:
-                xyz, rgb, _ = read_points3D_text(txt_path)
             storePly(ply_path, xyz, rgb)
-            if utils.DEFAULT_GROUP.size() > 1:
-                torch.distributed.barrier()
-        else:
-            if utils.DEFAULT_GROUP.size() > 1:
-                torch.distributed.barrier()
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+        if utils.DEFAULT_GROUP.size() > 1:
+            torch.distributed.barrier()
+
+
+    pcd = BasicPointCloud(points=xyz, colors=rgb, normals=np.zeros((xyz.shape[0], 3)), tracks=tracks)
 
     scene_info = SceneInfo(
         point_cloud=pcd,

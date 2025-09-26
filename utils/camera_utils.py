@@ -21,6 +21,22 @@ from multiprocessing import shared_memory
 import torch
 from PIL import Image
 
+'''
+def filter_pc_by_views(pc, li_cam):
+    n_pt = len(pc.points)
+    li_visible = np.zeros(n_pt, np.uint8) 
+    for iP, pt in enumerate(pc.points):
+        #is_visible = False
+        for cam in li_cam:
+            if cam.is_this_pt_visible(pt):
+                li_visible[iP] = 1    
+                #is_visible = True
+                break
+        #if is_visible:
+        #    li_visible[iP] = 1    
+    points_sub = pc.points[li_visible]; colors_sub = pc.colors[li_visible]; normals_sub = pc.normals[li_visible]
+    return BasicPointCloud(points = points_sub, colors = colors_sub, normals = normals_sub)
+'''
 
 def loadCam(args, id, cam_info, nerf_norm, decompressed_image=None, return_image=False):
     orig_w, orig_h = cam_info.width, cam_info.height
@@ -233,7 +249,7 @@ def cameraList_from_camInfos(cam_infos, nerf_norm, args):
         camera_list.append(
             loadCam(
                 args,
-                id,
+                c.uid,  # Use original COLMAP camera ID instead of enumerate index
                 c,
                 nerf_norm,
                 decompressed_image=decompressed_images[id],

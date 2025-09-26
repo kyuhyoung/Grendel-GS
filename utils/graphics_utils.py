@@ -12,13 +12,14 @@
 import torch
 import math
 import numpy as np
-from typing import NamedTuple
+from typing import NamedTuple, List, Set
 
 
 class BasicPointCloud(NamedTuple):
     points: np.array
     colors: np.array
     normals: np.array
+    tracks: List[Set[int]] = None  # 각 점이 보이는 camera ID들의 집합
 
 
 def geom_transform_points(points, transf_matrix):
@@ -82,3 +83,53 @@ def fov2focal(fov, pixels):
 
 def focal2fov(focal, pixels):
     return 2 * math.atan(pixels / (2 * focal))
+
+
+def filter_pc_by_visibility(point_cloud: BasicPointCloud, camera_list):
+    """
+    Filter BasicPointCloud to only include points visible in the given cameras.
+
+    Args:
+        point_cloud: BasicPointCloud with tracks information
+        camera_list: List of cameras with uid attribute
+
+    Returns:
+        BasicPointCloud containing only points visible in the specified cameras
+    """
+    if point_cloud.tracks is None:
+        # If no track information, return original point cloud
+        return point_cloud
+
+    # Get camera IDs from the camera list
+    camera_ids = set(cam.uid for cam in camera_list)
+    print(f"🔍 Filtering points for cameras: {sorted(camera_ids)}")
+
+    # Find points that are visible in at least one of the specified cameras
+    visible_indices = []
+    for i, track in enumerate(point_cloud.tracks):
+        if track.intersection(camera_ids):  # If track has common camera IDs
+            visible_indices.append(i)
+
+    print(f"✅ Filter result: {len(visible_indices)} / {len(point_cloud.tracks)} points visible in specified cameras")
+
+    if not visible_indices:
+        # Return empty point cloud if no points are visible
+        return BasicPointCloud(
+            points=np.empty((0, 3)),
+            colors=np.empty((0, 3)),
+            normals=np.empty((0, 3)),
+            tracks=[]
+        )
+
+    # Filter the point cloud data
+    filtered_points = point_cloud.points[visible_indices]
+    filtered_colors = point_cloud.colors[visible_indices]
+    filtered_normals = point_cloud.normals[visible_indices]
+    filtered_tracks = [point_cloud.tracks[i] for i in visible_indices]
+
+    return BasicPointCloud(
+        points=filtered_points,
+        colors=filtered_colors,
+        normals=filtered_normals,
+        tracks=filtered_tracks
+    )

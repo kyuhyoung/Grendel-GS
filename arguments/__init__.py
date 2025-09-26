@@ -67,17 +67,24 @@ class AuxiliaryParams(ParamGroup):
         self.detect_anomaly = False
         self.test_iterations = [7_000, 30_000]
         #self.save_iterations = [7_000, 30_000]
-        self.save_iterations = [50, 300, 600, 1_000, 2_000, 4_000, 6_000, 8_000, 11_000, 14_000, 18_000, 23_000, 29_000, 36_000, 44_000, 53_000, 63_000, 74_000, 86_000, 110_000]
+        self.save_iterations = [60, 300, 600, 1_000, 2_000, 4_000, 6_000, 8_000, 11_000, 14_000, 18_000, 23_000, 29_000, 36_000, 44_000, 53_000, 63_000, 74_000, 86_000, 110_000]
         self.quiet = False
         #self.checkpoint_iterations = []
-        self.checkpoint_iterations = self.save_iterations 
+        self.checkpoint_iterations = self.save_iterations
         self.start_checkpoint = ""
         self.auto_start_checkpoint = False
+        self.auto_save_final_iteration = True  # Automatically add final iteration to save_iterations
+        self.no_auto_save_final_iteration = False  # Disable automatic save of final iteration
         self.log_folder = "/tmp/gaussian_splatting"
         self.log_interval = 250
         self.llffhold = 8
         self.backend = "default" # "default", "gsplat"
         self.deterministic = False  # Enable deterministic execution for reproducible results
+
+        # Progressive training parameters
+        self.cams_init = ""  # Comma-separated list of initial window camera IDs
+        self.cams_prev = ""  # Comma-separated list of previous window camera IDs
+
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -91,9 +98,13 @@ class ModelParams(ParamGroup):
         self._source_path = ""
         self._model_path = "/tmp/gaussian_splatting"
         self._images = "images"
+        self.dir_images = ""  # Direct path to images directory (contains .png/.tif files)
+        self.dir_sparse = ""  # Direct path to sparse directory (contains images.txt, cameras.txt, points3D.txt)
         self._white_background = False
         self.eval = False
         self.normalize = False
+        self.previous_state = ""  # Path to previous window's state JSON file for progressive training
+        self.track_by_projection = False  # Generate tracks by projecting 3D points instead of using COLMAP tracks
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -207,6 +218,7 @@ class DebugParams(ParamGroup):
             False  # stop updating parameters. No optimizer.step() will be called.
         )
         self.time_image_loading = False  # Log image loading time.
+        self.show_memory_debug_info = False  # Show detailed memory and tensor debug info (GPU/RAM usage, tensor stats, etc.)
 
         self.nsys_profile = False  # profile with nsys.
         self.drop_initial_3dgs_p = 0.0  # profile with nsys.
@@ -305,6 +317,10 @@ def init_args(args):
         args.random_background = False
         print("[INFO] Deterministic mode enabled: random redistribution disabled")
 
+    # Handle no_auto_save_final_iteration flag
+    if args.no_auto_save_final_iteration:
+        args.auto_save_final_iteration = False
+
     if utils.DEFAULT_GROUP.size() == 1:
         #print('aaa')
         args.gaussians_distribution = False
@@ -332,7 +348,7 @@ def init_args(args):
     # sort test_iterations
     args.test_iterations.sort()
     args.save_iterations.sort()
-    if len(args.save_iterations) > 0 and args.iterations not in args.save_iterations:
+    if args.auto_save_final_iteration and len(args.save_iterations) > 0 and args.iterations not in args.save_iterations:
         args.save_iterations.append(args.iterations)
     args.checkpoint_iterations.sort()
 

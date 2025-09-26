@@ -17,6 +17,7 @@ from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.graphics_utils import filter_pc_by_visibility
 import utils.general_utils as utils
 import torch
 
@@ -25,12 +26,43 @@ class Scene:
 
     gaussians: GaussianModel
 
+    '''
     def __init__(
-        self, args, gaussians: GaussianModel, load_iteration=None, shuffle=True
+        self, args, gaussians: GaussianModel, load_iteration=None, shuffle=True, load_from_checkpoint=False, progressive_dataset=None
+    ):
+        """
+        Initialize Scene object.
+        :param args: Arguments object containing configuration
+        :param gaussians: GaussianModel instance
+        :param load_iteration: Iteration to load from checkpoint
+        :param shuffle: Whether to shuffle cameras
+        :param load_from_checkpoint: Whether loading from checkpoint
+        :param progressive_dataset: Progressive dataset for training
+        """
+        self._initialize_basic_attributes(args, gaussians, load_iteration)
+
+        if load_from_checkpoint:
+            self._handle_checkpoint_loading(args, progressive_dataset)
+            return
+
+        scene_info = self._load_scene_data(args)
+        self._initialize_cameras(args, scene_info, shuffle)
+        self._initialize_point_cloud(args, scene_info)
+    '''
+
+    # ===== ORIGINAL __init__ METHOD (BACKUP) =====
+    #'''
+    def __init__(
+        self, args, gaussians: GaussianModel, load_iteration=None, shuffle=True, load_from_checkpoint=False, progressive_dataset=None
     ):
         """b
         :param path: Path to colmap scene main folder.
         """
+        init_cameras = None
+        if hasattr(args, 'cams_init') and args.cams_init:
+            # Initial window - filter to specified cameras
+            init_cameras = [int(x) for x in args.cams_init.split(",")]
+
         self.model_path = args.model_path
         #print(f'self.model_path : {self.model_path}');  exit(1)
         self.loaded_iter = None
@@ -48,21 +80,52 @@ class Scene:
 
         utils.log_cpu_memory_usage("before loading images meta data")
 
-        if os.path.exists(
-            os.path.join(args.source_path, "sparse")
-        ):  # This is the format from colmap.
-            scene_info = sceneLoadTypeCallbacks["Colmap"](
-                args.source_path, args.images, args.eval, args.llffhold
-            )
-        elif "matrixcity" in args.source_path:  # This is for matrixcity
-            scene_info = sceneLoadTypeCallbacks["City"](
-                args.source_path,
-                args.random_background,
-                args.white_background,
-                llffhold=args.llffhold,
-            )
+        # Store args for later use in progressive training
+        self.args = args
+
+        if load_from_checkpoint:
+            # Skip COLMAP loading when loading from checkpoint
+            # Cameras and scene info will be restored from checkpoint
+            self.train_cameras = {}
+            self.test_cameras = {}
+            self.cameras_extent = 1.0  # Will be updated when checkpoint is loaded
+            utils.set_img_size(800, 800)  # Temporary values, will be updated from checkpoint
+            print("🚫 Scene.__init__: SKIPPING COLMAP LOADING - will use checkpoint data")
+
+            # If progressive dataset is provided, add cameras from it
+            if progressive_dataset:
+                print("📊 Scene.__init__: ADDING CAMERAS from progressive dataset")
+                self._add_cameras_from_progressive_dataset(progressive_dataset)
+
+            return  # Skip the rest of initialization
         else:
-            raise ValueError("No valid dataset found in the source path")
+            # Normal COLMAP loading
+            print("📁 Scene.__init__: NORMAL COLMAP LOADING")
+            # Check if we're using Colmap format
+            has_colmap = False
+
+            # Case 1: Direct directories provided
+            if args.dir_sparse and args.dir_images:
+                has_colmap = True
+            # Case 2: Traditional source_path structure
+            elif args.source_path and os.path.exists(os.path.join(args.source_path, "sparse")):
+                has_colmap = True
+
+            if has_colmap:  # This is the format from colmap.
+                track_by_projection = getattr(args, 'track_by_projection', False)
+                scene_info = sceneLoadTypeCallbacks["Colmap"](
+                    args.source_path, args.images, args.eval, args.llffhold,
+                    args.dir_images, args.dir_sparse, track_by_projection
+                )
+            elif "matrixcity" in args.source_path:  # This is for matrixcity
+                scene_info = sceneLoadTypeCallbacks["City"](
+                    args.source_path,
+                    args.random_background,
+                    args.white_background,
+                    llffhold=args.llffhold,
+                )
+            else:
+                raise ValueError("No valid dataset found in the source path")
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, "rb") as src_file, open(
@@ -109,7 +172,7 @@ class Scene:
             / 1e9
         )
         log_file.write(f"Dataset size: {dataset_size_in_GB} GB\n")
-            
+
         print(f'dataset_size_in_GB : {dataset_size_in_GB}, args.preload_dataset_to_gpu_threshold : {args.preload_dataset_to_gpu_threshold}'); #exit(1)
 
         if dataset_size_in_GB < args.preload_dataset_to_gpu_threshold:  # 10GB memory limit for dataset
@@ -131,6 +194,11 @@ class Scene:
             train_cameras = scene_info.train_cameras[: args.num_train_cameras]
         else:
             train_cameras = scene_info.train_cameras
+        #print(f'type(train_cameras[0].uid)) : {type(train_cameras[0].keys())}');  exit(1)
+        if init_cameras:
+            #print(f'len(train_cameras) b4 : {len(train_cameras)}');
+            train_cameras = [cam for cam in train_cameras if cam.uid in init_cameras]
+            #print(f'len(train_cameras) after : {len(train_cameras)}');  exit(1)
         #print(f'args.normalize : {args.normalize}')
         if args.normalize:
             self.train_cameras = cameraList_from_camInfos(train_cameras, scene_info.nerf_normalization, args)
@@ -154,6 +222,12 @@ class Scene:
                 test_cameras = scene_info.test_cameras[: args.num_test_cameras]
             else:
                 test_cameras = scene_info.test_cameras
+
+            if init_cameras:
+                #print(f'len(train_cameras) b4 : {len(train_cameras)}');
+                test_cameras = [cam for cam in test_cameras if cam.uid in init_cameras]
+                #print(f'len(train_cameras) after : {len(train_cameras)}');  exit(1)
+
             self.test_cameras = cameraList_from_camInfos(test_cameras, args)
             # output the number of cameras in the training set and image size to the log file
             log_file.write(
@@ -167,6 +241,8 @@ class Scene:
                     )
                 )
 
+
+
         utils.check_initial_gpu_memory_usage("after Loading all images")
         utils.log_cpu_memory_usage("after decoding images")
 
@@ -179,7 +255,248 @@ class Scene:
         elif hasattr(args, "load_ply_path"):
             self.gaussians.load_ply(args.load_ply_path)
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            if init_cameras:
+                print(f"Original point cloud size: {len(scene_info.point_cloud.points)}")
+                all_cameras = self.train_cameras[:]
+                if self.test_cameras is not None:
+                    all_cameras.extend(self.test_cameras)
+                pc_sub = filter_pc_by_visibility(scene_info.point_cloud, all_cameras)
+                print(f"Filtered point cloud size: {len(pc_sub.points)}")
+                exit(1)
+                self.gaussians.create_from_pcd(pc_sub, self.cameras_extent)
+
+            else:
+                self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+
+        utils.check_initial_gpu_memory_usage("after initializing point cloud")
+        utils.log_cpu_memory_usage("after loading initial 3dgs points")
+    #'''
+
+    def _initialize_basic_attributes(self, args, gaussians, load_iteration):
+        """Initialize basic scene attributes."""
+        self.model_path = args.model_path
+        self.loaded_iter = None
+        self.gaussians = gaussians
+        self.args = args  # Store args for later use in progressive training
+
+        if load_iteration:
+            if load_iteration == -1:
+                self.loaded_iter = searchForMaxIteration(
+                    os.path.join(self.model_path, "point_cloud")
+                )
+            else:
+                self.loaded_iter = load_iteration
+            print("Loading trained model at iteration {}".format(self.loaded_iter))
+
+        utils.log_cpu_memory_usage("before loading images meta data")
+
+    def _handle_checkpoint_loading(self, args, progressive_dataset):
+        """Handle scene initialization when loading from checkpoint."""
+        # Skip COLMAP loading when loading from checkpoint
+        # Cameras and scene info will be restored from checkpoint
+        self.train_cameras = {}
+        self.test_cameras = {}
+        self.cameras_extent = 1.0  # Will be updated when checkpoint is loaded
+        utils.set_img_size(800, 800)  # Temporary values, will be updated from checkpoint
+        print("🚫 Scene.__init__: SKIPPING COLMAP LOADING - will use checkpoint data")
+
+        # If progressive dataset is provided, add cameras from it
+        if progressive_dataset:
+            print("📊 Scene.__init__: ADDING CAMERAS from progressive dataset")
+            self._add_cameras_from_progressive_dataset(progressive_dataset)
+
+    def _load_scene_data(self, args):
+        """Load scene data from COLMAP or other formats."""
+        print("📁 Scene.__init__: NORMAL COLMAP LOADING")
+
+        # Check if we're using Colmap format
+        has_colmap = False
+
+        # Case 1: Direct directories provided
+        if args.dir_sparse and args.dir_images:
+            has_colmap = True
+        # Case 2: Traditional source_path structure
+        elif args.source_path and os.path.exists(os.path.join(args.source_path, "sparse")):
+            has_colmap = True
+
+        if has_colmap:  # This is the format from colmap.
+            track_by_projection = getattr(args, 'track_by_projection', False)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](
+                args.source_path, args.images, args.eval, args.llffhold,
+                args.dir_images, args.dir_sparse, track_by_projection
+            )
+        elif "matrixcity" in args.source_path:  # This is for matrixcity
+            scene_info = sceneLoadTypeCallbacks["City"](
+                args.source_path,
+                args.random_background,
+                args.white_background,
+                llffhold=args.llffhold,
+            )
+        else:
+            raise ValueError("No valid dataset found in the source path")
+
+        # Save input.ply and cameras.json if not loading from iteration
+        if not self.loaded_iter:
+            self._save_initial_files(scene_info)
+
+        return scene_info
+
+    def _save_initial_files(self, scene_info):
+        """Save initial PLY and camera JSON files."""
+        with open(scene_info.ply_path, "rb") as src_file, open(
+            os.path.join(self.model_path, "input.ply"), "wb"
+        ) as dest_file:
+            dest_file.write(src_file.read())
+
+        json_cams = []
+        camlist = []
+        if scene_info.test_cameras:
+            camlist.extend(scene_info.test_cameras)
+        if scene_info.train_cameras:
+            camlist.extend(scene_info.train_cameras)
+        for id, cam in enumerate(camlist):
+            json_cams.append(camera_to_JSON(id, cam))
+        with open(os.path.join(self.model_path, "cameras.json"), "w") as file:
+            json.dump(json_cams, file)
+
+    def _initialize_cameras(self, args, scene_info, shuffle):
+        """Initialize training and test cameras."""
+        log_file = utils.get_log_file()
+
+        # Parse initial cameras if specified
+        init_cameras = None
+        if hasattr(args, 'cams_init') and args.cams_init:
+            init_cameras = [int(x) for x in args.cams_init.split(",")]
+
+        # Only shuffle if not in deterministic mode
+        if shuffle and not args.deterministic:
+            random.shuffle(scene_info.train_cameras)
+            random.shuffle(scene_info.test_cameras)
+
+        utils.log_cpu_memory_usage("before decoding images")
+
+        self.cameras_extent = scene_info.nerf_normalization["radius"]
+
+        # Set image size to global variable
+        orig_w, orig_h = (
+            scene_info.train_cameras[0].width,
+            scene_info.train_cameras[0].height,
+        )
+        utils.set_img_size(orig_h, orig_w)
+
+        # Calculate and log dataset size
+        self._handle_dataset_preloading(args, scene_info, orig_w, orig_h, log_file)
+
+        # Initialize training cameras
+        self._setup_train_cameras(args, scene_info, init_cameras, log_file)
+
+        # Initialize test cameras if evaluation is enabled
+        if args.eval:
+            self._setup_test_cameras(args, scene_info, init_cameras, log_file)
+
+        utils.check_initial_gpu_memory_usage("after Loading all images")
+        utils.log_cpu_memory_usage("after decoding images")
+
+    def _handle_dataset_preloading(self, args, scene_info, orig_w, orig_h, log_file):
+        """Handle dataset size calculation and GPU preloading logic."""
+        dataset_size_in_GB = (
+            1.0
+            * (len(scene_info.train_cameras) + len(scene_info.test_cameras))
+            * orig_w
+            * orig_h
+            * 3
+            / 1e9
+        )
+        log_file.write(f"Dataset size: {dataset_size_in_GB} GB\n")
+        print(f'dataset_size_in_GB : {dataset_size_in_GB}, args.preload_dataset_to_gpu_threshold : {args.preload_dataset_to_gpu_threshold}')
+
+        if dataset_size_in_GB < args.preload_dataset_to_gpu_threshold:
+            log_file.write(
+                f"[NOTE]: Preloading dataset({dataset_size_in_GB}GB) to GPU. Disable local_sampling and distributed_dataset_storage.\n"
+            )
+            print(
+                f"[NOTE]: Preloading dataset({dataset_size_in_GB}GB) to GPU. Disable local_sampling and distributed_dataset_storage."
+            )
+            args.preload_dataset_to_gpu = True
+            args.local_sampling = False
+            args.distributed_dataset_storage = False
+
+    def _setup_train_cameras(self, args, scene_info, init_cameras, log_file):
+        """Setup training cameras."""
+        utils.print_rank_0("Decoding Training Cameras")
+
+        if args.num_train_cameras >= 0:
+            train_cameras = scene_info.train_cameras[:args.num_train_cameras]
+        else:
+            train_cameras = scene_info.train_cameras
+
+        if init_cameras:
+            train_cameras = [cam for cam in train_cameras if cam.uid in init_cameras]
+
+        if args.normalize:
+            self.train_cameras = cameraList_from_camInfos(train_cameras, scene_info.nerf_normalization, args)
+        else:
+            self.train_cameras = cameraList_from_camInfos(train_cameras, None, args)
+
+        log_file.write("Number of local training cameras: {}\n".format(len(self.train_cameras)))
+        if len(self.train_cameras) > 0:
+            log_file.write(
+                "Image size: {}x{}\n".format(
+                    self.train_cameras[0].image_height,
+                    self.train_cameras[0].image_width,
+                )
+            )
+
+    def _setup_test_cameras(self, args, scene_info, init_cameras, log_file):
+        """Setup test cameras."""
+        utils.print_rank_0("Decoding Test Cameras")
+
+        if args.num_test_cameras >= 0:
+            test_cameras = scene_info.test_cameras[:args.num_test_cameras]
+        else:
+            test_cameras = scene_info.test_cameras
+
+        if init_cameras:
+            test_cameras = [cam for cam in test_cameras if cam.uid in init_cameras]
+
+        self.test_cameras = cameraList_from_camInfos(test_cameras, args)
+
+        log_file.write("Number of local test cameras: {}\n".format(len(self.test_cameras)))
+        if len(self.test_cameras) > 0:
+            log_file.write(
+                "Image size: {}x{}\n".format(
+                    self.test_cameras[0].image_height,
+                    self.test_cameras[0].image_width,
+                )
+            )
+
+    def _initialize_point_cloud(self, args, scene_info):
+        """Initialize point cloud from scene data or checkpoint."""
+        # Parse initial cameras if specified
+        init_cameras = None
+        if hasattr(args, 'cams_init') and args.cams_init:
+            init_cameras = [int(x) for x in args.cams_init.split(",")]
+
+        if self.loaded_iter:
+            self.gaussians.load_ply(
+                os.path.join(
+                    self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter)
+                )
+            )
+        elif hasattr(args, "load_ply_path"):
+            self.gaussians.load_ply(args.load_ply_path)
+        else:
+            if init_cameras:
+                print(f"Original point cloud size: {len(scene_info.point_cloud.points)}")
+                all_cameras = self.train_cameras[:]
+                if self.test_cameras is not None:
+                    all_cameras.extend(self.test_cameras)
+                pc_sub = filter_pc_by_visibility(scene_info.point_cloud, all_cameras)
+                print(f"Filtered point cloud size: {len(pc_sub.points)}")
+                exit(1)
+                self.gaussians.create_from_pcd(pc_sub, self.cameras_extent)
+            else:
+                self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
         utils.check_initial_gpu_memory_usage("after initializing point cloud")
         utils.log_cpu_memory_usage("after loading initial 3dgs points")
@@ -223,6 +540,98 @@ class Scene:
         log_file.write("opacity shape: {}\n".format(self.gaussians._opacity.shape))
         log_file.write("scaling shape: {}\n".format(self.gaussians._scaling.shape))
         log_file.write("rotation shape: {}\n".format(self.gaussians._rotation.shape))
+
+
+    def _add_cameras_from_progressive_dataset(self, progressive_dataset):
+        """
+        Add cameras from progressive dataset (memory data, not files)
+        """
+        try:
+            from scene.cameras import Camera
+            from scene.dataset_readers import fetchPly
+            from utils.graphics_utils import fov2focal, focal2fov
+            from PIL import Image
+            import numpy as np
+
+            all_cameras = progressive_dataset['cameras']  # All camera info
+            selected_images = progressive_dataset['images']  # Only selected camera images
+
+            print(f"📊 Adding {len(selected_images)} cameras from progressive dataset")
+
+            for img_id, img_data in selected_images.items():
+                # Get corresponding camera info
+                cam_id = img_data['camera_id']
+                if cam_id not in all_cameras:
+                    print(f"❌ Camera {cam_id} not found for image {img_id}")
+                    continue
+
+                cam_data = all_cameras[cam_id]
+
+                # Convert quaternion to rotation matrix
+                qw, qx, qy, qz = img_data['qw'], img_data['qx'], img_data['qy'], img_data['qz']
+                R = np.array([
+                    [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
+                    [2*(qx*qy + qz*qw), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
+                    [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)]
+                ])
+
+                # Translation vector
+                T = np.array([img_data['tx'], img_data['ty'], img_data['tz']])
+
+                # Camera intrinsics
+                width, height = cam_data['width'], cam_data['height']
+
+                # Get focal length from camera parameters (assuming PINHOLE model)
+                if cam_data['model'] == 'PINHOLE':
+                    fx = cam_data['params']['fx']
+                    fy = cam_data['params']['fy']
+                else:
+                    # Fallback for other models
+                    fx = fy = cam_data['raw_params'][0] if cam_data['raw_params'] else width
+
+                # Calculate field of view
+                FoVx = focal2fov(fx, width)
+                FoVy = focal2fov(fy, height)
+
+                # Load image
+                image_path = self.args.source_path / "images" / img_data['name'] if hasattr(self.args, 'source_path') else None
+                if image_path and image_path.exists():
+                    image = Image.open(image_path)
+                else:
+                    # Create dummy image if not found
+                    image = Image.new('RGB', (width, height), color='black')
+
+                # Convert PIL image to tensor
+                import torchvision.transforms as transforms
+                transform = transforms.Compose([
+                    transforms.ToTensor(),
+                ])
+                image_tensor = transform(image)
+
+                # Create Camera object
+                camera = Camera(
+                    colmap_id=img_id,  # Use image ID as colmap_id
+                    R=R,
+                    T=T,
+                    FoVx=FoVx,
+                    FoVy=FoVy,
+                    image=image_tensor,
+                    gt_alpha_mask=None,
+                    image_name=img_data['name'],
+                    uid=len(self.train_cameras),  # New unique ID
+                    data_device=self.args.data_device if hasattr(self.args, 'data_device') else "cuda"
+                )
+
+                # Add to train_cameras dict
+                self.train_cameras[camera.uid] = camera
+
+            print(f"✅ Added {len(selected_images)} cameras to scene")
+            print(f"📊 Total train cameras: {len(self.train_cameras)}")
+
+        except Exception as e:
+            print(f"❌ Error adding cameras from progressive dataset: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 class SceneDataset:

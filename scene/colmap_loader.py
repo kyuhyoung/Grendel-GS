@@ -12,6 +12,7 @@
 import numpy as np
 import collections
 import struct
+import cv2
 
 CameraModel = collections.namedtuple(
     "CameraModel", ["model_id", "model_name", "num_params"]
@@ -103,7 +104,112 @@ def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
     return struct.unpack(endian_character + format_char_sequence, data)
 
 
-def read_points3D_text(path):
+def generate_tracks_by_projection(points3d, cameras, images):
+    """
+    Generate track information by projecting 3D points onto camera images.
+    Uses batch processing for efficient projection.
+
+    Args:
+        points3d: Nx3 array of 3D points
+        cameras: Dictionary of camera information
+        images: Dictionary of image information
+
+    Returns:
+        List of sets, where each set contains camera IDs where the point is visible
+    """
+    num_points = points3d.shape[0]
+    tracks = [set() for _ in range(num_points)]
+
+    print(f"Projecting {num_points} points to {len(images)} cameras...")
+
+    for image_id, image in images.items():
+        camera = cameras[image.camera_id]
+
+        # Skip non-PINHOLE cameras for now
+        if camera.model != "PINHOLE":
+            continue
+
+        # COLMAP coordinate system transformation
+        # COLMAP stores qvec (quaternion) and tvec (translation)
+        # Convert to rotation matrix using same method as colmap_visualizer.py
+        qw, qx, qy, qz = image.qvec  # COLMAP quaternion format: [qw, qx, qy, qz]
+        # Use same formula as colmap_visualizer.py
+        R_colmap = np.array([
+            [1-2*(qy*qy+qz*qz), 2*(qx*qy-qw*qz), 2*(qx*qz+qw*qy)],
+            [2*(qx*qy+qw*qz), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx)],
+            [2*(qx*qz-qw*qy), 2*(qy*qz+qw*qx), 1-2*(qx*qx+qy*qy)]
+        ])
+        T_colmap = np.array(image.tvec)     # COLMAP translation vector
+
+        # COLMAP convention: world_to_camera transformation
+        # For cv2.projectPoints, we need world -> camera transformation
+        # COLMAP's R and T represent: P_camera = R * (P_world - C) where C is camera center
+        # Camera center C = -R^T * T
+        # For OpenCV: we use R directly and T = -R * C = T_colmap
+        R = R_colmap  # Use COLMAP rotation matrix directly
+        T = T_colmap  # Use COLMAP translation vector directly
+
+        # Camera matrix
+        fx, fy, cx, cy = camera.params[:4]
+        camera_matrix = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0, 1]
+        ], dtype=np.float64)
+
+        # Distortion coefficients
+        dist_coeffs = np.array([0, 0, 0, 0, 0], dtype=np.float64)
+        if len(camera.params) > 4:  # Has distortion parameters
+            # COLMAP PINHOLE camera can have distortion parameters k1, k2, p1, p2, k3
+            # Fill available distortion parameters (up to 5)
+            num_dist_params = min(len(camera.params) - 4, 5)
+            dist_coeffs[:num_dist_params] = camera.params[4:4+num_dist_params]
+
+        # Rotation and translation for cv2.projectPoints
+        # Use same approach as colmap_visualizer.py which works correctly
+        rvec, _ = cv2.Rodrigues(R)   # Convert rotation matrix to rotation vector
+        tvec = T.reshape(3, 1)       # Translation vector
+
+        # Filter out points behind camera after world->camera transform
+        # For this we need to apply the transformation within projectPoints
+        # So we work with world coordinates directly
+
+        # Project all points at once using world coordinates
+        # cv2.projectPoints expects shape (N, 1, 3) for world coordinates
+        points_2d, _ = cv2.projectPoints(
+            points3d.reshape(-1, 1, 3),  # World coordinates
+            rvec,  # Rotation vector (world -> camera)
+            tvec,  # Translation vector (world -> camera)
+            camera_matrix,
+            dist_coeffs
+        )
+
+        # points_2d shape: (N, 1, 2)
+        points_2d = points_2d.reshape(-1, 2)  # Shape: (N, 2)
+
+        # Check which points are valid (in front of camera and within image bounds)
+        # We need to check camera coordinates for z > 0
+        camera_points = (R.T @ (points3d - T).T).T  # Result: Nx3
+        valid_mask = camera_points[:, 2] > 0
+
+        # Check which points are within image bounds
+        in_bounds_mask = (
+            (points_2d[:, 0] >= 0) & (points_2d[:, 0] < image.width) &
+            (points_2d[:, 1] >= 0) & (points_2d[:, 1] < image.height)
+        )
+
+        # Combine masks: points must be in front of camera AND within image bounds
+        visible_mask = valid_mask & in_bounds_mask
+
+        # Add this camera ID to tracks of visible points
+        visible_point_indices = np.where(visible_mask)[0]
+        for point_idx in visible_point_indices:
+            tracks[point_idx].add(image_id)
+
+    return tracks
+
+
+def read_points3D_text(path, track_by_projection=False, cameras=None, images=None):
     """
     see: src/base/reconstruction.cc
         void Reconstruction::ReadPoints3DText(const std::string& path)
@@ -125,6 +231,7 @@ def read_points3D_text(path):
     xyzs = np.empty((num_points, 3))
     rgbs = np.empty((num_points, 3))
     errors = np.empty((num_points, 1))
+    tracks = []
     count = 0
     with open(path, "r") as fid:
         while True:
@@ -137,15 +244,49 @@ def read_points3D_text(path):
                 xyz = np.array(tuple(map(float, elems[1:4])))
                 rgb = np.array(tuple(map(int, elems[4:7])))
                 error = np.array(float(elems[7]))
+
                 xyzs[count] = xyz
                 rgbs[count] = rgb
                 errors[count] = error
+
+                # Only parse track info if not using projection-based tracks
+                if not track_by_projection:
+                    # Track 정보 파싱 (8번째 요소부터 image_id feature_id 쌍들)
+                    track_image_ids = set()
+                    for i in range(8, len(elems), 2):
+                        if i < len(elems):
+                            track_image_ids.add(int(elems[i]))
+                    tracks.append(track_image_ids)
+                else:
+                    tracks.append(set())  # Placeholder, will be replaced by projection
+
                 count += 1
 
-    return xyzs, rgbs, errors
+    # Use projection-based tracks if requested
+    if track_by_projection and cameras is not None and images is not None:
+        print("🎯 Generating tracks by projection...")
+        original_tracks = tracks.copy()  # Keep original for comparison
+        tracks = generate_tracks_by_projection(xyzs, cameras, images)
+
+        # Compare results
+        original_visible = sum(1 for track in original_tracks if len(track) > 0)
+        projection_visible = sum(1 for track in tracks if len(track) > 0)
+        print(f"📊 Track comparison: Original COLMAP: {original_visible} visible points, Projection: {projection_visible} visible points")
+
+        # Count points visible per camera in projection-based tracks
+        camera_point_counts = {}
+        for camera_id in images.keys():
+            count = sum(1 for track in tracks if camera_id in track)
+            camera_point_counts[camera_id] = count
+
+        print("📷 Projection-based visible points per camera:")
+        for camera_id in sorted(camera_point_counts.keys()):
+            print(f"  Camera {camera_id}: {camera_point_counts[camera_id]} visible points")
+
+    return xyzs, rgbs, errors, tracks
 
 
-def read_points3D_binary(path_to_model_file):
+def read_points3D_binary(path_to_model_file, track_by_projection=False, cameras=None, images=None):
     """
     see: src/base/reconstruction.cc
         void Reconstruction::ReadPoints3DBinary(const std::string& path)
@@ -158,6 +299,7 @@ def read_points3D_binary(path_to_model_file):
         xyzs = np.empty((num_points, 3))
         rgbs = np.empty((num_points, 3))
         errors = np.empty((num_points, 1))
+        tracks = []
 
         for p_id in range(num_points):
             binary_point_line_properties = read_next_bytes(
@@ -174,10 +316,43 @@ def read_points3D_binary(path_to_model_file):
                 num_bytes=8 * track_length,
                 format_char_sequence="ii" * track_length,
             )
+
             xyzs[p_id] = xyz
             rgbs[p_id] = rgb
             errors[p_id] = error
-    return xyzs, rgbs, errors
+
+            # Only parse track info if not using projection-based tracks
+            if not track_by_projection:
+                # track_elems는 [image_id1, feature_id1, image_id2, feature_id2, ...] 형태
+                track_image_ids = set()
+                for i in range(0, len(track_elems), 2):
+                    track_image_ids.add(track_elems[i])
+                tracks.append(track_image_ids)
+            else:
+                tracks.append(set())  # Placeholder, will be replaced by projection
+
+    # Use projection-based tracks if requested
+    if track_by_projection and cameras is not None and images is not None:
+        print("🎯 Generating tracks by projection...")
+        original_tracks = tracks.copy()  # Keep original for comparison
+        tracks = generate_tracks_by_projection(xyzs, cameras, images)
+
+        # Compare results
+        original_visible = sum(1 for track in original_tracks if len(track) > 0)
+        projection_visible = sum(1 for track in tracks if len(track) > 0)
+        print(f"📊 Track comparison: Original COLMAP: {original_visible} visible points, Projection: {projection_visible} visible points")
+
+        # Count points visible per camera in projection-based tracks
+        camera_point_counts = {}
+        for camera_id in images.keys():
+            count = sum(1 for track in tracks if camera_id in track)
+            camera_point_counts[camera_id] = count
+
+        print("📷 Projection-based visible points per camera:")
+        for camera_id in sorted(camera_point_counts.keys()):
+            print(f"  Camera {camera_id}: {camera_point_counts[camera_id]} visible points")
+
+    return xyzs, rgbs, errors, tracks
 
 
 def read_intrinsics_text(path):
