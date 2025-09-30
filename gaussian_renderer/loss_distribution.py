@@ -638,8 +638,7 @@ def fast_distributed_loss_computation(
         first_tile_y * utils.BLOCK_Y,
         first_tile_x * utils.BLOCK_X,
     )
-    # print(f"rk: {utils.MP_GROUP.rank()}, tile_ids_l: {tile_ids_l}, tile_ids_r: {tile_ids_r}, strategy.tile_x: {strategy.tile_x}, first_tile_y: {first_tile_y}, first_tile_x: {first_tile_x}, first_pixel_y: {first_pixel_y}, first_pixel_x: {first_pixel_x}")
-
+    #print(f"rk: {utils.MP_GROUP.rank()}, tile_ids_l: {tile_ids_l}, tile_ids_r: {tile_ids_r}, strategy.tile_x: {strategy.tile_x}, first_tile_y: {first_tile_y}, first_tile_x: {first_tile_x}, first_pixel_y: {first_pixel_y}, first_pixel_x: {first_pixel_x}");   exit(1)
     timers.start("[loss_distribution]prepare_tensor_for_communication")
     if utils.MP_GROUP.rank() != 0:
         if first_pixel_x == 0:

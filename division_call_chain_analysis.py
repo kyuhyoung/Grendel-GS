@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+
+"""
+division_pos = [cnt * i for i in range(utils.MP_GROUP.size())] 호출 체인 분석
+"""
+
+print("=" * 70)
+print("GPU 병렬 처리 분할 전략 호출 체인")
+print("=" * 70)
+print()
+
+print("🔍 질문: get_evenly_global_strategy_str은 어디서 호출되는가?")
+print("=" * 50)
+print("❌ 답: 실제로는 호출되지 않음!")
+print()
+
+print("✅ 실제 호출 체인:")
+print("-" * 50)
+print()
+
+print("1️⃣  train_internal.py:158 또는 train_internal.py:493")
+print("    ```python")
+print("    batched_strategies, gpuid2tasks = start_strategy_final(")
+print("        batched_cameras, strategy_history")
+print("    )```")
+print()
+
+print("2️⃣  workload_division.py:857 - start_strategy_final()")
+print("    ```python")
+print("    def start_strategy_final(batched_cameras, strategy_history):")
+print("        if args.local_sampling:")
+print("            # local_sampling 모드")
+print("        else:")
+print("            # 일반 모드 - 여기서 division_pos_heuristic 호출")
+print("    ```")
+print()
+
+print("3️⃣  workload_division.py:891 - division_pos_heuristic() 호출")
+print("    ```python")
+print("    division_pos = division_pos_heuristic(")
+print("        catted_accum_heuristic, total_tiles, utils.DEFAULT_GROUP.size(), right=True")
+print("    )```")
+print()
+
+print("4️⃣  workload_division.py:75 - division_pos_heuristic() 함수")
+print("    ```python")
+print("    def division_pos_heuristic(heuristic, tile_num, world_size, right=False):")
+print("        # 휴리스틱 기반 동적 분할")
+print("        heuristic_per_worker = heuristic_sum / world_size")
+print("        division_pos = [0] + division_indices.cpu().tolist() + [tile_num]")
+print("    ```")
+print()
+
+print("🔍 get_evenly_division_pos는 언제 사용되는가?")
+print("=" * 50)
+print("❌ get_evenly_global_strategy_str()에서만 호출되지만,")
+print("   get_evenly_global_strategy_str() 자체가 사용되지 않음!")
+print()
+
+print("✅ 실제로는 두 가지 분할 방식:")
+print("-" * 50)
+print()
+print("1. local_sampling=True인 경우:")
+print("   → 각 GPU가 독립적으로 전체 카메라 처리")
+print("   → division_pos_for_this_viewpoint = [0, n_tiles_per_image]")
+print()
+print("2. local_sampling=False인 경우 (기본):")
+print("   → division_pos_heuristic()으로 동적 분할")
+print("   → 휴리스틱(이전 성능 데이터) 기반으로 GPU별 작업량 조정")
+print()
+
+print("🎯 결론:")
+print("=" * 50)
+print("• get_evenly_division_pos()의 균등 분할은 실제로 사용되지 않음")
+print("• 대신 휴리스틱 기반 동적 분할(division_pos_heuristic)을 사용")
+print("• 이것이 각 GPU가 (W/G) × H 크기를 처리하게 만드는 핵심!")
+print()
+
+print("🔧 핵심 코드 위치:")
+print("-" * 50)
+print("📁 train_internal.py:158, 493")
+print("📁 workload_division.py:857 (start_strategy_final)")
+print("📁 workload_division.py:891 (division_pos_heuristic 호출)")
+print("📁 workload_division.py:75 (division_pos_heuristic 구현)")
+print()
+print("=" * 70)

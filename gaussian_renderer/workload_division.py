@@ -81,7 +81,10 @@ def division_pos_heuristic(heuristic, tile_num, world_size, right=False):
     if world_size == 1:
         return [0, tile_num]
     
-    heuristic_prefix_sum = torch.cumsum(heuristic, dim=0)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", ".*cumsum_cuda_kernel.*", UserWarning)
+        heuristic_prefix_sum = torch.cumsum(heuristic, dim=0)
     heuristic_sum = heuristic_prefix_sum[-1]
     heuristic_per_worker = heuristic_sum / world_size
 
@@ -930,11 +933,18 @@ def start_strategy_final(batched_cameras, strategy_history):
                 )
                 gpu_for_this_camera_tilelr.append((local_tile_l, local_tile_r))
                 gpuid2tasks[gpu_id].append((idx, local_tile_l, local_tile_r))
-
+                '''
+                print(f'gpu_id : {gpu_id} / local_tile_l : {local_tile_l}, local_tile_r : {local_tile_r}');  #exit(1)
+                gpu_id : 0 / local_tile_l : 0, local_tile_r : 360 [19/09 08:54:43]
+                gpu_id : 1 / local_tile_l : 360, local_tile_r : 721 [19/09 08:54:43]
+                gpu_id : 2 / local_tile_l : 721, local_tile_r : 1082 [19/09 08:54:43]
+                '''
             ws_for_this_camera = len(gpu_for_this_camera)
             division_pos_for_this_viewpoint = [0] + [
                 tilelr[1] for tilelr in gpu_for_this_camera_tilelr
             ]
+            #print(f'division_pos_for_this_viewpoint : {division_pos_for_this_viewpoint}');  exit(1)
+            #division_pos_for_this_viewpoint : [0, 360, 721, 1082] [19/09 08:54:43]
             strategy = DivisionStrategyFinal(
                 camera,
                 ws_for_this_camera,

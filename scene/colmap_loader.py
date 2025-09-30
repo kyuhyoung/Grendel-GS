@@ -13,6 +13,7 @@ import numpy as np
 import collections
 import struct
 import cv2
+from utils.camera_param_parser import parse_camera_parameters_heuristic
 
 CameraModel = collections.namedtuple(
     "CameraModel", ["model_id", "model_name", "num_params"]
@@ -119,14 +120,18 @@ def generate_tracks_by_projection(points3d, cameras, images):
     """
     num_points = points3d.shape[0]
     tracks = [set() for _ in range(num_points)]
-
+    '''
     print(f"Projecting {num_points} points to {len(images)} cameras...")
-
+    print(f"🔍 DEBUG: Camera IDs in images: {list(images.keys())}")
+    print(f"🔍 DEBUG: Camera IDs in cameras: {list(cameras.keys())}")
+    '''
     for image_id, image in images.items():
         camera = cameras[image.camera_id]
+        #print(f"🔍 Processing camera {image_id}, camera_id: {image.camera_id}, camera.model : {camera.model}")
 
-        # Skip non-PINHOLE cameras for now
-        if camera.model != "PINHOLE":
+        # Support PINHOLE and RADIAL camera models (same as colmap_visualizer.py)
+        if camera.model not in ["PINHOLE", "RADIAL"]:
+            print(f"⚠️  Skipping unsupported camera model: {camera.model}")
             continue
 
         # COLMAP coordinate system transformation
@@ -149,8 +154,17 @@ def generate_tracks_by_projection(points3d, cameras, images):
         R = R_colmap  # Use COLMAP rotation matrix directly
         T = T_colmap  # Use COLMAP translation vector directly
 
-        # Camera matrix
-        fx, fy, cx, cy = camera.params[:4]
+        # Parse camera parameters using heuristic approach (same as colmap_visualizer.py)
+        parsed_params = parse_camera_parameters_heuristic(
+            camera.params, camera.width, camera.height, camera.model
+        )
+
+        fx = parsed_params['fx']
+        fy = parsed_params['fy']
+        cx = parsed_params['cx']
+        cy = parsed_params['cy']
+        distortion = parsed_params['distortion']
+
         camera_matrix = np.array([
             [fx, 0, cx],
             [0, fy, cy],
@@ -159,20 +173,70 @@ def generate_tracks_by_projection(points3d, cameras, images):
 
         # Distortion coefficients
         dist_coeffs = np.array([0, 0, 0, 0, 0], dtype=np.float64)
-        if len(camera.params) > 4:  # Has distortion parameters
-            # COLMAP PINHOLE camera can have distortion parameters k1, k2, p1, p2, k3
-            # Fill available distortion parameters (up to 5)
-            num_dist_params = min(len(camera.params) - 4, 5)
-            dist_coeffs[:num_dist_params] = camera.params[4:4+num_dist_params]
+        if len(distortion) > 0:
+            num_dist_params = min(len(distortion), 5)
+            dist_coeffs[:num_dist_params] = distortion[:num_dist_params]
 
+        '''
+        # Debug: Show distortion coefficients for camera 36
+        if image_id == 36:
+            print(f"  📐 Camera params: {camera.params}")
+            print(f"  📐 Distortion coeffs: {dist_coeffs}")
+        '''
+        #print('00000')
         # Rotation and translation for cv2.projectPoints
         # Use same approach as colmap_visualizer.py which works correctly
         rvec, _ = cv2.Rodrigues(R)   # Convert rotation matrix to rotation vector
         tvec = T.reshape(3, 1)       # Translation vector
 
+        #print('11111')
         # Filter out points behind camera after world->camera transform
         # For this we need to apply the transformation within projectPoints
         # So we work with world coordinates directly
+        '''
+        # Debug: Detailed analysis for specific point and camera
+        if image_id == 36:  # Focus on camera 36
+            test_point_idx = 0  # First point
+            test_point = points3d[test_point_idx]
+
+            print(f"🔍 DETAILED DEBUG Camera {image_id}:")
+            print(f"  Camera matrix:\n{camera_matrix}")
+            print(f"  Dist coeffs: {dist_coeffs}")
+            print(f"  rvec: {rvec.flatten()}")
+            print(f"  tvec: {tvec.flatten()}")
+            print(f"  Camera width: {camera.width}, height: {camera.height}")
+            print(f"  Test point (world): {test_point}")
+
+            # Step by step projection for debugging
+            print(f"  --- Step by step projection ---")
+
+            # Manual transformation to compare with cv2.projectPoints
+            # Transform world point to camera coordinates
+            R_matrix = cv2.Rodrigues(rvec)[0]
+            point_cam = R_matrix @ test_point + tvec.flatten()
+            print(f"  Point in camera coords: {point_cam}")
+
+            if point_cam[2] > 0:  # Point in front of camera
+                # Project to normalized image coordinates
+                x_norm = point_cam[0] / point_cam[2]
+                y_norm = point_cam[1] / point_cam[2]
+                print(f"  Normalized coords: ({x_norm:.6f}, {y_norm:.6f})")
+
+                # Apply camera matrix
+                fx, fy = camera_matrix[0,0], camera_matrix[1,1]
+                cx, cy = camera_matrix[0,2], camera_matrix[1,2]
+                u = fx * x_norm + cx
+                v = fy * y_norm + cy
+                print(f"  Manual projection: ({u:.2f}, {v:.2f})")
+
+                # Check bounds
+                in_bounds = (0 <= u < camera.width and 0 <= v < camera.height)
+                print(f"  In bounds: {in_bounds} (bounds: [0,0] to [{camera.width},{camera.height}])")
+            else:
+                print(f"  Point behind camera (z={point_cam[2]:.6f})")
+        
+        #print('22222')
+        '''
 
         # Project all points at once using world coordinates
         # cv2.projectPoints expects shape (N, 1, 3) for world coordinates
@@ -184,27 +248,56 @@ def generate_tracks_by_projection(points3d, cameras, images):
             dist_coeffs
         )
 
+        #print('33333')
+        # Debug: Compare with cv2.projectPoints result
+        '''
+        if image_id == 36:
+            test_projection = points_2d[0, 0]  # First point projection
+            print(f"  cv2.projectPoints result: ({test_projection[0]:.2f}, {test_projection[1]:.2f})")
+
+            # Check if in bounds
+            u, v = test_projection
+            in_bounds_cv2 = (0 <= u < camera.width and 0 <= v < camera.height)
+            print(f"  cv2 in bounds: {in_bounds_cv2}")
+            print(f"  --- End detailed debug ---")
+        '''
         # points_2d shape: (N, 1, 2)
+        #print('44444')
         points_2d = points_2d.reshape(-1, 2)  # Shape: (N, 2)
+        #print('55555')
 
         # Check which points are valid (in front of camera and within image bounds)
         # We need to check camera coordinates for z > 0
         camera_points = (R.T @ (points3d - T).T).T  # Result: Nx3
+        #print('66666')
         valid_mask = camera_points[:, 2] > 0
+        #print('77777')
 
         # Check which points are within image bounds
         in_bounds_mask = (
-            (points_2d[:, 0] >= 0) & (points_2d[:, 0] < image.width) &
-            (points_2d[:, 1] >= 0) & (points_2d[:, 1] < image.height)
+            (points_2d[:, 0] >= 0) & (points_2d[:, 0] < camera.width) &
+            (points_2d[:, 1] >= 0) & (points_2d[:, 1] < camera.height)
         )
+        #print('88888')
 
         # Combine masks: points must be in front of camera AND within image bounds
         visible_mask = valid_mask & in_bounds_mask
+        #print('99999')
 
-        # Add this camera ID to tracks of visible points
+        # Add this image ID to tracks of visible points
         visible_point_indices = np.where(visible_mask)[0]
+        #print('aaaaa')
         for point_idx in visible_point_indices:
-            tracks[point_idx].add(image_id)
+            tracks[point_idx].add(image_id)  # Use image_id as intended
+        #print('bbbbb')
+    '''
+    # Camera visible points summary (same format as colmap_visualizer.py)
+    print("📷 Camera visible points summary:")
+    for image_id in sorted(images.keys()):
+        count = sum(1 for track in tracks if image_id in track)
+        print(f"  Camera {image_id}: {count} visible points")
+    print("====================================")
+    '''
 
     return tracks
 
@@ -264,25 +357,34 @@ def read_points3D_text(path, track_by_projection=False, cameras=None, images=Non
 
     # Use projection-based tracks if requested
     if track_by_projection and cameras is not None and images is not None:
-        print("🎯 Generating tracks by projection...")
+        #print("🎯 Generating tracks by projection...")
         original_tracks = tracks.copy()  # Keep original for comparison
         tracks = generate_tracks_by_projection(xyzs, cameras, images)
 
+        '''
         # Compare results
         original_visible = sum(1 for track in original_tracks if len(track) > 0)
         projection_visible = sum(1 for track in tracks if len(track) > 0)
         print(f"📊 Track comparison: Original COLMAP: {original_visible} visible points, Projection: {projection_visible} visible points")
 
-        # Count points visible per camera in projection-based tracks
-        camera_point_counts = {}
-        for camera_id in images.keys():
-            count = sum(1 for track in tracks if camera_id in track)
-            camera_point_counts[camera_id] = count
-
-        print("📷 Projection-based visible points per camera:")
-        for camera_id in sorted(camera_point_counts.keys()):
-            print(f"  Camera {camera_id}: {camera_point_counts[camera_id]} visible points")
-
+        # Count points visible per image in projection-based tracks
+        image_point_counts = {}
+        for image_id in images.keys():
+            count = sum(1 for track in tracks if image_id in track)
+            image_point_counts[image_id] = count
+        print("📷 Projection-based visible points per image:")
+        for image_id in sorted(image_point_counts.keys()):
+            print(f"  Image {image_id}: {image_point_counts[image_id]} visible points")
+        '''
+    else:
+        # Show COLMAP track-based summary
+        print("📷 COLMAP track-based visible points summary:")
+        if images is not None:
+            for image_id in sorted(images.keys()):
+                count = sum(1 for track in tracks if image_id in track)
+                print(f"  Camera {image_id}: {count} visible points")
+        print("====================================")
+    #exit(1)
     return xyzs, rgbs, errors, tracks
 
 
@@ -333,24 +435,24 @@ def read_points3D_binary(path_to_model_file, track_by_projection=False, cameras=
 
     # Use projection-based tracks if requested
     if track_by_projection and cameras is not None and images is not None:
-        print("🎯 Generating tracks by projection...")
+        #print("🎯 Generating tracks by projection...")
         original_tracks = tracks.copy()  # Keep original for comparison
         tracks = generate_tracks_by_projection(xyzs, cameras, images)
-
+        '''
         # Compare results
         original_visible = sum(1 for track in original_tracks if len(track) > 0)
         projection_visible = sum(1 for track in tracks if len(track) > 0)
         print(f"📊 Track comparison: Original COLMAP: {original_visible} visible points, Projection: {projection_visible} visible points")
 
-        # Count points visible per camera in projection-based tracks
-        camera_point_counts = {}
-        for camera_id in images.keys():
-            count = sum(1 for track in tracks if camera_id in track)
-            camera_point_counts[camera_id] = count
-
-        print("📷 Projection-based visible points per camera:")
-        for camera_id in sorted(camera_point_counts.keys()):
-            print(f"  Camera {camera_id}: {camera_point_counts[camera_id]} visible points")
+        # Count points visible per image in projection-based tracks
+        image_point_counts = {}
+        for image_id in images.keys():
+            count = sum(1 for track in tracks if image_id in track)
+            image_point_counts[image_id] = count
+        print("📷 Projection-based visible points per image:")
+        for image_id in sorted(image_point_counts.keys()):
+            print(f"  Image {image_id}: {image_point_counts[image_id]} visible points")
+        '''
 
     return xyzs, rgbs, errors, tracks
 

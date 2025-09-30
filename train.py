@@ -41,6 +41,7 @@ if __name__ == "__main__":
     debug_p = DebugParams(parser)
     args = parser.parse_args(sys.argv[1:])
 
+    #print(f'\n\n\n args : {args} \n\n\n')
     # Set up distributed training
     init_distributed(args)
 
@@ -66,6 +67,44 @@ if __name__ == "__main__":
     safe_state(args.quiet)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
+    # Load previous training state if provided (for progressive training)
+    previous_state = None
+    is_progressive_training = hasattr(args, 'previous_state') and args.previous_state is not None
+
+    if is_progressive_training:
+        if args.previous_state and os.path.exists(args.previous_state):
+            # Non-empty path - load from previous window
+            try:
+                with open(args.previous_state, 'r') as f:
+                    previous_state = json.load(f)
+                utils.print_rank_0(f"📖 Loaded previous state from: {args.previous_state}")
+                utils.print_rank_0(f"   Window: {previous_state.get('iteration_name', 'unknown')}")
+                utils.print_rank_0(f"   Unprocessed cameras: {len(previous_state.get('unprocessed_cameras', []))}")
+                utils.print_rank_0(f"   Processed cameras: {len(previous_state.get('processed_cameras', []))}")
+                utils.print_rank_0(f"   Unprocessed points: {len(previous_state.get('unprocessed_points', []))}")
+            except Exception as e:
+                utils.print_rank_0(f"⚠️  Warning: Could not load previous state: {e}")
+                previous_state = None
+        else:
+            # Empty path - initial window of progressive training
+            utils.print_rank_0(f"📖 Progressive training: Initial window (no previous state)")
+            previous_state = None
+
+    # Store previous state in args for train_internal access
+    # Also store whether this is progressive training (even for initial window)
+    args.previous_state_data = previous_state
+    args.is_progressive_training = is_progressive_training
+
+    # For compatibility with existing progressive dataset logic
+    # Load progressive dataset from temp files if previous state is available
+    if previous_state:
+        # Progressive training mode - dataset should be loaded from temp files
+        # The dataset files are saved by progressive_trainer in temp_* directories
+        utils.print_rank_0(f"🔄 Progressive training mode detected - using temporary dataset files")
+        args.progressive_dataset = True  # Flag to indicate progressive training mode
+    else:
+        args.progressive_dataset = None
+
     # Initialize log file and print all args
     log_file = open(
         args.log_folder
@@ -79,11 +118,13 @@ if __name__ == "__main__":
     utils.set_log_file(log_file)
     print_all_args(args, log_file)
 
-    train_internal.training(
+    train_internal.training_refactored_main(
         lp.extract(args), op.extract(args), pp.extract(args), args, log_file
     )
 
     # All done
     if utils.WORLD_SIZE > 1:
         torch.distributed.barrier(group=utils.DEFAULT_GROUP)
+        # Properly cleanup distributed training
+        torch.distributed.destroy_process_group()
     utils.print_rank_0("\nTraining complete.")

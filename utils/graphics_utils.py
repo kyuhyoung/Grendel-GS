@@ -102,7 +102,7 @@ def filter_pc_by_visibility(point_cloud: BasicPointCloud, camera_list):
 
     # Get camera IDs from the camera list
     camera_ids = set(cam.uid for cam in camera_list)
-    print(f"🔍 Filtering points for cameras: {sorted(camera_ids)}")
+    #print(f"🔍 Filtering points for cameras: {sorted(camera_ids)}")
 
     # Find points that are visible in at least one of the specified cameras
     visible_indices = []
@@ -110,7 +110,7 @@ def filter_pc_by_visibility(point_cloud: BasicPointCloud, camera_list):
         if track.intersection(camera_ids):  # If track has common camera IDs
             visible_indices.append(i)
 
-    print(f"✅ Filter result: {len(visible_indices)} / {len(point_cloud.tracks)} points visible in specified cameras")
+    print(f"✅ Filter result: {len(visible_indices)} / {len(point_cloud.tracks)} points visible in cameras of {camera_ids}")
 
     if not visible_indices:
         # Return empty point cloud if no points are visible

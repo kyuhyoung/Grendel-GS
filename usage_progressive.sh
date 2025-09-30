@@ -2,6 +2,14 @@
 # Usage script for Progressive Training with Grendel-GS
 # Configure parameters below and run this script
 
+# Set environment variables to suppress PyTorch/NCCL warnings
+export OMP_NUM_THREADS=1
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1
+export NCCL_DEBUG=ERROR
+export TORCH_CPP_LOG_LEVEL=ERROR
+export PYTHONWARNINGS="ignore"
+
 # ====================================================
 # USER CONFIGURATION - EDIT THESE PARAMETERS
 # ====================================================
@@ -14,9 +22,10 @@ OUTPUT_PATH="./output/progressive_test"   # Output directory
 INITIAL_CAMERAS=2                         # Number of initial cameras
 GPU_THRESHOLD=0.9                         # GPU memory threshold (0-1)
 ITERATIONS=30000                          # Training iterations
-#ITERATIONS_PER_WINDOW=50                # Iterations per sliding window
+#ITERATIONS_PER_WINDOW=600                # Iterations per sliding window
 ITERATIONS_PER_WINDOW=25                # Iterations per sliding window
 DENSIFICATION_INTERVAL=20               # Densification every 20 iterations
+#DENSIFICATION_INTERVAL=150               # Densification every 20 iterations
 DENSIFY_FROM_ITER=10                    # Start densification from iteration 10
 SH_DEGREE=3                              # Spherical harmonics degree
 RESOLUTION=1                             # Resolution downscaling factor
@@ -30,8 +39,8 @@ USE_CHUNK=true                           # Enable chunked SSIM for memory effici
 #USE_CHUNK=false                           # Enable chunked SSIM for memory efficiency
 #ONLY_ACTUALLY_VISIBLE=false             # Only keep points visible in camera frames
 ONLY_ACTUALLY_VISIBLE=true             # Only keep points visible in camera frames
-#TRACK_BY_PROJECTION=false               # Generate tracks by projection instead of using COLMAP tracks
 TRACK_BY_PROJECTION=true               # Generate tracks by projection instead of using COLMAP tracks
+#TRACK_BY_PROJECTION=false               # Generate tracks by projection instead of using COLMAP tracks
 
 # Advanced options (leave empty if not needed)
 DTM_MODULE=""                            # Path to external DTM module

@@ -53,15 +53,21 @@ class Scene:
     # ===== ORIGINAL __init__ METHOD (BACKUP) =====
     #'''
     def __init__(
-        self, args, gaussians: GaussianModel, load_iteration=None, shuffle=True, load_from_checkpoint=False, progressive_dataset=None
+        self, args, gaussians: GaussianModel, load_iteration=None, shuffle=True, load_from_checkpoint=False, progressive_dataset=None, skip_gaussian_init=False, train_view_ids=None, test_view_ids=None
     ):
         """b
         :param path: Path to colmap scene main folder.
+        :param train_view_ids: List of camera IDs to use for training (for progressive mode)
+        :param test_view_ids: List of camera IDs to use for testing (for progressive mode)
         """
         init_cameras = None
         if hasattr(args, 'cams_init') and args.cams_init:
             # Initial window - filter to specified cameras
             init_cameras = [int(x) for x in args.cams_init.split(",")]
+
+        # Override init_cameras with train_view_ids if provided (for progressive mode)
+        if train_view_ids is not None:
+            init_cameras = train_view_ids
 
         self.model_path = args.model_path
         #print(f'self.model_path : {self.model_path}');  exit(1)
@@ -88,6 +94,7 @@ class Scene:
             # Cameras and scene info will be restored from checkpoint
             self.train_cameras = {}
             self.test_cameras = {}
+            self.all_cameras = {}  # Initialize empty for checkpoint loading
             self.cameras_extent = 1.0  # Will be updated when checkpoint is loaded
             utils.set_img_size(800, 800)  # Temporary values, will be updated from checkpoint
             print("🚫 Scene.__init__: SKIPPING COLMAP LOADING - will use checkpoint data")
@@ -117,6 +124,17 @@ class Scene:
                     args.source_path, args.images, args.eval, args.llffhold,
                     args.dir_images, args.dir_sparse, track_by_projection
                 )
+
+                # Store all camera infos from COLMAP for progressive training (without loading images)
+                self.all_cameras = {}
+                for cam_info in scene_info.train_cameras:
+                    self.all_cameras[cam_info.uid] = cam_info
+                if args.eval:
+                    for cam_info in scene_info.test_cameras:
+                        self.all_cameras[cam_info.uid] = cam_info
+
+                utils.print_rank_0(f"📊 Stored {len(self.all_cameras)} total cameras from COLMAP in Scene constructor")
+
             elif "matrixcity" in args.source_path:  # This is for matrixcity
                 scene_info = sceneLoadTypeCallbacks["City"](
                     args.source_path,
@@ -190,6 +208,7 @@ class Scene:
         utils.print_rank_0("Decoding Training Cameras")
         self.train_cameras = None
         self.test_cameras = None
+        # Note: self.all_cameras already initialized and populated from COLMAP loading above
         if args.num_train_cameras >= 0:
             train_cameras = scene_info.train_cameras[: args.num_train_cameras]
         else:
@@ -223,10 +242,12 @@ class Scene:
             else:
                 test_cameras = scene_info.test_cameras
 
-            if init_cameras:
-                #print(f'len(train_cameras) b4 : {len(train_cameras)}');
-                test_cameras = [cam for cam in test_cameras if cam.uid in init_cameras]
-                #print(f'len(train_cameras) after : {len(train_cameras)}');  exit(1)
+            # Filter test cameras based on test_view_ids or init_cameras
+            test_filter_ids = test_view_ids if test_view_ids is not None else init_cameras
+            if test_filter_ids:
+                #print(f'len(test_cameras) b4 : {len(test_cameras)}');
+                test_cameras = [cam for cam in test_cameras if cam.uid in test_filter_ids]
+                #print(f'len(test_cameras) after : {len(test_cameras)}');  exit(1)
 
             self.test_cameras = cameraList_from_camInfos(test_cameras, args)
             # output the number of cameras in the training set and image size to the log file
@@ -254,22 +275,43 @@ class Scene:
             )
         elif hasattr(args, "load_ply_path"):
             self.gaussians.load_ply(args.load_ply_path)
-        else:
+        elif not skip_gaussian_init:
             if init_cameras:
-                print(f"Original point cloud size: {len(scene_info.point_cloud.points)}")
+                #print(f"Original point cloud size: {len(scene_info.point_cloud.points)}")
                 all_cameras = self.train_cameras[:]
                 if self.test_cameras is not None:
                     all_cameras.extend(self.test_cameras)
                 pc_sub = filter_pc_by_visibility(scene_info.point_cloud, all_cameras)
-                print(f"Filtered point cloud size: {len(pc_sub.points)}")
-                exit(1)
+                #print(f"Filtered point cloud size: {len(pc_sub.points)}")
+                #exit(1)
                 self.gaussians.create_from_pcd(pc_sub, self.cameras_extent)
 
             else:
                 self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
-
+        else:
+            utils.print_rank_0("🚫 SKIPPING GAUSSIAN INITIALIZATION - Using existing gaussians from checkpoint")
+            
+            
         utils.check_initial_gpu_memory_usage("after initializing point cloud")
         utils.log_cpu_memory_usage("after loading initial 3dgs points")
+
+        # Debug: Print self.all_cameras status at end of constructor
+        if hasattr(self, 'all_cameras') and self.all_cameras:
+            utils.print_rank_0(f"✅ Scene constructor completed: {len(self.all_cameras)} cameras in self.all_cameras")
+            #sample_ids = list(self.all_cameras.keys())[:5]  # Show first 5 camera IDs
+            utils.print_rank_0(f"   self.all_cameras IDs: {self.all_cameras.keys()}")
+        else:
+            utils.print_rank_0("⚠️  Scene constructor completed: self.all_cameras is empty or not initialized")
+        i_win = -1
+        # model_path가 "output/model_window_3" 형태인 경우
+        if 'window_' in self.model_path:
+            i_win = int(self.model_path.split('window_')[-1])
+        elif 'initial' in self.model_path:
+            i_win = 0
+        print(f'i_win : {i_win}');
+        if 2 * 2 * 2 * 2 < i_win:
+            exit(1)
+            
     #'''
 
     def _initialize_basic_attributes(self, args, gaussians, load_iteration):
@@ -278,6 +320,9 @@ class Scene:
         self.loaded_iter = None
         self.gaussians = gaussians
         self.args = args  # Store args for later use in progressive training
+
+        # For progressive training: store all cameras from COLMAP
+        self.all_cameras = None  # Will store all camera objects from COLMAP
 
         if load_iteration:
             if load_iteration == -1:
@@ -387,7 +432,10 @@ class Scene:
         # Calculate and log dataset size
         self._handle_dataset_preloading(args, scene_info, orig_w, orig_h, log_file)
 
-        # Initialize training cameras
+        # Note: self.all_cameras already populated in constructor from COLMAP data
+        utils.print_rank_0(f"📊 Using {len(self.all_cameras)} total cameras already loaded from COLMAP")
+
+        # Initialize training cameras (filtered or full)
         self._setup_train_cameras(args, scene_info, init_cameras, log_file)
 
         # Initialize test cameras if evaluation is enabled
@@ -487,13 +535,14 @@ class Scene:
             self.gaussians.load_ply(args.load_ply_path)
         else:
             if init_cameras:
-                print(f"Original point cloud size: {len(scene_info.point_cloud.points)}")
+                #print(f"Original point cloud size: {len(scene_info.point_cloud.points)}")
                 all_cameras = self.train_cameras[:]
                 if self.test_cameras is not None:
                     all_cameras.extend(self.test_cameras)
                 pc_sub = filter_pc_by_visibility(scene_info.point_cloud, all_cameras)
-                print(f"Filtered point cloud size: {len(pc_sub.points)}")
-                exit(1)
+                #print(f"Filtered point cloud size: {len(pc_sub.points)}")
+                #exit(1)
+                #self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
                 self.gaussians.create_from_pcd(pc_sub, self.cameras_extent)
             else:
                 self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)

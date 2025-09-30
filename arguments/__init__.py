@@ -67,7 +67,7 @@ class AuxiliaryParams(ParamGroup):
         self.detect_anomaly = False
         self.test_iterations = [7_000, 30_000]
         #self.save_iterations = [7_000, 30_000]
-        self.save_iterations = [60, 300, 600, 1_000, 2_000, 4_000, 6_000, 8_000, 11_000, 14_000, 18_000, 23_000, 29_000, 36_000, 44_000, 53_000, 63_000, 74_000, 86_000, 110_000]
+        self.save_iterations = [300, 600, 1_000, 2_000, 4_000, 6_000, 8_000, 11_000, 14_000, 18_000, 23_000, 29_000, 36_000, 44_000, 53_000, 63_000, 74_000, 86_000, 110_000]
         self.quiet = False
         #self.checkpoint_iterations = []
         self.checkpoint_iterations = self.save_iterations
@@ -84,6 +84,8 @@ class AuxiliaryParams(ParamGroup):
         # Progressive training parameters
         self.cams_init = ""  # Comma-separated list of initial window camera IDs
         self.cams_prev = ""  # Comma-separated list of previous window camera IDs
+        self.cams_2_delete = ""  # Comma-separated list of camera IDs to delete from window
+        self.cams_2_add = ""  # Comma-separated list of camera IDs to add to window
 
         super().__init__(parser, "Loading Parameters", sentinel)
 

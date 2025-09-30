@@ -944,7 +944,7 @@ class ProgressiveTrainer:
             init_cameras = list(dataset['images'].keys())
             cmd.extend(["--cams_init", ",".join(map(str, init_cameras))])
         else:
-            # Progressive window - pass previous window cameras
+            # Progressive window - pass previous window cameras and changes
             prev_iteration = self.get_previous_iteration_name(iteration_name)
             if prev_iteration:
                 # Get previous window cameras from state
@@ -955,6 +955,12 @@ class ProgressiveTrainer:
                     cmd.extend(["--cams_prev", ",".join(map(str, prev_cameras))])
                 else:
                     utils.print_rank_0("⚠️  Warning: No previous cameras found for progressive window")
+
+                # Add cameras to delete and add
+                if cam_id_2_delete is not None:
+                    cmd.extend(["--cams_2_delete", str(cam_id_2_delete)])
+                if new_camera_id is not None:
+                    cmd.extend(["--cams_2_add", str(new_camera_id)])
 
 
         if self.debug:
@@ -1595,8 +1601,8 @@ class ProgressiveTrainer:
     
     def create_sliding_dataset(self, camera_ids: List[int]) -> Dict:
         print(f"📊 Create dataset for sliding window cameras: {camera_ids}")
-        print(f"📊 Total 3D points in memory: {len(self.points3D)}")
-        print(f'📊 Camera visible points available: {list(self.points_in_view.keys())}')
+        #print(f"📊 Total 3D points in memory: {len(self.points3D)}")
+        #print(f'📊 Camera visible points available: {list(self.points_in_view.keys())}')
 
         # Include points visible from selected cameras
         included_points = {}
@@ -1706,20 +1712,20 @@ class ProgressiveTrainer:
                 break  # No more unprocessed cameras
             # STEP 2: Remove camera farthest from newly added camera
             removed = self._remove_camera_from_window(window_cameras, added)
-
+            '''
             # Update points: move points covered by new camera from unprocessed to processed
             if added in self.points_in_view:
                 new_points = set(self.points_in_view[added]) & self.unprocessed_points
                 self.unprocessed_points -= new_points  # Remove from unprocessed
                 # Note: processed_points doesn't exist, only processed_gaussians
-
+            print(f"   New points processed: {len(new_points) if added in self.points_in_view else 0}")
+            print(f"   Unprocessed points: {len(self.unprocessed_points)}")
+            '''
             camera_index += 1
 
             print(f"📊 Updated sliding window state:")
             print(f"   Removed camera {removed} -> processed_cameras: {len(self.processed_cameras)} cameras")
             print(f"   Added camera {added} -> unprocessed_cameras: {len(self.unprocessed_cameras)} cameras remaining")
-            print(f"   New points processed: {len(new_points) if added in self.points_in_view else 0}")
-            print(f"   Unprocessed points: {len(self.unprocessed_points)}")
             print(f"   Total processed gaussians: {len(self.processed_gaussians) if hasattr(self, 'processed_gaussians') else 0}")
 
             print("\n" + "="*80)

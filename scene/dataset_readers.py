@@ -294,7 +294,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sp
     ply_path = os.path.join(base_sparse_path, "points3D.ply")
     bin_path = os.path.join(base_sparse_path, "points3D.bin")
     txt_path = os.path.join(base_sparse_path, "points3D.txt")
-    print(f"🔍 Loading points3D with track_by_projection={track_by_projection}")
+    #print(f"🔍 Loading points3D with track_by_projection={track_by_projection}")
     try:
         xyz, rgb, errors, tracks = read_points3D_binary(
             bin_path,
@@ -302,6 +302,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sp
             cameras=cam_intrinsics,
             images=cam_extrinsics
         )
+        rgb /= 255.0
     except:
         xyz, rgb, errors, tracks = read_points3D_text(
             txt_path,
@@ -309,7 +310,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sp
             cameras=cam_intrinsics,
             images=cam_extrinsics
         )
-    exit(1)
+        rgb /= 255.0
+    #exit(1)
     '''
     # Debug: Print tracks for random 5 points
     import random

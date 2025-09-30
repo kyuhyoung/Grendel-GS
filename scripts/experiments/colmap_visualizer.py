@@ -15,6 +15,9 @@ from scipy.interpolate import griddata
 from scipy.spatial.distance import cdist
 import os
 import struct
+import sys
+sys.path.insert(0, '/workspace/Grendel-GS')
+from utils.camera_param_parser import parse_camera_parameters_heuristic
 
 class COLMAPVisualizer:
     def __init__(self, colmap_path=None, only_actually_visible=False):
@@ -89,9 +92,9 @@ class COLMAPVisualizer:
             if line.startswith('#') or not line.strip():
                 continue
                 
-            print(f"DEBUG: Parsing camera line: '{line.strip()}'")
+            # print(f"DEBUG: Parsing camera line: '{line.strip()}'")
             parts = line.strip().split()
-            print(f"DEBUG: Parsed parts: {parts}")
+            # print(f"DEBUG: Parsed parts: {parts}")
             
             camera_id = int(parts[0])
             model = parts[1]
@@ -99,63 +102,14 @@ class COLMAPVisualizer:
             height = int(parts[3])
             raw_params = [float(x) for x in parts[4:]]
             
-            print(f"DEBUG: Raw params: {raw_params}")
-            print(f"DEBUG: Num params: {len(raw_params)}")
-            print(f"DEBUG: Width/2={width/2:.1f}, Height/2={height/2:.1f}")
+            # print(f"DEBUG: Raw params: {raw_params}")
+            # print(f"DEBUG: Num params: {len(raw_params)}")
+            # print(f"DEBUG: Width/2={width/2:.1f}, Height/2={height/2:.1f}")
             
-            # 파라미터 자동 파싱
-            params = {}
-            if len(raw_params) >= 4:
-                # 4개 이상: fx, fy, cx, cy 순서 가능성 (PINHOLE 등)
-                # cx, cy가 width/2, height/2에 가까운지 체크
-                potential_cx_cy_pairs = [
-                    (raw_params[2], raw_params[3]),  # 일반적인 fx,fy,cx,cy 순서
-                    (raw_params[1], raw_params[2]),  # f,cx,cy,... 순서  
-                ]
-                
-                best_match = None
-                best_score = float('inf')
-                
-                for i, (cx, cy) in enumerate(potential_cx_cy_pairs):
-                    cx_error = abs(cx - width/2)
-                    cy_error = abs(cy - height/2)
-                    score = cx_error + cy_error
-                    print(f"DEBUG: Pattern {i}: cx={cx:.1f}, cy={cy:.1f}, error={score:.1f}")
-                    
-                    if score < best_score:
-                        best_score = score
-                        best_match = i
-                
-                print(f"DEBUG: Best match: pattern {best_match}")
-                
-                if best_match == 0:  # fx,fy,cx,cy 순서
-                    params = {
-                        'fx': raw_params[0],
-                        'fy': raw_params[1], 
-                        'cx': raw_params[2],
-                        'cy': raw_params[3],
-                        'distortion': raw_params[4:] if len(raw_params) > 4 else []
-                    }
-                elif best_match == 1:  # f,cx,cy 순서
-                    params = {
-                        'fx': raw_params[0],
-                        'fy': raw_params[0],  # 단일 focal length
-                        'cx': raw_params[1],
-                        'cy': raw_params[2],
-                        'distortion': raw_params[3:] if len(raw_params) > 3 else []
-                    }
-            else:
-                # 3개: f, cx, cy 순서 가능성
-                if len(raw_params) == 3:
-                    params = {
-                        'fx': raw_params[0],
-                        'fy': raw_params[0],
-                        'cx': raw_params[1], 
-                        'cy': raw_params[2],
-                        'distortion': []
-                    }
+            # 파라미터 자동 파싱 (utility 함수 사용)
+            params = parse_camera_parameters_heuristic(raw_params, width, height, model)
             
-            print(f"DEBUG: Parsed params: fx={params['fx']:.1f}, fy={params['fy']:.1f}, cx={params['cx']:.1f}, cy={params['cy']:.1f}")
+            # print(f"DEBUG: Parsed params: fx={params['fx']:.1f}, fy={params['fy']:.1f}, cx={params['cx']:.1f}, cy={params['cy']:.1f}")
             
             cameras[camera_id] = {
                 'id': camera_id,
@@ -277,53 +231,84 @@ class COLMAPVisualizer:
         points_projectable = {}  # point_id: [list of image_ids where point is in frame]
         points_outside = {}      # point_id: [list of image_ids where point is outside frame]
         
-        total_checks = 0
-        in_frame_count = 0
-        outside_frame_count = 0
-        
         # 모든 포인트를 모든 카메라에 투영 테스트
+        # Batch projection optimization: process all points for each camera at once
+        print("🚀 Using batch projection optimization for faster processing...")
+
+        # Prepare all points as numpy array
+        all_points = []
+        point_ids = []
         for point_id, point in self.points3d.items():
-            point_xyz = point['xyz']
-            projectable_images = []
-            outside_images = []
-            
-            for image_id, image in self.images.items():
-                camera = self.cameras[image['camera_id']]
-                
-                # 3D 포인트를 카메라 좌표계로 변환
-                R = image['R']
-                t = image['t']
-                point_cam = R @ point_xyz + t
-                
-                # 카메라 뒤에 있는 포인트는 제외
-                if point_cam[2] <= 0:
-                    continue
-                
-                # 카메라 파라미터
+            all_points.append(point['xyz'])
+            point_ids.append(point_id)
+
+        if not all_points:
+            print("No points to process")
+            return
+
+        all_points = np.array(all_points)  # Shape: (N, 3)
+
+        for image_id, image in self.images.items():
+            # Batch project all points to this camera
+            camera = self.cameras[image['camera_id']]
+
+            try:
+                import cv2
+
+                # Camera matrix and distortion (same as individual function)
                 fx = camera['params']['fx']
-                fy = camera['params']['fy']
+                fy = camera['params']['fy'] if 'fy' in camera['params'] else fx
                 cx = camera['params']['cx']
                 cy = camera['params']['cy']
-                
-                # 이미지 평면에 투영
-                u = fx * (point_cam[0] / point_cam[2]) + cx
-                v = fy * (point_cam[1] / point_cam[2]) + cy
-                
-                # 이미지 범위 체크
+
+                camera_matrix = np.array([[fx, 0, cx],
+                                        [0, fy, cy],
+                                        [0, 0, 1]], dtype=np.float64)
+
+                dist_coeffs = np.array([0, 0, 0, 0, 0], dtype=np.float64)
+                if 'distortion' in camera['params'] and camera['params']['distortion']:
+                    distortion = camera['params']['distortion']
+                    for i, coeff in enumerate(distortion[:5]):
+                        dist_coeffs[i] = coeff
+
+                # Rotation and translation
+                R = image['R']
+                t = image['t']
+                rvec, _ = cv2.Rodrigues(R)
+                tvec = t.reshape(3, 1)
+
+                # Batch projection: all points at once
+                object_points = all_points.reshape(-1, 1, 3).astype(np.float64)
+                image_points, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
+                image_points = image_points.reshape(-1, 2)  # Shape: (N, 2)
+
+                # Check which points are in view
                 width = camera['width']
                 height = camera['height']
-                
-                total_checks += 1
-                
-                if 0 <= u < width and 0 <= v < height:
-                    projectable_images.append(image_id)
-                    in_frame_count += 1
-                else:
-                    outside_images.append(image_id)
-                    outside_frame_count += 1
-            
-            points_projectable[point_id] = projectable_images
-            points_outside[point_id] = outside_images
+
+                # Check bounds for all points at once
+                in_bounds = (
+                    (image_points[:, 0] >= 0) & (image_points[:, 0] < width) &
+                    (image_points[:, 1] >= 0) & (image_points[:, 1] < height)
+                )
+
+                # Assign results to points
+                for i, point_id in enumerate(point_ids):
+                    if point_id not in points_projectable:
+                        points_projectable[point_id] = []
+                        points_outside[point_id] = []
+
+                    if in_bounds[i]:
+                        points_projectable[point_id].append(image_id)
+                    else:
+                        points_outside[point_id].append(image_id)
+
+            except Exception as e:
+                print(f"Error in batch projection for camera {image_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Skip this camera on error
+                continue
         
         # 통계 계산
         never_visible = []  # 어떤 이미지에서도 보이지 않는 포인트
@@ -344,10 +329,6 @@ class COLMAPVisualizer:
         print(f"  Points NEVER visible (always outside frame): {len(always_outside)}")
         print(f"  Points behind all cameras: {len(never_visible)}")
         
-        print(f"\nProjection statistics:")
-        print(f"  Total projections checked: {total_checks}")
-        print(f"  Projections inside frame: {in_frame_count} ({100*in_frame_count/total_checks:.1f}%)")
-        print(f"  Projections outside frame: {outside_frame_count} ({100*outside_frame_count/total_checks:.1f}%)")
         
         # 문제가 있는 포인트들의 위치 분석
         if len(always_outside) > 0:
@@ -371,6 +352,7 @@ class COLMAPVisualizer:
             print(f"\n⚠️  WARNING: {mismatch_count} points have track info but project outside frame!")
         
         # only_actually_visible 플래그가 켜져있으면 프레임 밖 포인트 제거
+        #print(f'self.only_actually_visible : {self.only_actually_visible}, len(always_outside) : {len(always_outside)}');  exit(1) 
         if self.only_actually_visible and len(always_outside) > 0:
             print(f"\n🔧 Removing {len(always_outside)} points that are always outside frame...")
             
@@ -394,9 +376,223 @@ class COLMAPVisualizer:
                 print(f"   Y: [{remaining_xyz[:, 1].min():.2f}, {remaining_xyz[:, 1].max():.2f}]")
                 print(f"   Z: [{remaining_xyz[:, 2].min():.2f}, {remaining_xyz[:, 2].max():.2f}]")
             
+        # 카메라별 visible points 딕셔너리 생성 (points_projectable을 역변환)
+        camera_visible_points = {}
+        for camera_id in self.images.keys():
+            camera_visible_points[camera_id] = []
+
+        for point_id, visible_cameras in points_projectable.items():
+            for camera_id in visible_cameras:
+                if camera_id in camera_visible_points:
+                    camera_visible_points[camera_id].append(point_id)
+
+        # 클래스 변수로 저장하여 progressive_trainer에서 접근 가능하게 함
+        self.camera_visible_points = camera_visible_points
+
+        print(f"\n📷 Camera visible points summary:")
+        for camera_id, visible_points in camera_visible_points.items():
+            print(f"  Camera {camera_id}: {len(visible_points)} visible points")
+
         print("="*60)
         #exit(1)
-        
+
+    def project_point_to_image(self, point_3d, image_id, margin_pixels=0, consider_distortion = True, use_opencv = True):
+        """
+        Project 3D point to image coordinates
+
+        Args:
+            point_3d: 3D point coordinates [x, y, z]
+            image_id: Image/camera ID to project to
+            margin_pixels: Margin in pixels to consider point still in view
+            consider_distortion: Whether to apply camera distortion correction (ignored if use_opencv=True)
+            use_opencv: If True, use cv2.projectPoints (always considers distortion)
+
+        Returns:
+            tuple: (is_in_view, u, v) where is_in_view is bool and (u,v) are image coordinates
+        """
+        if image_id not in self.images:
+            return False, 0, 0
+
+        image = self.images[image_id]
+        camera = self.cameras[image['camera_id']]
+
+        if use_opencv:
+            # OpenCV를 사용한 projection (distortion 무조건 고려)
+            try:
+                import cv2
+                import numpy as np
+
+                # 카메라 매트릭스 구성
+                fx = camera['params']['fx']
+                fy = camera['params']['fy'] if 'fy' in camera['params'] else fx
+                cx = camera['params']['cx']
+                cy = camera['params']['cy']
+
+                camera_matrix = np.array([[fx, 0, cx],
+                                        [0, fy, cy],
+                                        [0, 0, 1]], dtype=np.float64)
+
+                # Distortion 계수 준비
+                dist_coeffs = np.array([0, 0, 0, 0, 0], dtype=np.float64)
+                if 'distortion' in camera['params'] and camera['params']['distortion']:
+                    distortion = camera['params']['distortion']
+                    # OpenCV 형식에 맞춰 최대 5개까지 사용 (k1, k2, p1, p2, k3)
+                    for i, coeff in enumerate(distortion[:5]):
+                        dist_coeffs[i] = coeff
+
+                # 회전 벡터와 이동 벡터 준비 (world -> camera)
+                R = image['R']
+                t = image['t']
+
+                # Debug: Same point as colmap_loader.py for comparison - only for first point
+                first_point = np.array([609.388767, -430.194813, 19.847636])
+                is_first_point = np.allclose(point_3d, first_point, atol=1e-3)
+                if image_id == 36 and is_first_point:
+                    print(f"🔍 COLMAP_VISUALIZER DEBUG Camera {image_id} - FIRST POINT ONLY:")
+                    print(f"  Camera matrix:\n{camera_matrix}")
+                    print(f"  Dist coeffs: {dist_coeffs}")
+                    print(f"  R matrix:\n{R}")
+                    print(f"  t vector: {t}")
+                    print(f"  Camera width: {camera['width']}, height: {camera['height']}")
+                    print(f"  Test point (world): {point_3d}")
+
+                # 회전 행렬을 회전 벡터로 변환
+                rvec, _ = cv2.Rodrigues(R)
+                tvec = t.reshape(3, 1)
+
+                if image_id == 36 and is_first_point:
+                    print(f"  rvec: {rvec.flatten()}")
+                    print(f"  tvec: {tvec.flatten()}")
+                    print(f"  --- Step by step projection ---")
+
+                    # Manual transformation to compare with cv2.projectPoints
+                    point_cam = R @ point_3d + t
+                    print(f"  Point in camera coords: {point_cam}")
+
+                    if point_cam[2] > 0:  # Point in front of camera
+                        # Project to normalized image coordinates
+                        x_norm = point_cam[0] / point_cam[2]
+                        y_norm = point_cam[1] / point_cam[2]
+                        print(f"  Normalized coords: ({x_norm:.6f}, {y_norm:.6f})")
+
+                        # Apply camera matrix
+                        u = fx * x_norm + cx
+                        v = fy * y_norm + cy
+                        print(f"  Manual projection: ({u:.2f}, {v:.2f})")
+
+                        # Check bounds
+                        width = camera['width']
+                        height = camera['height']
+                        in_bounds = (0 <= u < width and 0 <= v < height)
+                        print(f"  In bounds: {in_bounds} (bounds: [0,0] to [{width},{height}])")
+                    else:
+                        print(f"  Point behind camera (z={point_cam[2]:.6f})")
+
+                # 3D 포인트를 OpenCV 형식으로 준비 (world coordinates)
+                object_points = np.array([point_3d], dtype=np.float64).reshape(1, 1, 3)
+
+                # OpenCV projectPoints 사용
+                image_points, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
+
+                if image_id == 36 and is_first_point:
+                    u_cv2, v_cv2 = image_points[0][0]
+                    print(f"  cv2.projectPoints result: ({u_cv2:.2f}, {v_cv2:.2f})")
+                    width = camera['width']
+                    height = camera['height']
+                    in_bounds_cv2 = (0 <= u_cv2 < width and 0 <= v_cv2 < height)
+                    print(f"  cv2 in bounds: {in_bounds_cv2}")
+                    print(f"  --- End detailed debug ---")
+
+                # 결과 추출
+                u, v = image_points[0][0]
+                #print(f'(u, v) : ({u}, {v})');  exit(1)
+                # Opencv T : (u, v) : (7868.1462153227885, 10588.613259466396)
+                # 이미지 범위 체크 (margin 고려)
+                width = camera['width']
+                height = camera['height']
+                is_in_view = (-margin_pixels <= u < width + margin_pixels and
+                            -margin_pixels <= v < height + margin_pixels)
+
+                return is_in_view, u, v
+
+            except ImportError:
+                print("Warning: OpenCV not available, falling back to manual projection")
+                # OpenCV가 없으면 수동 projection으로 fallback
+                use_opencv = False
+            except Exception as e:
+                print(f"Warning: OpenCV projection failed: {e}, falling back to manual projection")
+                use_opencv = False
+
+        if not use_opencv:
+            # 수동 projection (기존 로직)
+            # 3D 포인트를 카메라 좌표계로 변환
+            R = image['R']
+            t = image['t']
+            point_cam = R @ point_3d + t
+
+            # 카메라 뒤에 있는 포인트는 제외
+            if point_cam[2] <= 0:
+                return False, 0, 0
+
+            # 카메라 파라미터
+            fx = camera['params']['fx']
+            fy = camera['params']['fy']
+            cx = camera['params']['cx']
+            cy = camera['params']['cy']
+
+            # 정규화된 이미지 좌표로 투영
+            x_norm = point_cam[0] / point_cam[2]
+            y_norm = point_cam[1] / point_cam[2]
+
+            # Distortion 적용 (consider_distortion 플래그에 따라)
+            if consider_distortion:
+                if camera['model'] == 'RADIAL' and 'distortion' in camera['params'] and camera['params']['distortion']:
+                    # Radial distortion model: r² = x² + y²
+                    r2 = x_norm * x_norm + y_norm * y_norm
+
+                    # Apply distortion: x_distorted = x * (1 + k1*r² + k2*r⁴ + ...)
+                    distortion_factor = 1.0
+                    r2_power = r2  # r²
+                    for k in camera['params']['distortion']:
+                        distortion_factor += k * r2_power
+                        r2_power *= r2  # r⁴, r⁶, ...
+
+                    x_norm *= distortion_factor
+                    y_norm *= distortion_factor
+
+                elif camera['model'] == 'OPENCV' and 'distortion' in camera['params'] and camera['params']['distortion']:
+                    # OpenCV distortion model (k1, k2, p1, p2, [k3])
+                    distortion = camera['params']['distortion']
+                    if len(distortion) >= 2:
+                        k1, k2 = distortion[0], distortion[1]
+                        r2 = x_norm * x_norm + y_norm * y_norm
+                        radial_factor = 1 + k1 * r2 + k2 * r2 * r2
+
+                        # Apply tangential distortion if available
+                        if len(distortion) >= 4:
+                            p1, p2 = distortion[2], distortion[3]
+                            xy = x_norm * y_norm
+                            x_norm = x_norm * radial_factor + 2 * p1 * xy + p2 * (r2 + 2 * x_norm * x_norm)
+                            y_norm = y_norm * radial_factor + p1 * (r2 + 2 * y_norm * y_norm) + 2 * p2 * xy
+                        else:
+                            x_norm *= radial_factor
+                            y_norm *= radial_factor
+
+            # 최종 이미지 좌표 계산
+            u = fx * x_norm + cx
+            v = fy * y_norm + cy
+            #print(f'(u, v) : ({u}, {v})');  exit(1)
+            # distortion T, Opencv F : (u, v) : (7868.144640319083, 10588.611676362934)
+            # distortion F, Opencv F : (u, v) : (7868.144640319083, 10588.611676362934)
+            # 이미지 범위 체크 (margin 고려)
+            width = camera['width']
+            height = camera['height']
+
+            is_in_view = (-margin_pixels <= u < width + margin_pixels and
+                         -margin_pixels <= v < height + margin_pixels)
+
+            return is_in_view, u, v
+
     def quaternion_to_rotation_matrix(self, q):
         """쿼터니언을 회전 행렬로 변환"""
         w, x, y, z = q
@@ -450,7 +646,7 @@ class COLMAPVisualizer:
         print(f"Created DTM with resolution {resolution}m, size {zi_grid.shape}")
         
         # DTM과 원래 point cloud의 bounding box 비교
-        self.compare_dtm_vs_pointcloud_bounds()
+        #self.compare_dtm_vs_pointcloud_bounds()
         
         return self.dtm
     
@@ -460,6 +656,7 @@ class COLMAPVisualizer:
             print("DTM not created yet")
             return
             
+        #''' 
         # 원래 point cloud bounding box
         xyz_points = np.array([p['xyz'] for p in self.points3d.values()])
         pc_x_min, pc_x_max = xyz_points[:, 0].min(), xyz_points[:, 0].max()
@@ -470,7 +667,6 @@ class COLMAPVisualizer:
         dtm_x_min, dtm_x_max = self.dtm['x_grid'].min(), self.dtm['x_grid'].max()
         dtm_y_min, dtm_y_max = self.dtm['y_grid'].min(), self.dtm['y_grid'].max()
         dtm_z_min, dtm_z_max = self.dtm['z_grid'].min(), self.dtm['z_grid'].max()
-        
         print("\n" + "="*60)
         print("DTM vs POINT CLOUD BOUNDING BOX COMPARISON")
         print("="*60)
@@ -493,7 +689,6 @@ class COLMAPVisualizer:
         print(f"  X range difference: {x_diff:.2f}m ({'expanded' if x_diff > 0 else 'contracted' if x_diff < 0 else 'same'})")
         print(f"  Y range difference: {y_diff:.2f}m ({'expanded' if y_diff > 0 else 'contracted' if y_diff < 0 else 'same'})")
         print(f"  Z range difference: {z_diff:.2f}m ({'expanded' if z_diff > 0 else 'contracted' if z_diff < 0 else 'same'})")
-        
         # DTM의 Z값이 원래 포인트 범위를 벗어나는지 확인
         z_below_min = (dtm_z_min < pc_z_min)
         z_above_max = (dtm_z_max > pc_z_max)
@@ -508,6 +703,7 @@ class COLMAPVisualizer:
             print(f"\n✅ DTM Z values are within original point cloud range")
             
         print("="*60)
+        #'''
         #exit(1)
 
     def get_camera_corners(self, image_id):
@@ -591,7 +787,7 @@ class COLMAPVisualizer:
                 'y_range': [y_min_expanded, y_max_expanded], 
                 'z_range': [z_min, z_max]
             }
-            print(f"DEBUG: Scene bounds (expanded): X:[{x_min_expanded:.1f},{x_max_expanded:.1f}] Y:[{y_min_expanded:.1f},{y_max_expanded:.1f}] Z:[{z_min:.1f},{z_max:.1f}]")
+            # print(f"DEBUG: Scene bounds (expanded): X:[{x_min_expanded:.1f},{x_max_expanded:.1f}] Y:[{y_min_expanded:.1f},{y_max_expanded:.1f}] Z:[{z_min:.1f},{z_max:.1f}]")
         
         return self._scene_bounds
 
@@ -601,16 +797,16 @@ class COLMAPVisualizer:
             raise ValueError("DTM not created. Call create_dtm() first")
             
         # Ray가 아래로 향하는지 확인
-        # print(f"DEBUG:       Ray origin: {ray_origin}")
-        # print(f"DEBUG:       Ray direction: {ray_dir}")
-        # print(f"DEBUG:       Ray dir Z: {ray_dir[2]}")
+        # # print(f"DEBUG:       Ray origin: {ray_origin}")
+        # # print(f"DEBUG:       Ray direction: {ray_dir}")
+        # # print(f"DEBUG:       Ray dir Z: {ray_dir[2]}")
         
-        # print(f"DEBUG:       Ray dir Z: {ray_dir[2]:.3f}")
+        # # print(f"DEBUG:       Ray dir Z: {ray_dir[2]:.3f}")
         if ray_dir[2] >= 0:  # 위로 향하면 아래 지면과 교차하지 않음 (항공 사진의 경우)
-            # print(f"DEBUG:       FAIL: Ray pointing upward (dir_z={ray_dir[2]:.3f})")
+            # # print(f"DEBUG:       FAIL: Ray pointing upward (dir_z={ray_dir[2]:.3f})")
             return None, 'upward_ray'
         else:
-            # print(f"DEBUG:       Ray pointing downward (dir_z={ray_dir[2]:.3f}) - continuing...")
+            # # print(f"DEBUG:       Ray pointing downward (dir_z={ray_dir[2]:.3f}) - continuing...")
             pass
             
         # Scene bounds 가져오기
@@ -626,25 +822,25 @@ class COLMAPVisualizer:
         t_z_top = (z_max - ray_origin[2]) / ray_dir[2]  # 상단면과 교차
         t_z_bottom = (z_min - ray_origin[2]) / ray_dir[2]  # 하단면과 교차
         
-        # print(f"DEBUG:       t_z_top: {t_z_top}, t_z_bottom: {t_z_bottom}")
+        # # print(f"DEBUG:       t_z_top: {t_z_top}, t_z_bottom: {t_z_bottom}")
         
         # Ray가 아래로 향하므로 t_z_top이 더 작은 값 (먼저 만나는 면)
         t_start = max(0, t_z_top)  # Scene 상단부터 시작
         t_end = t_z_bottom  # Scene 하단까지
         
-        # print(f"DEBUG:       Final t_start: {t_start}, t_end: {t_end}")
+        # # print(f"DEBUG:       Final t_start: {t_start}, t_end: {t_end}")
         
         # 유효한 범위인지 확인
         if t_start >= t_end or t_end <= 0:
-            # print("DEBUG:       Invalid t range for Z intersection")
+            # # print("DEBUG:       Invalid t range for Z intersection")
             return None, 'out_of_bounds'
             
         # 이 범위에서 XY가 scene bounds 내에 있는지 확인
         start_point = ray_origin + t_start * ray_dir
         end_point = ray_origin + t_end * ray_dir
         
-        # print(f"DEBUG:       Start point: {start_point}")
-        # print(f"DEBUG:       End point: {end_point}")
+        # # print(f"DEBUG:       Start point: {start_point}")
+        # # print(f"DEBUG:       End point: {end_point}")
         
         # Ray가 XY bounds를 지나가는지 확인 (더 관대한 체크)
         # 적어도 ray의 일부가 scene XY 영역을 지나가면 OK
@@ -658,10 +854,10 @@ class COLMAPVisualizer:
             t_x2 = (x_max - ray_origin[0]) / ray_dir[0]
             t_x_enter = min(t_x1, t_x2)
             t_x_exit = max(t_x1, t_x2)
-            # print(f"DEBUG:       X axis: t_enter={t_x_enter}, t_exit={t_x_exit}")
+            # # print(f"DEBUG:       X axis: t_enter={t_x_enter}, t_exit={t_x_exit}")
             t_ranges.append((t_x_enter, t_x_exit))
         # else:
-            # print("DEBUG:       X axis: Ray parallel to X bounds")
+            # # print("DEBUG:       X axis: Ray parallel to X bounds")
             
         # Y축 체크  
         if abs(ray_dir[1]) > 1e-6:
@@ -669,25 +865,25 @@ class COLMAPVisualizer:
             t_y2 = (y_max - ray_origin[1]) / ray_dir[1]
             t_y_enter = min(t_y1, t_y2)
             t_y_exit = max(t_y1, t_y2)
-            # print(f"DEBUG:       Y axis: t_enter={t_y_enter}, t_exit={t_y_exit}")
+            # # print(f"DEBUG:       Y axis: t_enter={t_y_enter}, t_exit={t_y_exit}")
             t_ranges.append((t_y_enter, t_y_exit))
         # else:
-            # print("DEBUG:       Y axis: Ray parallel to Y bounds")
+            # # print("DEBUG:       Y axis: Ray parallel to Y bounds")
             
         # Z축 범위
-        # print(f"DEBUG:       Z axis: t_enter={t_start}, t_exit={t_end}")
+        # # print(f"DEBUG:       Z axis: t_enter={t_start}, t_exit={t_end}")
         t_ranges.append((t_start, t_end))
         
-        # print(f"DEBUG:       All t_ranges: {t_ranges}")
+        # # print(f"DEBUG:       All t_ranges: {t_ranges}")
         
         # 모든 축의 교집합 계산
         final_t_start = max([r[0] for r in t_ranges] + [0])  # 0보다 큰 값만
         final_t_end = min([r[1] for r in t_ranges])
         
-        # print(f"DEBUG:       XY+Z intersection: t_start={final_t_start}, t_end={final_t_end}")
+        # # print(f"DEBUG:       XY+Z intersection: t_start={final_t_start}, t_end={final_t_end}")
         
         if final_t_start >= final_t_end:
-            # print(f"DEBUG:       FAIL: No intersection with scene bounds (t={final_t_start:.1f} >= {final_t_end:.1f})")
+            # # print(f"DEBUG:       FAIL: No intersection with scene bounds (t={final_t_start:.1f} >= {final_t_end:.1f})")
             return None, 'out_of_bounds'
             
         # 교집합 범위 사용
@@ -699,19 +895,19 @@ class COLMAPVisualizer:
             t_end = 1000
         
         # Binary search로 교차점 찾기
-        # print(f"DEBUG:       Starting binary search with t_start={t_start}, t_end={t_end}")
+        # # print(f"DEBUG:       Starting binary search with t_start={t_start}, t_end={t_end}")
         
         for i in range(20):  # 최대 20회 반복
             t_mid = (t_start + t_end) / 2
-            # print(f"DEBUG:       Binary search iteration {i+1}: t_mid={t_mid}")
+            # # print(f"DEBUG:       Binary search iteration {i+1}: t_mid={t_mid}")
             
             # Ray 위의 점 계산
             ray_point = ray_origin + t_mid * ray_dir
-            # print(f"DEBUG:       Ray point: {ray_point}")
+            # # print(f"DEBUG:       Ray point: {ray_point}")
             
             # DTM에서 해당 XY 위치의 Z 값 보간 (최적화된 방법)
             try:
-                # print(f"DEBUG:       Getting DTM Z for XY: [{ray_point[0]:.2f}, {ray_point[1]:.2f}]")
+                # # print(f"DEBUG:       Getting DTM Z for XY: [{ray_point[0]:.2f}, {ray_point[1]:.2f}]")
                 
                 # DTM grid에서 가장 가까운 점들 찾기 (griddata 대신)
                 x_grid_flat = self.dtm['x_grid'].flatten()
@@ -726,35 +922,36 @@ class COLMAPVisualizer:
                 # 거리 체크 - 너무 멀면 extrapolation 경고
                 min_distance = distances[nearest_idx]
                 if min_distance > 100:  # 100m 이상 떨어져 있으면 extrapolation
-                    # print(f"DEBUG:       Using extrapolation (distance: {min_distance:.1f}m)")
+                    # # print(f"DEBUG:       Using extrapolation (distance: {min_distance:.1f}m)")
                     pass
                 
-                # print(f"DEBUG:       DTM Z (nearest): {dtm_z}, Ray Z: {ray_point[2]}, distance: {distances[nearest_idx]:.2f}")
+                # # print(f"DEBUG:       DTM Z (nearest): {dtm_z}, Ray Z: {ray_point[2]}, distance: {distances[nearest_idx]:.2f}")
                 
                 if np.isnan(dtm_z):
-                    print("DEBUG:       FAIL: DTM Z is NaN at this location")
+                    pass
+                    # print("DEBUG:       FAIL: DTM Z is NaN at this location")
                     return None, 'dtm_nan'
                     
                 # Ray Z와 DTM Z 비교
                 z_diff = ray_point[2] - dtm_z
-                # print(f"DEBUG:       Z difference: {z_diff}")
+                # # print(f"DEBUG:       Z difference: {z_diff}")
                 
                 if abs(z_diff) < 50.0:  # 50m 이내 정밀도로 극도로 완화
-                    # print(f"DEBUG:     Found intersection at [{ray_point[0]:.1f}, {ray_point[1]:.1f}, {dtm_z:.1f}]")
+                    # # print(f"DEBUG:     Found intersection at [{ray_point[0]:.1f}, {ray_point[1]:.1f}, {dtm_z:.1f}]")
                     return np.array([ray_point[0], ray_point[1], dtm_z]), 'success'
                 elif z_diff > 0:  # Ray가 DTM보다 위에 있음
-                    # print("DEBUG:       Ray above DTM, moving t_start forward")
+                    # # print("DEBUG:       Ray above DTM, moving t_start forward")
                     t_start = t_mid
                 else:  # Ray가 DTM보다 아래에 있음
-                    # print("DEBUG:       Ray below DTM, moving t_end backward")
+                    # # print("DEBUG:       Ray below DTM, moving t_end backward")
                     t_end = t_mid
                     
             except Exception as e:
-                # print(f"DEBUG:       Exception in griddata: {e}")
+                # # print(f"DEBUG:       Exception in griddata: {e}")
                 return None, 'dtm_nan'
                 
         # 최종 근사값 반환 (binary search 완료 후)
-        print(f"DEBUG:       FAIL: Binary search couldn't converge to 50m precision")
+        # print(f"DEBUG:       FAIL: Binary search couldn't converge to 50m precision")
         final_point = ray_origin + t_mid * ray_dir
         try:
             # Nearest neighbor 방식 사용 (griddata 대신)
@@ -768,67 +965,78 @@ class COLMAPVisualizer:
             
             # Extrapolation 거리 체크
             if distances[nearest_idx] > 100:
-                print(f"DEBUG:       Using extrapolation for final point (distance: {distances[nearest_idx]:.1f}m)")
+                pass
+                # print(f"DEBUG:       Using extrapolation for final point (distance: {distances[nearest_idx]:.1f}m)")
+                pass
             
-            print(f"DEBUG:       Final result: [{final_point[0]:.2f}, {final_point[1]:.2f}, {dtm_z:.2f}]")
+            # print(f"DEBUG:       Final result: [{final_point[0]:.2f}, {final_point[1]:.2f}, {dtm_z:.2f}]")
             return np.array([final_point[0], final_point[1], dtm_z]), 'no_convergence'
         except Exception as e:
-            print(f"DEBUG:       Error in final approximation: {e}")
+            pass
+            # print(f"DEBUG:       Error in final approximation: {e}")
             return None, 'dtm_nan'
     
     def visualize_3d_scene(self, save_path='colmap_3d_scene.png'):
         """3D 장면 시각화"""
-        print("DEBUG: visualize_3d_scene() - ENTRY POINT")
-        print(f"DEBUG: save_path = {save_path}")
+        # print("DEBUG: visualize_3d_scene() - ENTRY POINT")
+        # print(f"DEBUG: save_path = {save_path}")
         
-        print("DEBUG: Checking data availability...")
-        print(f"DEBUG: self.cameras exists: {bool(self.cameras)}")
-        print(f"DEBUG: self.images exists: {bool(self.images)}")
-        print(f"DEBUG: self.points3d exists: {bool(self.points3d)}")
+        # print("DEBUG: Checking data availability...")
+        # print(f"DEBUG: self.cameras exists: {bool(self.cameras)}")
+        # print(f"DEBUG: self.images exists: {bool(self.images)}")
+        # print(f"DEBUG: self.points3d exists: {bool(self.points3d)}")
         
         if not all([self.cameras, self.images, self.points3d]):
-            print("DEBUG: ERROR - Missing required data!")
+            pass
+            # print("DEBUG: ERROR - Missing required data!")
             raise ValueError("Load all COLMAP data first")
         
-        print("DEBUG: All data available, proceeding...")
-        print(f"DEBUG: Number of cameras: {len(self.cameras)}")
-        print(f"DEBUG: Number of images: {len(self.images)}")
-        print(f"DEBUG: Number of 3D points: {len(self.points3d)}")
+        # print("DEBUG: All data available, proceeding...")
+        # print(f"DEBUG: Number of cameras: {len(self.cameras)}")
+        # print(f"DEBUG: Number of images: {len(self.images)}")
+        # print(f"DEBUG: Number of 3D points: {len(self.points3d)}")
         
-        print("DEBUG: Creating matplotlib figure...")
+        # print("DEBUG: Creating matplotlib figure...")
         try:
             fig = plt.figure(figsize=(15, 12))
-            print("DEBUG: Figure created successfully")
+            # print("DEBUG: Figure created successfully")
         except Exception as e:
-            print(f"DEBUG: ERROR creating figure: {e}")
+            pass
+            # print(f"DEBUG: ERROR creating figure: {e}")
             raise
             
-        print("DEBUG: Adding 3D subplot...")
+        # print("DEBUG: Adding 3D subplot...")
         try:
             ax = fig.add_subplot(111, projection='3d')
-            print("DEBUG: 3D subplot added successfully")
+            # print("DEBUG: 3D subplot added successfully")
         except Exception as e:
-            print(f"DEBUG: ERROR adding 3D subplot: {e}")
+            pass
+            # print(f"DEBUG: ERROR adding 3D subplot: {e}")
             raise
         
         # 1. DTM 표시
-        print("DEBUG: Checking DTM availability...")
+        # print("DEBUG: Checking DTM availability...")
         if hasattr(self, 'dtm'):
-            print("DEBUG: DTM exists, adding surface plot...")
+            pass
+            # print("DEBUG: DTM exists, adding surface plot...")
             try:
                 ax.plot_wireframe(self.dtm['x_grid'], self.dtm['y_grid'], self.dtm['z_grid'],
                                 alpha=0.6, color='darkgray', linewidth=0.8)
-                print("DEBUG: DTM wireframe plot added successfully")
+                # print("DEBUG: DTM wireframe plot added successfully")
             except Exception as e:
-                print(f"DEBUG: ERROR adding DTM surface: {e}")
+                pass
+                # print(f"DEBUG: ERROR adding DTM surface: {e}")
+                pass
         else:
-            print("DEBUG: No DTM available")
+            pass
+            # print("DEBUG: No DTM available")
+            pass
         
         # 2. 3D 점들 표시 (생략 - DTM만 사용)
-        print("DEBUG: Skipping 3D points display - using DTM wireframe only")
+        # print("DEBUG: Skipping 3D points display - using DTM wireframe only")
         
         # 3. 카메라들과 ray casting
-        print("DEBUG: Processing cameras and ray casting...")
+        # print("DEBUG: Processing cameras and ray casting...")
         camera_centers = []
         
         # 실패 원인 통계 수집
@@ -849,15 +1057,15 @@ class COLMAPVisualizer:
             #camera_color = colors[(image_count - 1) % len(colors)]
             camera_color = self.color_cam[image_id % len(self.color_cam)]
             
-            print(f"DEBUG: Processing image {image_count}/{len(self.images)} (ID: {image_id}) - Color: {camera_color}")
+            # print(f"DEBUG: Processing image {image_count}/{len(self.images)} (ID: {image_id}) - Color: {camera_color}")
             
             try:
                 camera_center = image['camera_center']
-                # print(f"DEBUG:   Camera center: {camera_center}")
+                # # print(f"DEBUG:   Camera center: {camera_center}")
                 camera_centers.append(camera_center)
                 
                 # 카메라 0의 바라보는 방향 계산 및 출력
-                #'''
+                '''
                 if image_count == 1:  # 첫 번째 카메라 (카메라 0)
                     R = image['R']
                     # COLMAP에서 카메라의 Z축(viewing direction)은 [0, 0, 1]
@@ -870,15 +1078,15 @@ class COLMAPVisualizer:
                     else:
                         print("Camera looking DOWN (negative Z)")
                     print("=== END VIEWING DIRECTION ===\n")
-                #'''
+                '''
                 # 카메라 위치 표시 (각각 다른 색상)
                 ax.scatter(*camera_center, c=camera_color, s=100, marker='^')
-                # print(f"DEBUG:   Camera position plotted successfully")
+                # # print(f"DEBUG:   Camera position plotted successfully")
                 
                 # 이미지 꼭지점들과 지표면 교점 구하기
-                # print("DEBUG:   Getting camera corners...")
+                # # print("DEBUG:   Getting camera corners...")
                 _, ray_dirs = self.get_camera_corners(image_id)
-                # print(f"DEBUG:   Ray directions shape: {ray_dirs.shape}")
+                # # print(f"DEBUG:   Ray directions shape: {ray_dirs.shape}")
                 
                 # 각 카메라의 corner ray direction 출력  
                 if image_count <= 10:  # 처음 10대 카메라만 출력 (너무 많으면 제한)
@@ -903,7 +1111,8 @@ class COLMAPVisualizer:
                         [0, 0, 1]
                     ])
                     corners_normalized = np.linalg.inv(K) @ corners_2d
-                    
+                   
+                    '''
                     print(f"\n=== CAMERA {image_count} (ID: {image_id}) CORNER ANALYSIS ===")
                     print(f"Image size: width={w}, height={h}")
                     print(f"Camera params: fx={fx:.6f}, fy={fy:.6f}, cx={cx:.6f}, cy={cy:.6f}")
@@ -913,14 +1122,14 @@ class COLMAPVisualizer:
                     
                     print(f"\nPixel corners:")
                     pixel_corners = [[0, 0], [w, 0], [w, h], [0, h]]
+                    corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
                     for i in range(4):
-                        corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
                         px, py = pixel_corners[i]
                         print(f"Corner {i+1} ({corner_names[i]}): pixel=({px}, {py})")
                     
                     print(f"\nCorners normalized (camera coordinates):")
+                    corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
                     for i in range(4):
-                        corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
                         norm_coord = corners_normalized[:, i]
                         px, py = pixel_corners[i]
                         # 수동 계산으로 확인
@@ -928,12 +1137,11 @@ class COLMAPVisualizer:
                         manual_ny = (py - cy) / fy
                         print(f"Corner {i+1} ({corner_names[i]}): [{norm_coord[0]:.6f}, {norm_coord[1]:.6f}, {norm_coord[2]:.6f}]")
                         print(f"  -> Manual calc: [({px}-{cx:.1f})/{fx:.1f}, ({py}-{cy:.1f})/{fy:.1f}] = [{manual_nx:.6f}, {manual_ny:.6f}]")
-                    
                     print(f"\nRay directions (world coordinates):")
+                    corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
                     nadir_vector = np.array([0, 0, -1])  # 수직 아래 방향
                     
                     for i in range(4):
-                        corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
                         ray_dir = ray_dirs[:, i]
                         
                         # Off nadir angle 계산 (도 단위)
@@ -947,15 +1155,15 @@ class COLMAPVisualizer:
                         else:
                             print(f"  -> Ray pointing DOWN (Z={ray_dir[2]:.6f})")
                     print(f"=== END CAMERA {image_count} ANALYSIS ===\n")
-                
+                    '''
                 ground_points = []
                 for i in range(4):  # 4개 꼭지점
-                    # print(f"DEBUG:     Raycasting corner {i+1}/4...")
+                    # # print(f"DEBUG:     Raycasting corner {i+1}/4...")
                     result = self.raycast_to_dtm(camera_center, ray_dirs[:, i])
                     
                     if result[0] is not None:  # 성공
                         intersection, reason = result
-                        # print(f"DEBUG:     Intersection found: {intersection}")
+                        # # print(f"DEBUG:     Intersection found: {intersection}")
                         ground_points.append(intersection)
                         failure_stats[reason] += 1
                         
@@ -964,23 +1172,25 @@ class COLMAPVisualizer:
                                [camera_center[1], intersection[1]],
                                [camera_center[2], intersection[2]], 
                                color=camera_color, alpha=1.0, linewidth=1.0, linestyle='-')
-                        # print(f"DEBUG:     Ray line plotted successfully")
+                        # # print(f"DEBUG:     Ray line plotted successfully")
                     else:  # 실패
                         _, reason = result
                         failure_stats[reason] += 1
-                        print(f"DEBUG:     No intersection found for corner {i+1} - Reason: {reason}")
+                        # print(f"DEBUG:     No intersection found for corner {i+1} - Reason: {reason}")
                 
-                print(f"DEBUG:   Found {len(ground_points)}/4 ground intersections for camera {image_count}")
-                
+                # print(f"DEBUG:   Found {len(ground_points)}/4 ground intersections for camera {image_count}")
+               
+                '''
                 # 카메라 0의 교점들을 콘솔에 출력 (몇 개든 상관없이)
                 print(f"\n=== CAMERA {image_count} INTERSECTIONS ({len(ground_points)}/4 found) ===")
                 for i, point in enumerate(ground_points):
                     print(f"Intersection {i+1}: [{point[0]:.6f}, {point[1]:.6f}, {point[2]:.6f}]")
                 print("=== END INTERSECTIONS ===\n")
-                
+                '''
+
                 # 지표면 사각형 그리기 (2개 이상의 점이 있으면 연결)
                 if len(ground_points) >= 2:
-                    # print(f"DEBUG:   Drawing ground polygon with {len(ground_points)} points...")
+                    # # print(f"DEBUG:   Drawing ground polygon with {len(ground_points)} points...")
                     
                     # 모든 점을 연결하여 polygon 형성
                     ground_points_array = np.array(ground_points)
@@ -995,40 +1205,42 @@ class COLMAPVisualizer:
                     
                     # 교차점 표시 제거 - 4각형만 그리기
                     
-                    # print(f"DEBUG:   Ground polygon drawn with {len(ground_points)} vertices")
+                    # # print(f"DEBUG:   Ground polygon drawn with {len(ground_points)} vertices")
                 elif len(ground_points) == 1:
                     # 하나의 점만 있을 때는 점으로 표시 (카메라별 색상)
                     ax.scatter(ground_points[0][0], ground_points[0][1], ground_points[0][2], 
                               c=camera_color, s=50, marker='o', alpha=0.8)
-                    print("DEBUG:   Single ground point drawn")
+                    # print("DEBUG:   Single ground point drawn")
                 else:
                     # footprint가 없는 경우 처리
                     pass
-                    print(f"DEBUG:   No ground intersections found for this image")
+                    # print(f"DEBUG:   No ground intersections found for this image")
                     
             except Exception as e:
-                print(f"DEBUG:   ERROR processing image {image_id}: {e}")
+                pass
+                # print(f"DEBUG:   ERROR processing image {image_id}: {e}")
                 continue
         
-        print(f"DEBUG: Processed {len(camera_centers)} camera centers")
+        # print(f"DEBUG: Processed {len(camera_centers)} camera centers")
         
         # 4. 카메라들의 중심 구하기
-        print("DEBUG: Computing scene center...")
+        # print("DEBUG: Computing scene center...")
         try:
             camera_centers = np.array(camera_centers)
-            print(f"DEBUG: Camera centers array shape: {camera_centers.shape}")
+            # print(f"DEBUG: Camera centers array shape: {camera_centers.shape}")
             scene_center = np.mean(camera_centers, axis=0)
-            print(f"DEBUG: Scene center: {scene_center}")
+            # print(f"DEBUG: Scene center: {scene_center}")
             
             # Scene center 표시는 뒤에서 한 번만 하기
         except Exception as e:
-            print(f"DEBUG: ERROR computing scene center: {e}")
+            pass
+            # print(f"DEBUG: ERROR computing scene center: {e}")
             raise
         
         # 상공 카메라 제거됨
         
         # 설정
-        print("DEBUG: Setting plot labels and legend...")
+        # print("DEBUG: Setting plot labels and legend...")
         try:
             ax.set_xlabel('X (m)')
             ax.set_ylabel('Y (m)') 
@@ -1065,55 +1277,61 @@ class COLMAPVisualizer:
                       edgecolors='black', linewidth=2, label='Scene Center')
             ax.legend()
             ax.set_title('COLMAP 3D Scene Visualization')
-            print("DEBUG: Plot configuration completed")
+            # print("DEBUG: Plot configuration completed")
         except Exception as e:
-            print(f"DEBUG: ERROR setting plot configuration: {e}")
+            pass
+            # print(f"DEBUG: ERROR setting plot configuration: {e}")
         
-        print("DEBUG: Preparing to save plot...")
+        # print("DEBUG: Preparing to save plot...")
         try:
             plt.tight_layout()
-            print("DEBUG: tight_layout() completed")
+            # print("DEBUG: tight_layout() completed")
         except Exception as e:
-            print(f"DEBUG: WARNING - tight_layout() failed: {e}")
+            pass
+            # print(f"DEBUG: WARNING - tight_layout() failed: {e}")
             
-        print(f"DEBUG: About to save plot to: {save_path}")
-        print(f"DEBUG: Current working directory: {os.getcwd()}")
+        # print(f"DEBUG: About to save plot to: {save_path}")
+        # print(f"DEBUG: Current working directory: {os.getcwd()}")
         
         # 간단한 테스트로 빈 파일이라도 생성해보기
         try:
             with open('test_file.txt', 'w') as f:
                 f.write('test')
-            print("DEBUG: Test file creation successful")
+            # print("DEBUG: Test file creation successful")
         except Exception as e:
-            print(f"DEBUG: Test file creation failed: {e}")
+            pass
+            # print(f"DEBUG: Test file creation failed: {e}")
         
         #'''
-        print(f"DEBUG: Saving to {save_path}...")
+        # print(f"DEBUG: Saving to {save_path}...")
         try:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"DEBUG: Plot saved successfully to {save_path}")
-            print(f"DEBUG: PNG file should be created at: {save_path}")
+            # print(f"DEBUG: Plot saved successfully to {save_path}")
+            # print(f"DEBUG: PNG file should be created at: {save_path}")
             
             # 파일이 실제로 생성되었는지 확인
             if os.path.exists(save_path):
                 size = os.path.getsize(save_path)
-                print(f"DEBUG: File exists with size: {size} bytes")
+                # print(f"DEBUG: File exists with size: {size} bytes")
             else:
-                print(f"DEBUG: ERROR - File does not exist: {save_path}")
+                pass
+                # print(f"DEBUG: ERROR - File does not exist: {save_path}")
                 
         except Exception as e:
-            print(f"DEBUG: ERROR saving plot: {e}")
+            pass
+            # print(f"DEBUG: ERROR saving plot: {e}")
             import traceback
             traceback.print_exc()
             raise
         #'''
 
-        print("DEBUG: Closing figure...")
+        # print("DEBUG: Closing figure...")
         try:
             plt.close()  # 메모리 절약을 위해 figure 닫기
-            print("DEBUG: Figure closed successfully")
+            # print("DEBUG: Figure closed successfully")
         except Exception as e:
-            print(f"DEBUG: WARNING - error closing figure: {e}")
+            pass
+            # print(f"DEBUG: WARNING - error closing figure: {e}")
         
         print(f"3D scene saved to {save_path}")
         
@@ -1146,24 +1364,27 @@ class COLMAPVisualizer:
         print(f"{'TOTAL':<20} {total_rays:<8} {100.0:>6.1f}%")
         print("="*50)
         
-        print(f"DEBUG: visualize_3d_scene() - EXIT POINT")
-        print(f"DEBUG: Returning scene_center={scene_center}")
+        # print(f"DEBUG: visualize_3d_scene() - EXIT POINT")
+        # print(f"DEBUG: Returning scene_center={scene_center}")
         return scene_center
     
     def render_orthographic_view(self, scene_center, 
                                 save_path='orthographic_view.png'):
         """상공에서 nadir orthographic projection 렌더링"""
-        
+        #print('111') 
         # DTM 기반으로 orthographic view 생성
         if not hasattr(self, 'dtm'):
             raise ValueError("DTM not created")
             
+        #print('222') 
         fig, ax = plt.subplots(figsize=(12, 12))
         
+        #print('333') 
         # DTM contour map
         contour = ax.contourf(self.dtm['x_grid'], self.dtm['y_grid'], self.dtm['z_grid'],
                              levels=50, cmap='terrain', alpha=0.8)
         
+        #print('444') 
         # 카메라 위치들 표시
         image_count = 0
         for image_id, image in self.images.items():
@@ -1174,7 +1395,6 @@ class COLMAPVisualizer:
             camera_center = image['camera_center']
             ax.plot(camera_center[0], camera_center[1], '^', 
                    color=camera_color, markersize=8, alpha=0.8)
-            a
             # 이미지 footprint
             _, ray_dirs = self.get_camera_corners(image_id)
             ground_points = []
@@ -1193,12 +1413,15 @@ class COLMAPVisualizer:
                                          edgecolor=camera_color, linewidth=1, alpha=0.7)
                     ax.add_patch(polygon)
                 except Exception as e:
-                    print(f"DEBUG: Error creating polygon: {e}")
+                    pass
+                    # print(f"DEBUG: Error creating polygon: {e}")
         
+        #print('555') 
         # Scene center 표시
         ax.plot(scene_center[0], scene_center[1], 'y*', 
                markersize=15, label='Scene Center')
         
+        #print('666') 
         # 원래 point cloud 점들 표시 (주석처리 - 대량 데이터로 인한 성능 문제)
         # if self.points3d:
         #     xyz_points = np.array([p['xyz'] for p in self.points3d.values()])
@@ -1211,6 +1434,7 @@ class COLMAPVisualizer:
         # 컬러바
         plt.colorbar(contour, ax=ax, label='Elevation (m)')
         
+        #print('777') 
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_title('Orthographic View from Aerial Camera')
@@ -1218,6 +1442,7 @@ class COLMAPVisualizer:
         ax.grid(True, alpha=0.3)
         ax.set_aspect('equal')
         
+        #print('888') 
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()  # 메모리 절약을 위해 figure 닫기
@@ -1237,6 +1462,7 @@ class COLMAPVisualizer:
             ax.plot_wireframe(self.dtm['x_grid'], self.dtm['y_grid'], self.dtm['z_grid'],
                             alpha=0.9, color='black', linewidth=1.5)
             
+            '''
             # Nadir view에서 실제 그려지는 DTM 범위 출력
             print("\n" + "="*60)
             print("NADIR VIEW - ACTUAL DTM RENDERING BOUNDS")
@@ -1256,7 +1482,7 @@ class COLMAPVisualizer:
             if len(valid_z) > 0:
                 print(f"Valid Z range (excluding NaN): [{valid_z.min():.2f}, {valid_z.max():.2f}]")
             print("="*60)
-
+            '''
         # 2. Point cloud 표시
         if self.points3d:
             xyz_points = np.array([pt['xyz'] for pt in self.points3d.values()])
@@ -1310,7 +1536,8 @@ class COLMAPVisualizer:
                                color=camera_color, linewidth=1, alpha=0.3)
                         
             except Exception as e:
-                print(f"DEBUG: Error processing camera {image_id}: {e}")
+                pass
+                # print(f"DEBUG: Error processing camera {image_id}: {e}")
         
         # 4. Nadir view 설정 (위에서 아래로)
         if hasattr(self, 'dtm'):
@@ -1337,12 +1564,12 @@ class COLMAPVisualizer:
             ax.set_xlim(x_lim)
             ax.set_ylim(y_lim)
             ax.set_zlim(z_lim)
-            
+            ''' 
             print(f"\nNADIR VIEW - AXIS LIMITS SET:")
             print(f"X axis: {x_lim}")
             print(f"Y axis: {y_lim}")
             print(f"Z axis: {z_lim}")
-        
+            '''
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
@@ -1511,7 +1738,8 @@ class COLMAPVisualizer:
                 #print('ccc');
             except Exception as e:
                 if hasattr(self, 'debug') and self.debug:
-                    print(f"DEBUG: Error processing camera {image_id}: {e}")
+                    pass
+                    # print(f"DEBUG: Error processing camera {image_id}: {e}")
 
         #print('aaaa');  #exit(1)
         # 5. Nadir view 설정 (위에서 아래로) - create_nadir_view와 동일
@@ -1583,7 +1811,7 @@ class COLMAPVisualizer:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
 
-        print(f"Nadir multi view saved to {save_path}")
+        #print(f"Nadir multi view saved to {save_path}")
         #exit(1)
 
 def main():

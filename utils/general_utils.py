@@ -91,8 +91,11 @@ def set_img_size(h, w):
     IMG_H, IMG_W = h, w
     TILE_Y = (IMG_H + BLOCK_Y - 1) // BLOCK_Y
     TILE_X = (IMG_W + BLOCK_X - 1) // BLOCK_X
-
-
+    '''
+    print(f"Image size set: IMG_W={IMG_W}, IMG_H={IMG_H}, TILE_X={TILE_X}, TILE_Y={TILE_Y}")
+    Image size set: IMG_W=11310, IMG_H=17310, TILE_X=707, TILE_Y=1082
+    exit(1)
+    '''
 def get_img_size():
     global IMG_H, IMG_W
     return IMG_H, IMG_W
@@ -217,6 +220,7 @@ def init_distributed(args):
             all_in_node_group.append(dist.new_group(in_node_group_ranks))
         node_rank = GLOBAL_RANK // num_gpu_per_node
         IN_NODE_GROUP = all_in_node_group[node_rank]
+        '''
         print(
             "Initializing -> "
             + " world_size: "
@@ -228,7 +232,7 @@ def init_distributed(args):
             + " in_node_rank: "
             + str(IN_NODE_GROUP.rank())
         )
-
+        '''
     else:
         DEFAULT_GROUP = SingleGPUGroup()
         IN_NODE_GROUP = SingleGPUGroup()
@@ -348,7 +352,7 @@ def check_memory_usage(log_file, args, iteration, gaussians, n_gauss_max, before
         mem_cur = max([a[0] for a in memory_usage_list])
         mem_max = args.densify_memory_limit_percentage * total_memory
         is_over_memory = mem_cur > mem_max
-        is_over_gauss = n_gauss_cur > n_gauss_max if n_gauss_max is not None else False
+        is_over_gauss = n_gauss_cur > n_gauss_max if (n_gauss_max is not None and n_gauss_max > 0) else False
         if is_over_memory or is_over_gauss:  
         #if (max([a[0] for a in memory_usage_list]) > args.densify_memory_limit_percentage * total_memory):  
         # If memory usage is reaching the upper bound of GPU memory, stop densification to avoid OOM by fragmentation and etc.
@@ -577,7 +581,7 @@ def merge_multiple_checkpoints(checkpoint_files):
     start_from_this_iteration = 0
     for checkpoint_file in checkpoint_files:
         (model_params, start_from_this_iteration) = torch.load(
-            checkpoint_file, map_location=f"cuda:{LOCAL_RANK}"
+            checkpoint_file, map_location=f"cuda:{LOCAL_RANK}", weights_only=False
         )
         all_model_params.append(model_params)
 
@@ -625,7 +629,7 @@ def get_part_of_checkpoints(checkpoint_file, num_parts, part_id):
     global LOCAL_RANK
 
     (model_params, start_from_this_iteration) = torch.load(
-        checkpoint_file, map_location=f"cuda:{LOCAL_RANK}"
+        checkpoint_file, map_location=f"cuda:{LOCAL_RANK}", weights_only=False
     )
 
     num_gaussians = model_params[1].shape[0]
@@ -709,6 +713,7 @@ def load_checkpoint(args):
     number_files = len(os.listdir(args.start_checkpoint))
     if args.start_checkpoint[-1] != "/":
         args.start_checkpoint += "/"
+    #print(f'number_files : {number_files}, DEFAULT_GROUP.size() : {DEFAULT_GROUP.size()}'); exit(1)
     if number_files == DEFAULT_GROUP.size():
         # file_name = args.start_checkpoint+"chkpnt" + str(DEFAULT_GROUP.rank()) + ".pth"
         file_name = (
@@ -719,7 +724,7 @@ def load_checkpoint(args):
             + str(DEFAULT_GROUP.rank())
             + ".pth"
         )
-        (model_params, start_from_this_iteration) = torch.load(file_name)
+        (model_params, start_from_this_iteration) = torch.load(file_name, weights_only=False)
 
     elif number_files > DEFAULT_GROUP.size():
         assert (

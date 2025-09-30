@@ -121,6 +121,8 @@ def eval_sh(deg, sh, dirs):
 
 
 def RGB2SH(rgb):
+    #print(f'rgb.shape : {rgb.shape}');  exit(1)
+    #print(f'rgb[0] : {rgb[0]}');  exit(1)
     return (rgb - 0.5) / C0
 
 

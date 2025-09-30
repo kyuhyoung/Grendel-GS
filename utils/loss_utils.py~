@@ -141,7 +141,12 @@ def pixelwise_ssim_with_mask_safe_efficient(img1, img2, pixel_mask):
     denominator = torch.clamp(denominator, min=1e-8)  # 0으로 나누기 방지
     
     pixelwise_ssim_loss = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / denominator
-    pixelwise_ssim_loss = pixelwise_ssim_loss * pixel_mask.unsqueeze(0)
+
+    # Efficient masking with in-place operation
+    # pixelwise_ssim_loss is (C, H, W), pixel_mask is (H, W)
+    if pixel_mask is not None:
+        # In-place multiplication to avoid new tensor allocation
+        pixelwise_ssim_loss *= pixel_mask.view(1, *pixel_mask.shape)
     
     return pixelwise_ssim_loss
 
@@ -172,7 +177,9 @@ def pixelwise_ssim_with_mask_checkpointed(img1, img2, pixel_mask):
         pixelwise_ssim_loss = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
             (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
         )
-        pixelwise_ssim_loss = pixelwise_ssim_loss * pixel_mask.unsqueeze(0)
+        # Efficient masking with in-place operation
+        if pixel_mask is not None:
+            pixelwise_ssim_loss *= pixel_mask.view(1, *pixel_mask.shape)
         return pixelwise_ssim_loss
     
     # Gradient checkpointing 사용
@@ -290,12 +297,23 @@ def pixelwise_ssim_with_mask_fp16(img1, img2, pixel_mask):
     C1 = 0.01**2
     C2 = 0.03**2
     
-    pixelwise_ssim_loss = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
-        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-    )
+    # 메모리 효율적인 계산 - 중간 변수 재사용
+    # Numerator 계산
+    temp1 = mu1_mu2.mul(2).add_(C1)  # 2 * mu1_mu2 + C1 (in-place)
+    temp2 = sigma12.mul(2).add_(C2)  # 2 * sigma12 + C2 (in-place)
+    numerator = temp1.mul_(temp2)  # 최종 numerator
+
+    # Denominator 계산
+    temp3 = mu1_sq.add(mu2_sq).add_(C1)  # mu1_sq + mu2_sq + C1 (in-place)
+    temp4 = sigma1_sq.add(sigma2_sq).add_(C2)  # sigma1_sq + sigma2_sq + C2 (in-place)
+    denominator = temp3.mul_(temp4)  # 최종 denominator
+
+    # 최종 결과
+    pixelwise_ssim_loss = numerator.div_(denominator)  # in-place division
     
-    # 마스크 적용
-    pixelwise_ssim_loss = pixelwise_ssim_loss * pixel_mask.unsqueeze(0).half()
+    # 마스크 적용 with in-place operation
+    if pixel_mask is not None:
+        pixelwise_ssim_loss *= pixel_mask.view(1, *pixel_mask.shape).half()
     
     # 원본 dtype으로 복원
     return pixelwise_ssim_loss.to(original_dtype)
@@ -393,10 +411,24 @@ def pixelwise_ssim_with_mask_ori(img1, img2, pixel_mask):
     C1 = 0.01**2
     C2 = 0.03**2
 
-    pixelwise_ssim_loss = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
-        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-    )
-    pixelwise_ssim_loss = pixelwise_ssim_loss * pixel_mask.unsqueeze(0)
+    # 메모리 효율적인 계산 - 중간 변수 재사용
+    # Numerator 계산
+    temp1 = mu1_mu2.mul(2).add_(C1)  # 2 * mu1_mu2 + C1 (in-place)
+    temp2 = sigma12.mul(2).add_(C2)  # 2 * sigma12 + C2 (in-place)
+    numerator = temp1.mul_(temp2)  # 최종 numerator
+
+    # Denominator 계산
+    temp3 = mu1_sq.add(mu2_sq).add_(C1)  # mu1_sq + mu2_sq + C1 (in-place)
+    temp4 = sigma1_sq.add(sigma2_sq).add_(C2)  # sigma1_sq + sigma2_sq + C2 (in-place)
+    denominator = temp3.mul_(temp4)  # 최종 denominator
+
+    # 최종 결과
+    pixelwise_ssim_loss = numerator.div_(denominator)  # in-place division
+    #pixelwise_ssim_loss = pixelwise_ssim_loss * pixel_mask.unsqueeze(0)
+    # Efficient masking with in-place operation
+    if pixel_mask is not None:
+        # In-place multiplication to avoid new tensor allocation
+        pixelwise_ssim_loss *= pixel_mask.view(1, *pixel_mask.shape)
 
     return pixelwise_ssim_loss
 
@@ -525,12 +557,23 @@ def pixelwise_ssim_with_mask_original(img1, img2, pixel_mask):
     
     C1 = 0.01**2
     C2 = 0.03**2
-    pixelwise_ssim_loss = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
-        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-    )
+    # 메모리 효율적인 계산 - 중간 변수 재사용
+    # Numerator 계산
+    temp1 = mu1_mu2.mul(2).add_(C1)  # 2 * mu1_mu2 + C1 (in-place)
+    temp2 = sigma12.mul(2).add_(C2)  # 2 * sigma12 + C2 (in-place)
+    numerator = temp1.mul_(temp2)  # 최종 numerator
+
+    # Denominator 계산
+    temp3 = mu1_sq.add(mu2_sq).add_(C1)  # mu1_sq + mu2_sq + C1 (in-place)
+    temp4 = sigma1_sq.add(sigma2_sq).add_(C2)  # sigma1_sq + sigma2_sq + C2 (in-place)
+    denominator = temp3.mul_(temp4)  # 최종 denominator
+
+    # 최종 결과
+    pixelwise_ssim_loss = numerator.div_(denominator)  # in-place division
     
-    # 마스크 적용 - (1, C, H, W) * (1, 1, H, W)
-    pixelwise_ssim_loss = pixelwise_ssim_loss * pixel_mask.unsqueeze(0).unsqueeze(0)
+    # 마스크 적용 with in-place - (1, C, H, W) * (1, 1, H, W)
+    if pixel_mask is not None:
+        pixelwise_ssim_loss *= pixel_mask.view(1, 1, *pixel_mask.shape)
     
     # 첫 번째 채널만 반환하고 배치 차원 제거
     return pixelwise_ssim_loss[:, :1, :, :].squeeze(0)  # (1, H, W)
@@ -569,12 +612,23 @@ def pixelwise_ssim_with_mask_mixed_precision(img1, img2, pixel_mask):
     C1 = 0.01**2
     C2 = 0.03**2
     
-    pixelwise_ssim_loss = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
-        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-    )
+    # 메모리 효율적인 계산 - 중간 변수 재사용
+    # Numerator 계산
+    temp1 = mu1_mu2.mul(2).add_(C1)  # 2 * mu1_mu2 + C1 (in-place)
+    temp2 = sigma12.mul(2).add_(C2)  # 2 * sigma12 + C2 (in-place)
+    numerator = temp1.mul_(temp2)  # 최종 numerator
+
+    # Denominator 계산
+    temp3 = mu1_sq.add(mu2_sq).add_(C1)  # mu1_sq + mu2_sq + C1 (in-place)
+    temp4 = sigma1_sq.add(sigma2_sq).add_(C2)  # sigma1_sq + sigma2_sq + C2 (in-place)
+    denominator = temp3.mul_(temp4)  # 최종 denominator
+
+    # 최종 결과
+    pixelwise_ssim_loss = numerator.div_(denominator)  # in-place division
     
-    # 마스크 적용
-    pixelwise_ssim_loss = pixelwise_ssim_loss * pixel_mask.unsqueeze(0).float()
+    # 마스크 적용 with in-place operation
+    if pixel_mask is not None:
+        pixelwise_ssim_loss *= pixel_mask.view(1, *pixel_mask.shape).float()
     
     return pixelwise_ssim_loss
 
@@ -597,10 +651,8 @@ def pixelwise_ssim_with_mask(img1, img2, pixel_mask, use_chunk):
             return torch.zeros_like(img1[:, 0:1, :, :])
     
     if use_chunk:
-        #print(f'use_chunk : {use_chunk}')
         return pixelwise_ssim_with_mask_improved_chunked(img1, img2, pixel_mask, 4096)
     else:
-        #print(f'use_chunk : {use_chunk}')
         return pixelwise_ssim_with_mask_ori(img1, img2, pixel_mask)
     #return pixelwise_ssim_with_mask_improved_chunked(img1, img2, pixel_mask, 256)
     #return pixelwise_ssim_with_mask_fp16(img1, img2, pixel_mask)
