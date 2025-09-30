@@ -264,9 +264,8 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
                         if new_points:
                             _add_gaussians_from_points(gaussians, new_points, opt_args)
 
-                # Store all cameras for visibility checks
-                scene.all_cameras = {cam.uid: cam for cam in scene.train_cameras}
-                utils.print_rank_0(f"📊 Stored {len(scene.all_cameras)} cameras for visibility checks")
+                # Note: scene.all_cameras is already populated in Scene.__init__ from COLMAP
+                utils.print_rank_0(f"📊 Using {len(scene.all_cameras)} cameras for visibility checks (from Scene.__init__)")
 
                 gaussians.training_setup(opt_args)
 
@@ -515,6 +514,8 @@ def _debug_gaussian_projection_check(gaussians, scene, args, batched_cameras):
                 cx = width / 2
                 cy = height / 2
 
+                from utils.projection_utils import project_points_to_camera
+
                 # Camera matrix using current 3DGS settings
                 camera_matrix = np.array([
                     [fx_focal, 0, cx],
@@ -522,40 +523,20 @@ def _debug_gaussian_projection_check(gaussians, scene, args, batched_cameras):
                     [0, 0, 1]
                 ], dtype=np.float64)
 
-                # No distortion for 3DGS cameras
-                dist_coeffs = np.array([0, 0, 0, 0, 0], dtype=np.float64)
-
                 # Rotation and translation from current 3DGS camera
                 R = cam.R if isinstance(cam.R, np.ndarray) else cam.R.detach().cpu().numpy()  # 3x3 rotation matrix
                 T = cam.T if isinstance(cam.T, np.ndarray) else cam.T.detach().cpu().numpy()  # 3x1 translation vector
 
-                # For cv2.projectPoints (world to camera transformation)
-                rvec, _ = cv2.Rodrigues(R)
-                tvec = T.reshape(3, 1)
-
-                # Project all Gaussians
-                points_2d, _ = cv2.projectPoints(
-                    gaussian_positions.reshape(-1, 1, 3),  # World coordinates
-                    rvec,  # Rotation vector
-                    tvec,  # Translation vector
-                    camera_matrix,
-                    dist_coeffs
+                # Use common projection utility (no distortion for 3DGS cameras)
+                result = project_points_to_camera(
+                    gaussian_positions, R, T, camera_matrix, dist_coeffs=None,
+                    check_behind_camera=True,
+                    image_width=width,
+                    image_height=height,
+                    margin_pixels=0
                 )
 
-                points_2d = points_2d.reshape(-1, 2)  # Shape: (N, 2)
-
-                # Check which points are in front of camera
-                camera_points = (R.T @ (gaussian_positions - T).T).T  # Nx3
-                valid_mask = camera_points[:, 2] > 0
-
-                # Check which points are within image bounds
-                in_bounds_mask = (
-                    (points_2d[:, 0] >= 0) & (points_2d[:, 0] < width) &
-                    (points_2d[:, 1] >= 0) & (points_2d[:, 1] < height)
-                )
-
-                # Combine masks
-                visible_mask = valid_mask & in_bounds_mask
+                visible_mask = result['visible_mask']
                 visible_count = np.sum(visible_mask)
 
                 print(f"  📷 Camera {cam.colmap_id} (3DGS): {visible_count} / {len(gaussian_positions)} Gaussians visible")
@@ -1045,6 +1026,8 @@ def _check_points_visibility_batch(points_3d, camera_id, scene, margin_pixels=0)
     import numpy as np
     import cv2
 
+    from utils.projection_utils import project_points_to_camera
+
     n_points = len(points_3d)
     visible = np.zeros(n_points, dtype=bool)
 
@@ -1060,48 +1043,55 @@ def _check_points_visibility_batch(points_3d, camera_id, scene, margin_pixels=0)
         R = camera.R  # Rotation matrix [3, 3]
         T = camera.T  # Translation vector [3]
 
-        # Convert rotation matrix to rodrigues vector for cv2.projectPoints
-        rvec, _ = cv2.Rodrigues(R)
-        tvec = T.reshape(3, 1)
+        # Get camera intrinsics - compute from FOV
+        from utils.graphics_utils import fov2focal
 
-        # Get camera intrinsics
+        # Handle both Camera and CameraInfo objects
+        if hasattr(camera, 'FoVx'):
+            # Camera object
+            fov_x = camera.FoVx
+            fov_y = camera.FoVy
+            width = camera.image_width
+            height = camera.image_height
+        elif hasattr(camera, 'FovX'):
+            # CameraInfo object
+            fov_x = camera.FovX
+            fov_y = camera.FovY
+            width = camera.width
+            height = camera.height
+        else:
+            raise AttributeError(f"Camera object has neither FoVx nor FovX attribute")
+
+        fx = fov2focal(fov_x, width)
+        fy = fov2focal(fov_y, height)
+        cx = width / 2.0
+        cy = height / 2.0
+
         K = np.array([
-            [camera.fx, 0, camera.cx],
-            [0, camera.fy, camera.cy],
+            [fx, 0, cx],
+            [0, fy, cy],
             [0, 0, 1]
-        ], dtype=np.float32)
+        ], dtype=np.float64)
 
         # Get distortion coefficients from camera model
         # COLMAP camera models: PINHOLE (no distortion), RADIAL (k1, k2), etc.
+        dist_coeffs = None
         if hasattr(camera, 'distortion_params') and camera.distortion_params is not None:
-            dist_coeffs = np.array(camera.distortion_params, dtype=np.float32)
+            dist_coeffs = np.array(camera.distortion_params, dtype=np.float64)
         elif hasattr(camera, 'k1') and hasattr(camera, 'k2'):
             # RADIAL model: k1, k2
-            dist_coeffs = np.array([camera.k1, camera.k2, 0, 0, 0], dtype=np.float32)
-        else:
-            # PINHOLE or no distortion available
-            dist_coeffs = np.zeros(5, dtype=np.float32)
+            dist_coeffs = np.array([camera.k1, camera.k2], dtype=np.float64)
 
-        # Project all points at once
-        projected_points, _ = cv2.projectPoints(
-            points_3d.reshape(-1, 1, 3).astype(np.float32),
-            rvec, tvec, K, dist_coeffs
-        )
-        projected_points = projected_points.reshape(-1, 2)
-
-        # Check if points are within image bounds with margin
-        # Positive margin: shrink valid region [margin, width-margin]
-        # Negative margin: expand valid region [-margin, width+margin]
-        width = camera.image_width
-        height = camera.image_height
-
-        visible = (
-            (projected_points[:, 0] >= margin_pixels) &
-            (projected_points[:, 0] < width - margin_pixels) &
-            (projected_points[:, 1] >= margin_pixels) &
-            (projected_points[:, 1] < height - margin_pixels)
+        # Use common projection utility
+        result = project_points_to_camera(
+            points_3d, R, T, K, dist_coeffs,
+            check_behind_camera=False,  # Only check image bounds (matching original behavior)
+            image_width=width,
+            image_height=height,
+            margin_pixels=margin_pixels
         )
 
+        visible = result['in_bounds_mask']
         return visible
 
     except Exception as e:
