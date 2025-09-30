@@ -227,9 +227,10 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.sum_visible_count_in_one_batch = torch.zeros(
-            (self.get_xyz.shape[0]), device="cuda"
-        )
+        # NOTE: sum_visible_count_in_one_batch는 현재 사용되지 않음 (미사용 변수)
+        # self.sum_visible_count_in_one_batch = torch.zeros(
+        #     (self.get_xyz.shape[0]), device="cuda"
+        # )
 
     def all_parameters(self):
         return [
@@ -977,9 +978,10 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.sum_visible_count_in_one_batch = self.sum_visible_count_in_one_batch[
-            valid_points_mask
-        ]
+        # NOTE: sum_visible_count_in_one_batch는 현재 사용되지 않음 (미사용 변수)
+        # self.sum_visible_count_in_one_batch = self.sum_visible_count_in_one_batch[
+        #     valid_points_mask
+        # ]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -1058,9 +1060,10 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.sum_visible_count_in_one_batch = torch.zeros(
-            (self.get_xyz.shape[0]), device="cuda"
-        )
+        # NOTE: sum_visible_count_in_one_batch는 현재 사용되지 않음 (미사용 변수)
+        # self.sum_visible_count_in_one_batch = torch.zeros(
+        #     (self.get_xyz.shape[0]), device="cuda"
+        # )
 
         self.send_to_gpui_cnt = torch.cat(
             (self.send_to_gpui_cnt, new_send_to_gpui_cnt), dim=0
@@ -1481,9 +1484,10 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.sum_visible_count_in_one_batch = torch.zeros(
-            (self.get_xyz.shape[0]), device="cuda"
-        )
+        # NOTE: sum_visible_count_in_one_batch는 현재 사용되지 않음 (미사용 변수)
+        # self.sum_visible_count_in_one_batch = torch.zeros(
+        #     (self.get_xyz.shape[0]), device="cuda"
+        # )
         # NOTE: This function is called right after desify_and_prune. Therefore self.xyz_gradient_accum, self.denom and self.max_radii2D are all zero.
         # We do not need to all2all them here.
 
