@@ -253,9 +253,9 @@ class COLMAPVisualizer:
             camera = self.cameras[image['camera_id']]
 
             try:
-                import cv2
+                from utils.projection_utils import project_points_to_camera
 
-                # Camera matrix and distortion (same as individual function)
+                # Camera matrix and distortion
                 fx = camera['params']['fx']
                 fy = camera['params']['fy'] if 'fy' in camera['params'] else fx
                 cx = camera['params']['cx']
@@ -265,32 +265,25 @@ class COLMAPVisualizer:
                                         [0, fy, cy],
                                         [0, 0, 1]], dtype=np.float64)
 
-                dist_coeffs = np.array([0, 0, 0, 0, 0], dtype=np.float64)
+                dist_coeffs = None
                 if 'distortion' in camera['params'] and camera['params']['distortion']:
-                    distortion = camera['params']['distortion']
-                    for i, coeff in enumerate(distortion[:5]):
-                        dist_coeffs[i] = coeff
+                    dist_coeffs = np.array(camera['params']['distortion'], dtype=np.float64)
 
                 # Rotation and translation
                 R = image['R']
                 t = image['t']
-                rvec, _ = cv2.Rodrigues(R)
-                tvec = t.reshape(3, 1)
 
-                # Batch projection: all points at once
-                object_points = all_points.reshape(-1, 1, 3).astype(np.float64)
-                image_points, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
-                image_points = image_points.reshape(-1, 2)  # Shape: (N, 2)
-
-                # Check which points are in view
-                width = camera['width']
-                height = camera['height']
-
-                # Check bounds for all points at once
-                in_bounds = (
-                    (image_points[:, 0] >= 0) & (image_points[:, 0] < width) &
-                    (image_points[:, 1] >= 0) & (image_points[:, 1] < height)
+                # Use common projection utility
+                result = project_points_to_camera(
+                    all_points, R, t, camera_matrix, dist_coeffs,
+                    check_behind_camera=False,  # Not checking in original code
+                    image_width=camera['width'],
+                    image_height=camera['height'],
+                    margin_pixels=0
                 )
+
+                image_points = result['points_2d']
+                in_bounds = result['in_bounds_mask']
 
                 # Assign results to points
                 for i, point_id in enumerate(point_ids):
@@ -396,202 +389,9 @@ class COLMAPVisualizer:
         print("="*60)
         #exit(1)
 
-    def project_point_to_image(self, point_3d, image_id, margin_pixels=0, consider_distortion = True, use_opencv = True):
-        """
-        Project 3D point to image coordinates
-
-        Args:
-            point_3d: 3D point coordinates [x, y, z]
-            image_id: Image/camera ID to project to
-            margin_pixels: Margin in pixels to consider point still in view
-            consider_distortion: Whether to apply camera distortion correction (ignored if use_opencv=True)
-            use_opencv: If True, use cv2.projectPoints (always considers distortion)
-
-        Returns:
-            tuple: (is_in_view, u, v) where is_in_view is bool and (u,v) are image coordinates
-        """
-        if image_id not in self.images:
-            return False, 0, 0
-
-        image = self.images[image_id]
-        camera = self.cameras[image['camera_id']]
-
-        if use_opencv:
-            # OpenCV를 사용한 projection (distortion 무조건 고려)
-            try:
-                import cv2
-                import numpy as np
-
-                # 카메라 매트릭스 구성
-                fx = camera['params']['fx']
-                fy = camera['params']['fy'] if 'fy' in camera['params'] else fx
-                cx = camera['params']['cx']
-                cy = camera['params']['cy']
-
-                camera_matrix = np.array([[fx, 0, cx],
-                                        [0, fy, cy],
-                                        [0, 0, 1]], dtype=np.float64)
-
-                # Distortion 계수 준비
-                dist_coeffs = np.array([0, 0, 0, 0, 0], dtype=np.float64)
-                if 'distortion' in camera['params'] and camera['params']['distortion']:
-                    distortion = camera['params']['distortion']
-                    # OpenCV 형식에 맞춰 최대 5개까지 사용 (k1, k2, p1, p2, k3)
-                    for i, coeff in enumerate(distortion[:5]):
-                        dist_coeffs[i] = coeff
-
-                # 회전 벡터와 이동 벡터 준비 (world -> camera)
-                R = image['R']
-                t = image['t']
-
-                # Debug: Same point as colmap_loader.py for comparison - only for first point
-                first_point = np.array([609.388767, -430.194813, 19.847636])
-                is_first_point = np.allclose(point_3d, first_point, atol=1e-3)
-                if image_id == 36 and is_first_point:
-                    print(f"🔍 COLMAP_VISUALIZER DEBUG Camera {image_id} - FIRST POINT ONLY:")
-                    print(f"  Camera matrix:\n{camera_matrix}")
-                    print(f"  Dist coeffs: {dist_coeffs}")
-                    print(f"  R matrix:\n{R}")
-                    print(f"  t vector: {t}")
-                    print(f"  Camera width: {camera['width']}, height: {camera['height']}")
-                    print(f"  Test point (world): {point_3d}")
-
-                # 회전 행렬을 회전 벡터로 변환
-                rvec, _ = cv2.Rodrigues(R)
-                tvec = t.reshape(3, 1)
-
-                if image_id == 36 and is_first_point:
-                    print(f"  rvec: {rvec.flatten()}")
-                    print(f"  tvec: {tvec.flatten()}")
-                    print(f"  --- Step by step projection ---")
-
-                    # Manual transformation to compare with cv2.projectPoints
-                    point_cam = R @ point_3d + t
-                    print(f"  Point in camera coords: {point_cam}")
-
-                    if point_cam[2] > 0:  # Point in front of camera
-                        # Project to normalized image coordinates
-                        x_norm = point_cam[0] / point_cam[2]
-                        y_norm = point_cam[1] / point_cam[2]
-                        print(f"  Normalized coords: ({x_norm:.6f}, {y_norm:.6f})")
-
-                        # Apply camera matrix
-                        u = fx * x_norm + cx
-                        v = fy * y_norm + cy
-                        print(f"  Manual projection: ({u:.2f}, {v:.2f})")
-
-                        # Check bounds
-                        width = camera['width']
-                        height = camera['height']
-                        in_bounds = (0 <= u < width and 0 <= v < height)
-                        print(f"  In bounds: {in_bounds} (bounds: [0,0] to [{width},{height}])")
-                    else:
-                        print(f"  Point behind camera (z={point_cam[2]:.6f})")
-
-                # 3D 포인트를 OpenCV 형식으로 준비 (world coordinates)
-                object_points = np.array([point_3d], dtype=np.float64).reshape(1, 1, 3)
-
-                # OpenCV projectPoints 사용
-                image_points, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
-
-                if image_id == 36 and is_first_point:
-                    u_cv2, v_cv2 = image_points[0][0]
-                    print(f"  cv2.projectPoints result: ({u_cv2:.2f}, {v_cv2:.2f})")
-                    width = camera['width']
-                    height = camera['height']
-                    in_bounds_cv2 = (0 <= u_cv2 < width and 0 <= v_cv2 < height)
-                    print(f"  cv2 in bounds: {in_bounds_cv2}")
-                    print(f"  --- End detailed debug ---")
-
-                # 결과 추출
-                u, v = image_points[0][0]
-                #print(f'(u, v) : ({u}, {v})');  exit(1)
-                # Opencv T : (u, v) : (7868.1462153227885, 10588.613259466396)
-                # 이미지 범위 체크 (margin 고려)
-                width = camera['width']
-                height = camera['height']
-                is_in_view = (-margin_pixels <= u < width + margin_pixels and
-                            -margin_pixels <= v < height + margin_pixels)
-
-                return is_in_view, u, v
-
-            except ImportError:
-                print("Warning: OpenCV not available, falling back to manual projection")
-                # OpenCV가 없으면 수동 projection으로 fallback
-                use_opencv = False
-            except Exception as e:
-                print(f"Warning: OpenCV projection failed: {e}, falling back to manual projection")
-                use_opencv = False
-
-        if not use_opencv:
-            # 수동 projection (기존 로직)
-            # 3D 포인트를 카메라 좌표계로 변환
-            R = image['R']
-            t = image['t']
-            point_cam = R @ point_3d + t
-
-            # 카메라 뒤에 있는 포인트는 제외
-            if point_cam[2] <= 0:
-                return False, 0, 0
-
-            # 카메라 파라미터
-            fx = camera['params']['fx']
-            fy = camera['params']['fy']
-            cx = camera['params']['cx']
-            cy = camera['params']['cy']
-
-            # 정규화된 이미지 좌표로 투영
-            x_norm = point_cam[0] / point_cam[2]
-            y_norm = point_cam[1] / point_cam[2]
-
-            # Distortion 적용 (consider_distortion 플래그에 따라)
-            if consider_distortion:
-                if camera['model'] == 'RADIAL' and 'distortion' in camera['params'] and camera['params']['distortion']:
-                    # Radial distortion model: r² = x² + y²
-                    r2 = x_norm * x_norm + y_norm * y_norm
-
-                    # Apply distortion: x_distorted = x * (1 + k1*r² + k2*r⁴ + ...)
-                    distortion_factor = 1.0
-                    r2_power = r2  # r²
-                    for k in camera['params']['distortion']:
-                        distortion_factor += k * r2_power
-                        r2_power *= r2  # r⁴, r⁶, ...
-
-                    x_norm *= distortion_factor
-                    y_norm *= distortion_factor
-
-                elif camera['model'] == 'OPENCV' and 'distortion' in camera['params'] and camera['params']['distortion']:
-                    # OpenCV distortion model (k1, k2, p1, p2, [k3])
-                    distortion = camera['params']['distortion']
-                    if len(distortion) >= 2:
-                        k1, k2 = distortion[0], distortion[1]
-                        r2 = x_norm * x_norm + y_norm * y_norm
-                        radial_factor = 1 + k1 * r2 + k2 * r2 * r2
-
-                        # Apply tangential distortion if available
-                        if len(distortion) >= 4:
-                            p1, p2 = distortion[2], distortion[3]
-                            xy = x_norm * y_norm
-                            x_norm = x_norm * radial_factor + 2 * p1 * xy + p2 * (r2 + 2 * x_norm * x_norm)
-                            y_norm = y_norm * radial_factor + p1 * (r2 + 2 * y_norm * y_norm) + 2 * p2 * xy
-                        else:
-                            x_norm *= radial_factor
-                            y_norm *= radial_factor
-
-            # 최종 이미지 좌표 계산
-            u = fx * x_norm + cx
-            v = fy * y_norm + cy
-            #print(f'(u, v) : ({u}, {v})');  exit(1)
-            # distortion T, Opencv F : (u, v) : (7868.144640319083, 10588.611676362934)
-            # distortion F, Opencv F : (u, v) : (7868.144640319083, 10588.611676362934)
-            # 이미지 범위 체크 (margin 고려)
-            width = camera['width']
-            height = camera['height']
-
-            is_in_view = (-margin_pixels <= u < width + margin_pixels and
-                         -margin_pixels <= v < height + margin_pixels)
-
-            return is_in_view, u, v
+    # DELETED: project_point_to_image
+    # This function has been replaced by _check_points_visibility_batch in train_internal.py
+    # which provides batch processing for better performance
 
     def quaternion_to_rotation_matrix(self, q):
         """쿼터니언을 회전 행렬로 변환"""

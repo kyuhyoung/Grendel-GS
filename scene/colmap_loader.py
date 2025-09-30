@@ -165,124 +165,28 @@ def generate_tracks_by_projection(points3d, cameras, images):
         cy = parsed_params['cy']
         distortion = parsed_params['distortion']
 
+        from utils.projection_utils import project_points_to_camera
+
         camera_matrix = np.array([
             [fx, 0, cx],
             [0, fy, cy],
             [0, 0, 1]
         ], dtype=np.float64)
 
-        # Distortion coefficients
-        dist_coeffs = np.array([0, 0, 0, 0, 0], dtype=np.float64)
-        if len(distortion) > 0:
-            num_dist_params = min(len(distortion), 5)
-            dist_coeffs[:num_dist_params] = distortion[:num_dist_params]
+        # Distortion coefficients (pass raw distortion array to util function)
+        dist_coeffs = np.array(distortion, dtype=np.float64) if len(distortion) > 0 else None
 
-        '''
-        # Debug: Show distortion coefficients for camera 36
-        if image_id == 36:
-            print(f"  📐 Camera params: {camera.params}")
-            print(f"  📐 Distortion coeffs: {dist_coeffs}")
-        '''
-        #print('00000')
-        # Rotation and translation for cv2.projectPoints
-        # Use same approach as colmap_visualizer.py which works correctly
-        rvec, _ = cv2.Rodrigues(R)   # Convert rotation matrix to rotation vector
-        tvec = T.reshape(3, 1)       # Translation vector
-
-        #print('11111')
-        # Filter out points behind camera after world->camera transform
-        # For this we need to apply the transformation within projectPoints
-        # So we work with world coordinates directly
-        '''
-        # Debug: Detailed analysis for specific point and camera
-        if image_id == 36:  # Focus on camera 36
-            test_point_idx = 0  # First point
-            test_point = points3d[test_point_idx]
-
-            print(f"🔍 DETAILED DEBUG Camera {image_id}:")
-            print(f"  Camera matrix:\n{camera_matrix}")
-            print(f"  Dist coeffs: {dist_coeffs}")
-            print(f"  rvec: {rvec.flatten()}")
-            print(f"  tvec: {tvec.flatten()}")
-            print(f"  Camera width: {camera.width}, height: {camera.height}")
-            print(f"  Test point (world): {test_point}")
-
-            # Step by step projection for debugging
-            print(f"  --- Step by step projection ---")
-
-            # Manual transformation to compare with cv2.projectPoints
-            # Transform world point to camera coordinates
-            R_matrix = cv2.Rodrigues(rvec)[0]
-            point_cam = R_matrix @ test_point + tvec.flatten()
-            print(f"  Point in camera coords: {point_cam}")
-
-            if point_cam[2] > 0:  # Point in front of camera
-                # Project to normalized image coordinates
-                x_norm = point_cam[0] / point_cam[2]
-                y_norm = point_cam[1] / point_cam[2]
-                print(f"  Normalized coords: ({x_norm:.6f}, {y_norm:.6f})")
-
-                # Apply camera matrix
-                fx, fy = camera_matrix[0,0], camera_matrix[1,1]
-                cx, cy = camera_matrix[0,2], camera_matrix[1,2]
-                u = fx * x_norm + cx
-                v = fy * y_norm + cy
-                print(f"  Manual projection: ({u:.2f}, {v:.2f})")
-
-                # Check bounds
-                in_bounds = (0 <= u < camera.width and 0 <= v < camera.height)
-                print(f"  In bounds: {in_bounds} (bounds: [0,0] to [{camera.width},{camera.height}])")
-            else:
-                print(f"  Point behind camera (z={point_cam[2]:.6f})")
-        
-        #print('22222')
-        '''
-
-        # Project all points at once using world coordinates
-        # cv2.projectPoints expects shape (N, 1, 3) for world coordinates
-        points_2d, _ = cv2.projectPoints(
-            points3d.reshape(-1, 1, 3),  # World coordinates
-            rvec,  # Rotation vector (world -> camera)
-            tvec,  # Translation vector (world -> camera)
-            camera_matrix,
-            dist_coeffs
+        # Use common projection utility
+        result = project_points_to_camera(
+            points3d, R, T, camera_matrix, dist_coeffs,
+            check_behind_camera=True,
+            image_width=camera.width,
+            image_height=camera.height,
+            margin_pixels=0
         )
 
-        #print('33333')
-        # Debug: Compare with cv2.projectPoints result
-        '''
-        if image_id == 36:
-            test_projection = points_2d[0, 0]  # First point projection
-            print(f"  cv2.projectPoints result: ({test_projection[0]:.2f}, {test_projection[1]:.2f})")
-
-            # Check if in bounds
-            u, v = test_projection
-            in_bounds_cv2 = (0 <= u < camera.width and 0 <= v < camera.height)
-            print(f"  cv2 in bounds: {in_bounds_cv2}")
-            print(f"  --- End detailed debug ---")
-        '''
-        # points_2d shape: (N, 1, 2)
-        #print('44444')
-        points_2d = points_2d.reshape(-1, 2)  # Shape: (N, 2)
-        #print('55555')
-
-        # Check which points are valid (in front of camera and within image bounds)
-        # We need to check camera coordinates for z > 0
-        camera_points = (R.T @ (points3d - T).T).T  # Result: Nx3
-        #print('66666')
-        valid_mask = camera_points[:, 2] > 0
-        #print('77777')
-
-        # Check which points are within image bounds
-        in_bounds_mask = (
-            (points_2d[:, 0] >= 0) & (points_2d[:, 0] < camera.width) &
-            (points_2d[:, 1] >= 0) & (points_2d[:, 1] < camera.height)
-        )
-        #print('88888')
-
-        # Combine masks: points must be in front of camera AND within image bounds
-        visible_mask = valid_mask & in_bounds_mask
-        #print('99999')
+        points_2d = result['points_2d']
+        visible_mask = result['visible_mask']
 
         # Add this image ID to tracks of visible points
         visible_point_indices = np.where(visible_mask)[0]
