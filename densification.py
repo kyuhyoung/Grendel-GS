@@ -1,5 +1,59 @@
 import torch
+import numpy as np
 import utils.general_utils as utils
+
+
+def compute_visibility_prune_mask(gaussians, scene, margin_pixels=20):
+    """
+    Compute mask of gaussians that are outside ALL camera frustums.
+
+    Args:
+        gaussians: GaussianModel containing gaussians to check
+        scene: Scene object containing camera data
+        margin_pixels: Margin in pixels for visibility check (positive = stricter)
+
+    Returns:
+        torch.Tensor: Boolean mask where True = should be pruned (not visible to any camera)
+    """
+    from train_internal import _check_points_visibility_batch
+
+    gaussian_xyz = gaussians.get_xyz.detach().cpu().numpy()  # [N, 3]
+    n_gaussians = len(gaussian_xyz)
+
+    utils.print_rank_0(f"🔍 [compute_visibility_prune_mask] Starting with {n_gaussians} gaussians, margin={margin_pixels}px")
+
+    if n_gaussians == 0:
+        utils.print_rank_0("🔍 [compute_visibility_prune_mask] No gaussians to check")
+        return torch.zeros(0, dtype=torch.bool, device=gaussians.get_xyz.device)
+
+    # Get current training cameras
+    train_cameras = scene.getTrainCameras()
+    camera_ids = [cam.uid for cam in train_cameras]
+    utils.print_rank_0(f"🔍 [compute_visibility_prune_mask] Checking against training cameras of {camera_ids}")
+
+    if len(train_cameras) == 0:
+        utils.print_rank_0("⚠️  No training cameras found, skipping visibility pruning")
+        return torch.zeros(n_gaussians, dtype=torch.bool, device=gaussians.get_xyz.device)
+
+    # Check visibility for each camera
+    visible_to_any_camera = np.zeros(n_gaussians, dtype=bool)
+
+    for camera in train_cameras:
+        cam_visible = _check_points_visibility_batch(
+            gaussian_xyz, camera.uid, scene, margin_pixels
+        )
+        visible_to_any_camera |= cam_visible  # OR operation
+
+    # Prune gaussians NOT visible to any camera
+    gaussians_to_prune = ~visible_to_any_camera
+    n_to_prune = np.sum(gaussians_to_prune)
+    n_visible = np.sum(visible_to_any_camera)
+
+    utils.print_rank_0(f"🔍 [compute_visibility_prune_mask] Result: {n_visible} visible, {n_to_prune} to prune (outside all frustums)")
+
+    # Convert to torch tensor
+    prune_mask = torch.tensor(gaussians_to_prune, dtype=torch.bool, device=gaussians.get_xyz.device)
+    return prune_mask
 
 
 def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg):
@@ -29,7 +83,7 @@ def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
         should_densify = iteration > args.densify_from_iter and utils.check_update_at_this_iter(
             iteration, args.bsz, args.densification_interval, 0
         )
-        
+
         if should_densify:
             assert (
                 args.stop_update_param == False
@@ -39,11 +93,24 @@ def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
             timers.start("densify_and_prune")
             size_threshold = 20 if iteration > args.opacity_reset_interval else None
             num_gaussians_before = gaussians.get_xyz.shape[0]
+
+            # Compute visibility-based pruning mask if enabled
+            visibility_mask = None
+            if args.prune_by_visibility:
+                utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Enabled at iteration {iteration} with margin={args.visibility_prune_margin}px")
+                visibility_mask = compute_visibility_prune_mask(
+                    gaussians, scene, margin_pixels=args.visibility_prune_margin
+                )
+                if visibility_mask is not None:
+                    n_to_prune_visibility = visibility_mask.sum().item()
+                    utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Mask computed: {n_to_prune_visibility} gaussians marked for pruning")
+            exit(1)
             gaussians.densify_and_prune(
                 args.densify_grad_threshold,
                 args.min_opacity,
                 scene.cameras_extent,
                 size_threshold,
+                visibility_prune_mask=visibility_mask,
             )
             num_gaussians_after = gaussians.get_xyz.shape[0]
             timers.stop("densify_and_prune")
@@ -134,7 +201,7 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
         should_densify = iteration > args.densify_from_iter and utils.check_update_at_this_iter(
             iteration, args.bsz, args.densification_interval, 0
         )
-        
+
         if should_densify:
             assert (
                 args.stop_update_param == False
@@ -144,11 +211,24 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
             timers.start("densify_and_prune")
             size_threshold = 20 if iteration > args.opacity_reset_interval else None
             num_gaussians_before = gaussians.get_xyz.shape[0]
+
+            # Compute visibility-based pruning mask if enabled
+            visibility_mask = None
+            if args.prune_by_visibility:
+                utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Enabled at iteration {iteration} with margin={args.visibility_prune_margin}px")
+                visibility_mask = compute_visibility_prune_mask(
+                    gaussians, scene, margin_pixels=args.visibility_prune_margin
+                )
+                if visibility_mask is not None:
+                    n_to_prune_visibility = visibility_mask.sum().item()
+                    utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Mask computed: {n_to_prune_visibility} gaussians marked for pruning")
+
             gaussians.densify_and_prune(
                 args.densify_grad_threshold,
                 args.min_opacity,
                 scene.cameras_extent,
                 size_threshold,
+                visibility_prune_mask=visibility_mask,
             )
             num_gaussians_after = gaussians.get_xyz.shape[0]
             timers.stop("densify_and_prune")

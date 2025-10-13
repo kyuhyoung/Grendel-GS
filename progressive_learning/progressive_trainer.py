@@ -913,6 +913,14 @@ class ProgressiveTrainer:
         if hasattr(self, 'track_by_projection') and self.track_by_projection:
             cmd.append("--track_by_projection")
 
+        # Add prune_by_visibility flag if set
+        if hasattr(self, 'prune_by_visibility') and self.prune_by_visibility:
+            cmd.append("--prune_by_visibility")
+
+        # Add visibility_prune_margin if set
+        if hasattr(self, 'visibility_prune_margin'):
+            cmd.extend(["--visibility_prune_margin", str(self.visibility_prune_margin)])
+
         # Force checkpoint save at final iteration for progressive training continuity
         final_iter = total_iterations if total_iterations else self.iterations
         cmd.extend(["--checkpoint_iterations", str(final_iter)])
@@ -1231,21 +1239,22 @@ class ProgressiveTrainer:
         current_window_mean = getattr(self, 'current_window_mean', None)
         window_number = int(iteration_name.split("_")[-1]) if "window_" in iteration_name else 0
 
-        # Get current window's checkpoint paths after training completion
-        all_checkpoint_paths = {}
+        # Get current window's checkpoint directory after training completion
+        checkpoint_dir = None
 
-        # Try to load checkpoint paths from temporary file created by train_internal.py
-        temp_checkpoint_file = model_output / f"window_{window_number}_checkpoint_paths.json"
+        # Try to load checkpoint directory from temporary file created by train_internal.py
+        temp_checkpoint_file = model_output / f"window_{window_number}_checkpoint.json"
         if temp_checkpoint_file.exists():
             try:
                 with open(temp_checkpoint_file, 'r') as f:
-                    all_checkpoint_paths = json.load(f)
-                print(f"📂 Collected checkpoint paths: {all_checkpoint_paths}")
+                    checkpoint_info = json.load(f)
+                    checkpoint_dir = checkpoint_info.get('checkpoint_dir', None)
+                print(f"📂 Collected checkpoint directory: {checkpoint_dir}")
                 # Remove temporary file since we'll store in state.json
                 temp_checkpoint_file.unlink()
                 print(f"🗑️  Removed temporary checkpoint file: {temp_checkpoint_file}")
             except Exception as e:
-                print(f"⚠️  Could not load checkpoint paths: {e}")
+                print(f"⚠️  Could not load checkpoint directory: {e}")
 
         state = {
             "iteration_name": iteration_name,
@@ -1257,7 +1266,7 @@ class ProgressiveTrainer:
             "trained_gaussians": list(self.trained_gaussians),
             "current_window_cameras": list(self.current_window_cameras),
             "current_window_mean": current_window_mean,
-            "all_checkpoint_paths": all_checkpoint_paths,
+            "checkpoint_dir": checkpoint_dir,
             "total_cameras": len(self.images),
             "total_points": len(self.points3D),
             "gpu_memory_threshold": self.gpu_memory_threshold,
@@ -1278,6 +1287,7 @@ class ProgressiveTrainer:
         print(f"   trained_gaussians: {len(state['trained_gaussians'])} files")
         print(f"   current_window_cameras: {state['current_window_cameras']}")
         print(f"   current_window_mean: {state['current_window_mean']}")
+        print(f"   checkpoint_dir: {state['checkpoint_dir']}")
         print(f"   total_cameras: {state['total_cameras']}")
         print(f"   total_points: {state['total_points']}")
         print(f"   gpu_memory_threshold: {state['gpu_memory_threshold']}")

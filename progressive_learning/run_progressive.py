@@ -41,6 +41,8 @@ def main():
     parser.add_argument('--use_chunk', action='store_true', help='Enable chunked SSIM for memory efficiency')
     parser.add_argument('--auto_save_final_iteration', action='store_true', help='Automatically add final iteration to save_iterations')
     parser.add_argument('--track_by_projection', action='store_true', help='Generate tracks by projection instead of using COLMAP tracks')
+    parser.add_argument('--prune_by_visibility', action='store_true', help='Prune gaussians outside all camera frustums')
+    parser.add_argument('--visibility_prune_margin', type=int, default=20, help='Margin in pixels for visibility-based pruning')
 
     args = parser.parse_args()
 
@@ -80,6 +82,8 @@ def main():
     trainer.show_memory_debug_info = args.show_memory_debug_info
     trainer.auto_save_final_iteration = args.auto_save_final_iteration
     trainer.track_by_projection = args.track_by_projection
+    trainer.prune_by_visibility = args.prune_by_visibility
+    trainer.visibility_prune_margin = args.visibility_prune_margin
 
     # Run the progressive training pipeline with sliding window
     try:

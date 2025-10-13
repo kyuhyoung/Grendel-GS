@@ -64,10 +64,14 @@ class Scene:
         if hasattr(args, 'cams_init') and args.cams_init:
             # Initial window - filter to specified cameras
             init_cameras = [int(x) for x in args.cams_init.split(",")]
+            utils.print_rank_0(f"🔍 Scene.__init__: Got init_cameras from args.cams_init: {init_cameras}")
 
         # Override init_cameras with train_view_ids if provided (for progressive mode)
         if train_view_ids is not None:
             init_cameras = train_view_ids
+            utils.print_rank_0(f"🔍 Scene.__init__: Overriding with train_view_ids: {train_view_ids}")
+
+        utils.print_rank_0(f"🔍 Scene.__init__: Final init_cameras: {init_cameras}")
 
         self.model_path = args.model_path
         #print(f'self.model_path : {self.model_path}');  exit(1)
@@ -89,6 +93,8 @@ class Scene:
         # Store args for later use in progressive training
         self.args = args
 
+        utils.print_rank_0(f"🔍 Scene.__init__: load_from_checkpoint={load_from_checkpoint}, skip_gaussian_init={skip_gaussian_init}")
+
         if load_from_checkpoint:
             # Skip COLMAP loading when loading from checkpoint
             # Cameras and scene info will be restored from checkpoint
@@ -97,7 +103,7 @@ class Scene:
             self.all_cameras = {}  # Initialize empty for checkpoint loading
             self.cameras_extent = 1.0  # Will be updated when checkpoint is loaded
             utils.set_img_size(800, 800)  # Temporary values, will be updated from checkpoint
-            print("🚫 Scene.__init__: SKIPPING COLMAP LOADING - will use checkpoint data")
+            utils.print_rank_0("🚫 Scene.__init__: SKIPPING COLMAP LOADING - will use checkpoint data")
 
             # If progressive dataset is provided, add cameras from it
             if progressive_dataset:
@@ -144,6 +150,13 @@ class Scene:
                 )
             else:
                 raise ValueError("No valid dataset found in the source path")
+
+        # Store point cloud for progressive training (to add gaussians from new cameras)
+        self.point_cloud = scene_info.point_cloud
+        if hasattr(scene_info.point_cloud, 'points'):
+            utils.print_rank_0(f"✅ Scene.__init__: Stored point_cloud with {len(scene_info.point_cloud.points)} points")
+        else:
+            utils.print_rank_0(f"⚠️  Scene.__init__: point_cloud has no 'points' attribute")
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, "rb") as src_file, open(
@@ -215,9 +228,14 @@ class Scene:
             train_cameras = scene_info.train_cameras
         #print(f'type(train_cameras[0].uid)) : {type(train_cameras[0].keys())}');  exit(1)
         if init_cameras:
-            #print(f'len(train_cameras) b4 : {len(train_cameras)}');
+            utils.print_rank_0(f'🔍 Scene.__init__: Filtering train_cameras')
+            utils.print_rank_0(f'  - Before: {len(train_cameras)} cameras')
+            utils.print_rank_0(f'  - Filter IDs (init_cameras): {init_cameras}')
+            utils.print_rank_0(f'  - Available UIDs: {[cam.uid for cam in train_cameras[:10]]}...')
             train_cameras = [cam for cam in train_cameras if cam.uid in init_cameras]
-            #print(f'len(train_cameras) after : {len(train_cameras)}');  exit(1)
+            utils.print_rank_0(f'  - After: {len(train_cameras)} cameras')
+            if len(train_cameras) > 0:
+                utils.print_rank_0(f'  - Filtered camera UIDs: {[cam.uid for cam in train_cameras]}')
         #print(f'args.normalize : {args.normalize}')
         if args.normalize:
             self.train_cameras = cameraList_from_camInfos(train_cameras, scene_info.nerf_normalization, args)

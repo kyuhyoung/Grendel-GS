@@ -33,7 +33,7 @@ import torchvision.transforms.functional as tvf
 
 def training_refactored_main(dataset_args, opt_args, pipe_args, args, log_file):
     # Refactored training function
-    gaussians, timers, background, start_from_this_iteration = _initialize_training_components(dataset_args, opt_args, pipe_args, args, log_file)
+    gaussians, timers, background = _initialize_training_components(dataset_args, opt_args, pipe_args, args, log_file)
     scene, start_from_this_iteration = _setup_training_scene(args, gaussians, opt_args, log_file)
     _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, background, start_from_this_iteration, log_file)
     _finalize_training(args, opt_args, gaussians, log_file)
@@ -75,7 +75,6 @@ def _initialize_training_components(dataset_args, opt_args, pipe_args, args, log
     utils.set_timers(timers)
     prepare_output_and_logger(dataset_args)
     utils.log_cpu_memory_usage("at the beginning of training")
-    start_from_this_iteration = 1
 
     # Init parameterized scene
     gaussians = GaussianModel(dataset_args.sh_degree)
@@ -90,7 +89,7 @@ def _initialize_training_components(dataset_args, opt_args, pipe_args, args, log
     if bg_color is not None:
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    return gaussians, timers, background, start_from_this_iteration
+    return gaussians, timers, background
 
 
 def _filter_scene_cameras(scene, camera_ids):
@@ -119,49 +118,32 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
             #i_pre = previous_state['window_number']
             utils.print_rank_0("🔄 PROGRESSIVE TRAINING: Using progressive state")
 
-            # Check for checkpoint from JSON or command line
-            checkpoint_path = None
-
-            if 'all_checkpoint_paths' in previous_state and previous_state['all_checkpoint_paths']:
-                # Each GPU loads its own checkpoint
-                all_paths = previous_state['all_checkpoint_paths']
-                if str(utils.GLOBAL_RANK) in all_paths:
-                    checkpoint_path = all_paths[str(utils.GLOBAL_RANK)]
-                    utils.print_rank_0(f"🔄 CHECKPOINT FROM JSON: GPU {utils.GLOBAL_RANK} loading from {checkpoint_path}")
-                else:
-                    utils.print_rank_0(f"⚠️  No checkpoint found for GPU {utils.GLOBAL_RANK} in JSON")
+            # Check for checkpoint directory from JSON
+            checkpoint_dir = previous_state.get('checkpoint_dir', None) if previous_state else None
 
             # Skip checkpoint loading only if we're running the initial window itself
             # For window 1+, we should load checkpoints from previous windows
             i_cur = previous_state.get('window_number', 0) + 1
-            #print(f'i_win : {i_win}, current_window_num : {current_window_num}');   exit(1)
             if i_cur == 0:  # This should never happen in practice
-                checkpoint_path = None
+                checkpoint_dir = None
                 utils.print_rank_0("📁 INITIAL WINDOW: Skipping checkpoint loading")
-            #'''
-            if i_cur > 0:
-                print(f'checkpoint_path : {checkpoint_path}');  #exit(1) 
-                #checkpoint_path : output/progressive_test/model_initial/checkpoints/25//chkpnt_ws=3_rk=0.pth [29/09 10:58:46]
-                print(f'args.cams_prev : {args.cams_prev}');    #exit(1)
-                #args.cams_prev : 36,7
-                print(f'args.cams_2_add : {args.cams_2_add}');    #exit(1)
-                #args.cams_2_add : 46
-                print(f'args.cams_2_delete : {args.cams_2_delete}');    #exit(1)
-                #args.cams_2_delete : 7
-            #'''
-            if checkpoint_path:
-                # Load checkpoint first
-                import os
-                checkpoint_dir = os.path.dirname(checkpoint_path)
-                #print(f'checkpoint_dir : {checkpoint_dir}')
-                #checkpoint_dir : output/progressive_test/model_initial/checkpoints/25
+
+            if checkpoint_dir:
+                utils.print_rank_0(f"🔄 CHECKPOINT FROM JSON: Loading from {checkpoint_dir}")
+                utils.print_rank_0(f"   GPU {utils.GLOBAL_RANK} will load: chkpnt_ws={utils.WORLD_SIZE}_rk={utils.GLOBAL_RANK}.pth")
+
+                # Debug info
+                if i_cur > 0:
+                    utils.print_rank_0(f"   args.cams_prev: {args.cams_prev}")
+                    utils.print_rank_0(f"   args.cams_2_add: {args.cams_2_add}")
+                    utils.print_rank_0(f"   args.cams_2_delete: {args.cams_2_delete}")
+
+                # Load checkpoint from directory (load_checkpoint will find the rank-specific file)
                 original_checkpoint = getattr(args, 'start_checkpoint', '')
-                #print(f'args.start_checkpoint b4 : {original_checkpoint}')
-                #args.start_checkpoint b4 :
                 args.start_checkpoint = checkpoint_dir
-                #print(f'args.start_checkpoint after : {args.start_checkpoint}');    exit(1)
-                #args.start_checkpoint after : output/progressive_test/model_initial/checkpoints/25
-                model_params, start_from_this_iteration = utils.load_checkpoint(args)
+                model_params, _ = utils.load_checkpoint(args)
+                # Progressive mode: each window starts from iteration 1
+                start_from_this_iteration = 1
                 args.start_checkpoint = original_checkpoint
 
                 # Prepare train/test view IDs for Scene initialization
@@ -186,11 +168,13 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
 
                     train_view_ids = list(prev_cameras)
                     utils.print_rank_0(f"📊 Current window cameras: {sorted(train_view_ids)}")
+                    utils.print_rank_0(f"📊 train_view_ids type: {type(train_view_ids)}, value: {train_view_ids}")
                     #exit(1)
                 # TODO: Add test_view_ids logic if needed (e.g., from args.cams_test)
 
                 # Create scene from COLMAP data with filtered cameras
                 utils.print_rank_0("📊 CREATING SCENE with COLMAP data")
+                utils.print_rank_0(f"📊 Passing train_view_ids={train_view_ids} to Scene.__init__")
                 scene = Scene(args, gaussians, load_from_checkpoint = False, skip_gaussian_init = True, train_view_ids = train_view_ids, test_view_ids = test_view_ids)
 
                 # Note: scene.all_cameras is already populated in Scene.__init__ with ALL cameras from COLMAP
@@ -218,28 +202,50 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
                     utils.print_rank_0(f"🔄 PROGRESSIVE CHECKPOINT - Removed cameras: {list(removed_cameras)}")
 
                     # Process gaussian removal for removed cameras (after checkpoint loading)
-                    for removed_cam in removed_cameras:
-                        _remove_gaussians_only_visible_to_removed_camera(gaussians, scene, removed_cam, current_cameras)
-                    exit(1)
+                    _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_cameras, current_cameras)
+                    #exit(1)
                     # Process gaussian addition for new cameras (after checkpoint loading)
-                    for new_cam in new_cameras:
-                        new_points = _get_points_only_visible_to_new_camera(scene, new_cam, prev_cameras)
-                        if new_points:
-                            _add_gaussians_from_points(gaussians, new_points, opt_args)
+                    _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, prev_cameras, opt_args)
             else:
                 # Progressive training without checkpoint (should not happen with new design)
                 utils.print_rank_0("📁 PROGRESSIVE WITHOUT CHECKPOINT: Loading from COLMAP")
-                scene = Scene(args, gaussians)
+
+                # Prepare train/test view IDs for Scene initialization
+                train_view_ids = None
+                test_view_ids = None
 
                 # Handle progressive training camera filtering and gaussian processing
                 if hasattr(args, 'cams_init') and args.cams_init:
                     # Initial window - filter to specified cameras
                     init_cameras = [int(x) for x in args.cams_init.split(",")]
                     utils.print_rank_0(f"📁 PROGRESSIVE INITIAL - Filtering to cameras: {init_cameras}")
-                    scene = _filter_scene_cameras(scene, init_cameras)
+                    train_view_ids = init_cameras
 
                 elif hasattr(args, 'cams_prev') and args.cams_prev:
-                    # Progressive window - calculate new/removed cameras and process gaussians
+                    # Progressive window - calculate current window cameras: prev - delete + add
+                    prev_cameras = set([int(x) for x in args.cams_prev.split(",")])
+
+                    # Remove cameras to delete
+                    if hasattr(args, 'cams_2_delete') and args.cams_2_delete:
+                        cams_to_delete = set([int(x) for x in args.cams_2_delete.split(",")])
+                        prev_cameras -= cams_to_delete
+                        utils.print_rank_0(f"📊 Deleting cameras: {cams_to_delete}")
+
+                    # Add cameras to add
+                    if hasattr(args, 'cams_2_add') and args.cams_2_add:
+                        cams_to_add = set([int(x) for x in args.cams_2_add.split(",")])
+                        prev_cameras |= cams_to_add
+                        utils.print_rank_0(f"📊 Adding cameras: {cams_to_add}")
+
+                    train_view_ids = list(prev_cameras)
+                    utils.print_rank_0(f"📊 Current window cameras: {sorted(train_view_ids)}")
+
+                # Create scene from COLMAP data with filtered cameras
+                utils.print_rank_0(f"📊 Creating Scene with train_view_ids: {train_view_ids}")
+                scene = Scene(args, gaussians, train_view_ids=train_view_ids, test_view_ids=test_view_ids)
+
+                # Calculate new/removed cameras for gaussian processing (if applicable)
+                if hasattr(args, 'cams_prev') and args.cams_prev:
                     prev_cameras = [int(x) for x in args.cams_prev.split(",")]
                     current_cameras = [cam.colmap_id for cam in scene.train_cameras]
 
@@ -251,18 +257,11 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
                     utils.print_rank_0(f"🔄 PROGRESSIVE NO-CHECKPOINT - New cameras: {list(new_cameras)}")
                     utils.print_rank_0(f"🔄 PROGRESSIVE NO-CHECKPOINT - Removed cameras: {list(removed_cameras)}")
 
-                    # Filter scene to current cameras
-                    scene = _filter_scene_cameras(scene, current_cameras)
-
                     # Process gaussian removal for removed cameras
-                    for removed_cam in removed_cameras:
-                        _remove_gaussians_only_visible_to_removed_camera(gaussians, scene, removed_cam, current_cameras)
+                    _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_cameras, current_cameras)
 
                     # Process gaussian addition for new cameras
-                    for new_cam in new_cameras:
-                        new_points = _get_points_only_visible_to_new_camera(scene, new_cam, prev_cameras)
-                        if new_points:
-                            _add_gaussians_from_points(gaussians, new_points, opt_args)
+                    _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, prev_cameras, opt_args)
 
                 # Note: scene.all_cameras is already populated in Scene.__init__ from COLMAP
                 utils.print_rank_0(f"📊 Using {len(scene.all_cameras)} cameras for visibility checks (from Scene.__init__)")
@@ -315,16 +314,12 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
                 utils.print_rank_0(f"🔄 PROGRESSIVE WINDOW - Current cameras: {current_cameras}")
                 utils.print_rank_0(f"🔄 PROGRESSIVE WINDOW - New cameras: {list(new_cameras)}")
                 utils.print_rank_0(f"🔄 PROGRESSIVE WINDOW - Removed cameras: {list(removed_cameras)}")
-                exit(1)
+
                 # Process gaussian removal for removed cameras
-                for removed_cam in removed_cameras:
-                    _remove_gaussians_only_visible_to_removed_camera(gaussians, scene, removed_cam, current_cameras)
+                _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_cameras, current_cameras)
 
                 # Process gaussian addition for new cameras
-                for new_cam in new_cameras:
-                    new_points = _get_points_only_visible_to_new_camera(scene, new_cam, prev_cameras)
-                    if new_points:
-                        _add_gaussians_from_points(gaussians, new_points, opt_args)
+                _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, prev_cameras, opt_args)
 
             # Print Gaussian count after COLMAP initialization
             n_gaussians_colmap = len(gaussians.get_xyz)
@@ -356,7 +351,10 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
     previous_state = getattr(args, 'previous_state_data', None)
     progress_desc = "Training progress"
     if previous_state:
-        progress_desc = f"Window {previous_state.get('window_number', 0)} progress"
+        # We're training the next window after the one saved in previous_state
+        prev_window = previous_state.get('window_number', -1)
+        current_window = prev_window + 1
+        progress_desc = f"Window {current_window} progress"
 
     progress_bar = tqdm(
         range(1, opt_args.iterations + 1),
@@ -369,11 +367,15 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
 
     ema_loss_for_log = 0
     debug_info_printed = False
-
+    print(f'start_from_this_iteration : {start_from_this_iteration}, opt_args.iterations + 1 : {opt_args.iterations + 1}, args.bsz : {args.bsz}')
     for iteration in range(start_from_this_iteration, opt_args.iterations + 1, args.bsz):
-        ema_loss_for_log = _process_iteration(iteration, gaussians, scene, args, timers, strategy_history, train_dataset,
-                                            background, pipe_args, progress_bar, ema_loss_for_log, debug_info_printed,
-                                            end2end_timers, log_file, n_g_max)
+        ema_loss_for_log = _process_iteration(iteration, gaussians, scene, args, timers, strategy_history, train_dataset, background, pipe_args, progress_bar, ema_loss_for_log, debug_info_printed, end2end_timers, log_file, n_g_max)
+
+    '''
+    if previous_state:
+        if 1 == current_window:
+            exit(1)
+    '''
 
     # Finish training
     if opt_args.iterations not in args.save_iterations:
@@ -629,11 +631,9 @@ def _handle_iteration_tasks(iteration, scene, gaussians, args, batched_cameras, 
         # Save Checkpoints
         checkpoint_condition = any([iteration <= checkpoint_iteration < iteration + args.bsz for checkpoint_iteration in args.checkpoint_iterations])
         if checkpoint_condition:
-            last_checkpoint_path = _handle_checkpoints(iteration, scene, gaussians, args, end2end_timers, log_file)
-            # Store for progressive training JSON state
-            if not hasattr(args, 'all_checkpoint_paths'):
-                args.all_checkpoint_paths = {}
-            args.all_checkpoint_paths[utils.GLOBAL_RANK] = last_checkpoint_path
+            checkpoint_dir = _handle_checkpoints(iteration, scene, gaussians, args, end2end_timers, log_file)
+            # Store checkpoint directory for progressive training (all GPUs share same directory)
+            args.checkpoint_dir = checkpoint_dir
 
 
 def _optimize_and_cleanup(iteration, gaussians, args, batched_cameras, timers, log_file):
@@ -716,13 +716,13 @@ def _handle_checkpoints(iteration, scene, gaussians, args, end2end_timers, log_f
         args.actual_checkpoint_paths = []
     args.actual_checkpoint_paths.append(path_ckpt)
 
-    # Save latest checkpoint path to file for progressive trainer
+    # Save latest checkpoint directory to file for progressive trainer
     latest_checkpoint_file = os.path.join(scene.model_path, "latest_checkpoint.txt")
     with open(latest_checkpoint_file, 'w') as f:
-        f.write(path_ckpt)
+        f.write(save_folder)
     end2end_timers.start()
 
-    return path_ckpt
+    return save_folder
 
 
 def _finalize_training(args, opt_args, gaussians, log_file):
@@ -730,46 +730,29 @@ def _finalize_training(args, opt_args, gaussians, log_file):
     previous_state = getattr(args, 'previous_state_data', None)
 
 
-    # Save checkpoint paths for progressive training (temporary file)
+    # Save checkpoint directory for progressive training (temporary file)
     if getattr(args, 'is_progressive_training', False):
-        window_num = previous_state.get('window_number', 0) if previous_state else 0
-        checkpoint_paths_file = os.path.join(args.model_path, f"window_{window_num}_checkpoint_paths.json")
+        # Calculate current window number (same logic as line 348-349)
+        prev_window = previous_state.get('window_number', -1) if previous_state else -1
+        window_num = prev_window + 1
+        checkpoint_info_file = os.path.join(args.model_path, f"window_{window_num}_checkpoint.json")
 
-        # Create empty dict if no checkpoints were saved
-        if not hasattr(args, 'all_checkpoint_paths'):
-            args.all_checkpoint_paths = {}
+        # Check if checkpoint was saved
+        checkpoint_dir = getattr(args, 'checkpoint_dir', None)
+
+        if checkpoint_dir is None:
             utils.print_rank_0(f"⚠️  No checkpoints were saved in this window")
-
-        # Collect all checkpoint paths from all GPUs using distributed communication
-        if utils.WORLD_SIZE > 1:
-            # Gather all checkpoint paths from all ranks
-            import torch.distributed as dist
-
-            # Each rank prepares its checkpoint path data
-            local_checkpoint_data = {str(utils.GLOBAL_RANK): args.all_checkpoint_paths.get(utils.GLOBAL_RANK, None)}
-
-            # Gather all checkpoint data on rank 0
-            all_checkpoint_data = [None] * utils.WORLD_SIZE
-            dist.all_gather_object(all_checkpoint_data, local_checkpoint_data)
-
-            if utils.GLOBAL_RANK == 0:
-                # Combine all checkpoint paths from all ranks
-                combined_checkpoint_paths = {}
-                for rank_data in all_checkpoint_data:
-                    if rank_data:
-                        combined_checkpoint_paths.update(rank_data)
-
-                # Save combined checkpoint paths (temporary - will be moved to state.json)
-                with open(checkpoint_paths_file, 'w') as f:
-                    json.dump(combined_checkpoint_paths, f, indent=2)
-                utils.print_rank_0(f"💾 Saved checkpoint paths to: {checkpoint_paths_file}")
-                utils.print_rank_0(f"   Saved paths: {combined_checkpoint_paths}")
+            checkpoint_info = {"checkpoint_dir": None}
         else:
-            # Single GPU case
-            with open(checkpoint_paths_file, 'w') as f:
-                json.dump(args.all_checkpoint_paths, f, indent=2)
-            utils.print_rank_0(f"💾 Saved checkpoint paths to: {checkpoint_paths_file}")
-            utils.print_rank_0(f"   Saved paths: {args.all_checkpoint_paths}")
+            checkpoint_info = {"checkpoint_dir": checkpoint_dir}
+            utils.print_rank_0(f"💾 Checkpoint directory: {checkpoint_dir}")
+
+        # Only rank 0 saves the checkpoint info file (all GPUs share same directory)
+        if utils.GLOBAL_RANK == 0:
+            with open(checkpoint_info_file, 'w') as f:
+                json.dump(checkpoint_info, f, indent=2)
+            utils.print_rank_0(f"💾 Saved checkpoint info to: {checkpoint_info_file}")
+            utils.print_rank_0(f"   Checkpoint directory: {checkpoint_dir}")
 
     #print(f'previous_state : {previous_state}');  exit(1)
     # Progressive training completion summary
@@ -968,42 +951,92 @@ def _get_points_only_visible_to_new_camera(scene, new_camera_id, current_cameras
     """
     import numpy as np
 
+    utils.print_rank_0(f"\n🔍 [DEBUG] _get_points_only_visible_to_new_camera called:")
+    utils.print_rank_0(f"  - new_camera_id: {new_camera_id}")
+    utils.print_rank_0(f"  - current_cameras: {list(current_cameras) if current_cameras else 'None'}")
+
+    # Check scene attributes
+    utils.print_rank_0(f"🔍 [DEBUG] Scene attributes:")
+    utils.print_rank_0(f"  - has point_cloud: {hasattr(scene, 'point_cloud')}")
+    #utils.print_rank_0(f"  - has cameras: {hasattr(scene, 'cameras')}")
+    utils.print_rank_0(f"  - has all_cameras: {hasattr(scene, 'all_cameras')}")
+
     # Get COLMAP points from scene
     if hasattr(scene, 'point_cloud') and hasattr(scene.point_cloud, 'points'):
         colmap_points = scene.point_cloud.points  # [N, 3] array
+        utils.print_rank_0(f"✅ [DEBUG] Found {len(colmap_points)} COLMAP points")
+        utils.print_rank_0(f"  - Points shape: {colmap_points.shape}")
+        utils.print_rank_0(f"  - Points dtype: {colmap_points.dtype}")
     else:
-        utils.print_rank_0("⚠️  No COLMAP points found in scene")
+        utils.print_rank_0("⚠️ [DEBUG] No COLMAP points found in scene")
+        utils.print_rank_0(f"  - has point_cloud: {hasattr(scene, 'point_cloud')}")
+        if hasattr(scene, 'point_cloud'):
+            utils.print_rank_0(f"  - point_cloud has points: {hasattr(scene.point_cloud, 'points')}")
         return []
 
     # Get camera data
-    if not hasattr(scene, 'cameras') or new_camera_id not in scene.cameras:
-        utils.print_rank_0(f"⚠️  Camera {new_camera_id} not found in scene")
+    utils.print_rank_0(f"🔍 [DEBUG] Checking camera data:")
+    '''
+    if hasattr(scene, 'cameras'):
+        utils.print_rank_0(f"  - scene.cameras has {len(scene.cameras)} cameras")
+        utils.print_rank_0(f"  - scene.cameras keys: {list(scene.cameras.keys())[:10]}...")
+        utils.print_rank_0(f"  - new_camera_id {new_camera_id} in scene.cameras: {new_camera_id in scene.cameras}")
+    else:
+        utils.print_rank_0(f"  - scene.cameras does not exist")
+    '''
+    if hasattr(scene, 'all_cameras'):
+        utils.print_rank_0(f"  - scene.all_cameras has {len(scene.all_cameras)} cameras")
+        utils.print_rank_0(f"  - scene.all_cameras keys: {list(scene.all_cameras.keys())[:10]}...")
+        utils.print_rank_0(f"  - new_camera_id {new_camera_id} in scene.all_cameras: {new_camera_id in scene.all_cameras}")
+    else:
+        utils.print_rank_0(f"  - scene.all_cameras does not exist")
+
+    if not hasattr(scene, 'all_cameras') or new_camera_id not in scene.all_cameras:
+        utils.print_rank_0(f"⚠️ [DEBUG] Camera {new_camera_id} not found in scene.all_cameras")
         return []
 
-    new_camera = scene.cameras[new_camera_id]
+    utils.print_rank_0(f"✅ [DEBUG] Got camera {new_camera_id}")
+    utils.print_rank_0(f"🔍 [DEBUG] Starting batched visibility check for {len(colmap_points)} points...")
 
-    # Check visibility for each point
-    new_only_points = []
+    # Step 1: Check which points are visible to new camera (batched)
+    utils.print_rank_0(f"  - Checking visibility to new camera {new_camera_id}...")
+    visible_to_new = _check_points_visibility_batch(colmap_points, new_camera_id, scene, margin_pixels=0)
+    visible_to_new_count = np.sum(visible_to_new)
+    utils.print_rank_0(f"  - {visible_to_new_count} points visible to new camera")
 
-    for i, point_3d in enumerate(colmap_points):
-        # Check if point is visible to new camera
-        visible_to_new = _is_point_visible_to_camera(point_3d, new_camera_id, scene)
+    if visible_to_new_count == 0:
+        utils.print_rank_0(f"⚠️ [DEBUG] No points visible to new camera {new_camera_id}")
+        return []
 
-        if not visible_to_new:
+    # Step 2: Check which points are visible to ANY current camera (batched)
+    visible_to_any_current = np.zeros(len(colmap_points), dtype=bool)
+
+    utils.print_rank_0(f"  - Checking visibility to {len(current_cameras)} current cameras...")
+    for cam_id in current_cameras:
+        if cam_id not in scene.all_cameras:
+            utils.print_rank_0(f"    ⚠️ Camera {cam_id} not found in scene.all_cameras")
             continue
 
-        # Check if point is visible to any current camera
-        visible_to_current = False
-        for cam_id in current_cameras:
-            if cam_id in scene.cameras and _is_point_visible_to_camera(point_3d, cam_id, scene):
-                visible_to_current = True
-                break
+        cam_visible = _check_points_visibility_batch(colmap_points, cam_id, scene, margin_pixels=0)
+        visible_to_any_current |= cam_visible  # Logical OR
+        utils.print_rank_0(f"    - {np.sum(cam_visible)} points visible to camera {cam_id}")
 
-        # If visible to new camera but not to any current camera, include it
-        if not visible_to_current:
-            new_only_points.append(point_3d)
+    visible_to_current_count = np.sum(visible_to_any_current)
+    utils.print_rank_0(f"  - Total {visible_to_current_count} points visible to any current camera")
 
-    utils.print_rank_0(f"📊 Found {len(new_only_points)} points only visible to camera {new_camera_id}")
+    # Step 3: Find points visible ONLY to new camera (not to any current camera)
+    visible_only_to_new = visible_to_new & ~visible_to_any_current
+    new_only_indices = np.where(visible_only_to_new)[0]
+    new_only_points = colmap_points[new_only_indices].tolist()
+
+    visible_to_both_count = np.sum(visible_to_new & visible_to_any_current)
+
+    utils.print_rank_0(f"\n📊 [DEBUG] Point visibility summary for camera {new_camera_id}:")
+    utils.print_rank_0(f"  - Total COLMAP points: {len(colmap_points)}")
+    utils.print_rank_0(f"  - Visible to new camera: {visible_to_new_count}")
+    utils.print_rank_0(f"  - Visible to both new and current: {visible_to_both_count}")
+    utils.print_rank_0(f"  - Only visible to new camera: {len(new_only_points)}")
+
     return new_only_points
 
 
@@ -1119,55 +1152,16 @@ def _is_point_visible_to_camera(point_3d, camera_id, scene, margin_pixels=0):
     return result[0] if len(result) > 0 else False
 
 
-# Legacy function - no longer used in new cams_init/cams_prev design
-# def _handle_progressive_gaussian_removal(gaussians, scene, args):
-#     """
-#     Handle progressive gaussian removal based on removed camera
-#     """
-#     if args.progressive_removed_camera != -1:
-#         n_gaussians_before_removal = len(gaussians.get_xyz)
-#         current_cameras = []
-#         if args.progressive_current_cameras:
-#             current_cameras = [int(x) for x in args.progressive_current_cameras.split(",")]
-#         utils.print_rank_0(f"📊 Gaussians before removal: {n_gaussians_before_removal}")
-#         utils.print_rank_0(f"📊 Current cameras: {current_cameras}")
-#         n_removed = _remove_gaussians_only_visible_to_removed_camera(
-#             gaussians, scene, args.progressive_removed_camera, current_cameras
-#         )
-#         n_gaussians_after_removal = len(gaussians.get_xyz)
-#         utils.print_rank_0(f"✅ PROGRESSIVE GAUSSIAN REMOVAL: Removed {n_removed} gaussians only visible to camera {args.progressive_removed_camera}")
-
-
-# Legacy function - no longer used in new cams_init/cams_prev design
-# def _handle_progressive_gaussian_addition(gaussians, scene, args, opt_args):
-#     """
-#     Handle progressive gaussian addition based on new camera
-#     """
-#     if args.progressive_new_camera != -1:
-#         n_gaussians_before = len(gaussians.get_xyz)
-#         current_cameras = []
-#         if args.progressive_current_cameras:
-#             current_cameras = [int(x) for x in args.progressive_current_cameras.split(",")]
-#         new_points = _get_points_only_visible_to_new_camera(scene, args.progressive_new_camera, current_cameras)
-#         if len(new_points) > 0:
-#             _add_gaussians_from_points(gaussians, new_points, opt_args)
-#             n_gaussians_after = len(gaussians.get_xyz)
-#             n_added = n_gaussians_after - n_gaussians_before
-#             utils.print_rank_0(f"✅ PROGRESSIVE GAUSSIAN ADDITION: Added {n_added} gaussians for camera {args.progressive_new_camera} (only visible points)")
-#         else:
-#             utils.print_rank_0(f"⚠️  PROGRESSIVE GAUSSIAN ADDITION: No points found only visible to camera {args.progressive_new_camera}")
-
-
-def _remove_gaussians_only_visible_to_removed_camera(gaussians, scene, removed_camera_id, current_cameras, margin_pixels=10):
+def _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_cameras, current_cameras, margin_pixels=10):
     """
-    Remove gaussians that are only visible to the removed camera (not visible to current cameras)
-    Uses batched projection for efficiency.
+    Remove gaussians that are only visible to removed cameras (not visible to current cameras)
+    Uses batched projection for efficiency and prunes only once.
 
     Args:
         gaussians: GaussianModel to remove gaussians from
         scene: Scene object containing camera data
-        removed_camera_id: ID of the removed camera
-        current_cameras: List of current window camera IDs (excluding removed camera)
+        removed_cameras: List of removed camera IDs
+        current_cameras: List of current window camera IDs (excluding removed cameras)
         margin_pixels: Margin in pixels for visibility check
                       - Positive: excludes boundary points (conservative removal)
                       - Negative: includes nearly-visible points (aggressive removal)
@@ -1179,6 +1173,10 @@ def _remove_gaussians_only_visible_to_removed_camera(gaussians, scene, removed_c
     import numpy as np
     import torch
 
+    if not removed_cameras:
+        utils.print_rank_0("📊 No cameras removed")
+        return 0
+
     # Get current gaussian positions
     gaussian_xyz = gaussians.get_xyz.detach().cpu().numpy()  # [N, 3]
     n_gaussians = len(gaussian_xyz)
@@ -1187,15 +1185,24 @@ def _remove_gaussians_only_visible_to_removed_camera(gaussians, scene, removed_c
         utils.print_rank_0("⚠️  No gaussians to process for removal")
         return 0
 
-    utils.print_rank_0(f"📊 Checking visibility for {n_gaussians} gaussians (margin: {margin_pixels}px)...")
+    utils.print_rank_0(f"📊 Checking visibility for {n_gaussians} gaussians against {len(removed_cameras)} removed cameras (margin: {margin_pixels}px)...")
 
-    # Step 1: Check which gaussians are visible to removed camera (batched)
-    visible_to_removed = _check_points_visibility_batch(gaussian_xyz, removed_camera_id, scene, margin_pixels)
-    n_visible_to_removed = np.sum(visible_to_removed)
-    utils.print_rank_0(f"📊 {n_visible_to_removed} gaussians visible to removed camera {removed_camera_id}")
+    # Step 1: Check which gaussians are visible to ANY removed camera
+    visible_to_any_removed = np.zeros(n_gaussians, dtype=bool)
 
-    # Step 2: For gaussians visible to removed camera, check if they're visible to any current camera
-    # Create visibility matrix: [N_visible, M_cameras]
+    for removed_cam_id in removed_cameras:
+        if removed_cam_id not in scene.all_cameras:
+            utils.print_rank_0(f"⚠️  Camera {removed_cam_id} not found in scene.all_cameras")
+            continue
+
+        cam_visible = _check_points_visibility_batch(gaussian_xyz, removed_cam_id, scene, margin_pixels)
+        visible_to_any_removed |= cam_visible  # Logical OR - visible to at least one removed camera
+        utils.print_rank_0(f"📊 {np.sum(cam_visible)} gaussians visible to removed camera {removed_cam_id}")
+
+    n_visible_to_removed = np.sum(visible_to_any_removed)
+    utils.print_rank_0(f"📊 Total {n_visible_to_removed} gaussians visible to any removed camera")
+
+    # Step 2: Check if gaussians are visible to any current camera
     visible_to_current = np.zeros(n_gaussians, dtype=bool)
 
     for cam_id in current_cameras:
@@ -1207,66 +1214,242 @@ def _remove_gaussians_only_visible_to_removed_camera(gaussians, scene, removed_c
         cam_visible = _check_points_visibility_batch(gaussian_xyz, cam_id, scene, margin_pixels)
         visible_to_current |= cam_visible  # Logical OR - visible to at least one current camera
 
+    n_visible_to_current = np.sum(visible_to_current)
+    utils.print_rank_0(f"📊 {n_visible_to_current} gaussians visible to current cameras")
+
     # Step 3: Determine which gaussians to remove
-    # Remove if: visible to removed camera AND NOT visible to any current camera
-    gaussians_to_remove_mask = visible_to_removed & ~visible_to_current
+    # Remove if: visible to any removed camera AND NOT visible to any current camera
+    gaussians_to_remove_mask = visible_to_any_removed & ~visible_to_current
     n_removed = np.sum(gaussians_to_remove_mask)
 
     # Remove gaussians using boolean mask (True = remove, False = keep)
     if n_removed > 0:
         prune_mask = torch.tensor(gaussians_to_remove_mask, dtype=torch.bool, device=gaussians.get_xyz.device)
         gaussians.prune_points(prune_mask)
-        utils.print_rank_0(f"✅ Removed {n_removed} gaussians only visible to camera {removed_camera_id}")
+        utils.print_rank_0(f"✅ Removed {n_removed} gaussians only visible to removed cameras {list(removed_cameras)}")
     else:
-        utils.print_rank_0(f"📊 No gaussians found only visible to camera {removed_camera_id}")
+        utils.print_rank_0(f"📊 No gaussians found only visible to removed cameras")
 
     return n_removed
 
 
-def _add_gaussians_from_points(gaussians, new_points, opt_args):
+def _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, prev_cameras, opt_args):
+    """
+    Add gaussians from points visible to new cameras but not to previous cameras
+    Collects all new points and adds them in a single operation for efficiency.
+
+    Args:
+        gaussians: GaussianModel to add gaussians to
+        scene: Scene object containing camera and point data
+        new_cameras: List of new camera IDs to process
+        prev_cameras: List of previous camera IDs
+        opt_args: Optimization arguments
+    """
+    import numpy as np
+
+    # utils.print_rank_0("=" * 80)
+    # utils.print_rank_0("🔍 [DEBUG] _add_gaussians_only_visible_to_new_cameras STARTED")
+    # utils.print_rank_0(f"🔍 [DEBUG] Input parameters:")
+    # utils.print_rank_0(f"  - new_cameras: {list(new_cameras) if new_cameras else 'None'}")
+    # utils.print_rank_0(f"  - prev_cameras: {list(prev_cameras) if prev_cameras else 'None'}")
+    # utils.print_rank_0(f"  - Current gaussian count: {len(gaussians.get_xyz)}")
+
+    if not new_cameras:
+        # utils.print_rank_0("⚠️ [DEBUG] No new cameras to add - returning early")
+        # utils.print_rank_0("=" * 80)
+        return
+
+    # Check if scene has COLMAP point cloud data
+    # utils.print_rank_0(f"🔍 [DEBUG] Checking scene COLMAP data:")
+    # utils.print_rank_0(f"  - scene has point_cloud attribute: {hasattr(scene, 'point_cloud')}")
+
+    # Get COLMAP points from scene
+    if not hasattr(scene, 'point_cloud') or not hasattr(scene.point_cloud, 'points'):
+        # utils.print_rank_0("⚠️ [DEBUG] No COLMAP point cloud found in scene")
+        return
+
+    colmap_points = scene.point_cloud.points  # [N, 3] array
+    colmap_colors = scene.point_cloud.colors  # [N, 3] array (RGB, 0-1 range)
+    n_points = len(colmap_points)
+    # utils.print_rank_0(f"✅ [DEBUG] Found {n_points} COLMAP points with colors")
+
+    # Step 1: Check which points are visible to ANY new camera (batched)
+    # utils.print_rank_0(f"🔍 [DEBUG] Checking visibility to {len(new_cameras)} new cameras...")
+    visible_to_any_new = np.zeros(n_points, dtype=bool)
+
+    for new_camera_id in new_cameras:
+        if new_camera_id not in scene.all_cameras:
+            # utils.print_rank_0(f"  ⚠️ Camera {new_camera_id} not found in scene.all_cameras")
+            continue
+
+        cam_visible = _check_points_visibility_batch(colmap_points, new_camera_id, scene, margin_pixels=0)
+        visible_to_any_new |= cam_visible  # Logical OR - 합집합
+        # utils.print_rank_0(f"  - {np.sum(cam_visible)} points visible to new camera {new_camera_id}")
+
+    n_visible_to_new = np.sum(visible_to_any_new)
+    # utils.print_rank_0(f"📊 Total {n_visible_to_new} points visible to ANY new camera")
+
+    if n_visible_to_new == 0:
+        # utils.print_rank_0("⚠️ [DEBUG] No points visible to any new camera")
+        return
+
+    # Step 2: Check which points are visible to ANY prev camera (batched)
+    # utils.print_rank_0(f"🔍 [DEBUG] Checking visibility to {len(prev_cameras)} prev cameras...")
+    visible_to_any_prev = np.zeros(n_points, dtype=bool)
+
+    for prev_camera_id in prev_cameras:
+        if prev_camera_id not in scene.all_cameras:
+            # utils.print_rank_0(f"  ⚠️ Camera {prev_camera_id} not found in scene.all_cameras")
+            continue
+
+        cam_visible = _check_points_visibility_batch(colmap_points, prev_camera_id, scene, margin_pixels=0)
+        visible_to_any_prev |= cam_visible  # Logical OR - 합집합
+        # utils.print_rank_0(f"  - {np.sum(cam_visible)} points visible to prev camera {prev_camera_id}")
+
+    n_visible_to_prev = np.sum(visible_to_any_prev)
+    # utils.print_rank_0(f"📊 Total {n_visible_to_prev} points visible to ANY prev camera")
+
+    # Step 3: Find points visible ONLY to new cameras (not to any prev camera)
+    visible_only_to_new = visible_to_any_new & ~visible_to_any_prev
+    n_only_to_new = np.sum(visible_only_to_new)
+
+    visible_to_both = np.sum(visible_to_any_new & visible_to_any_prev)
+
+    # utils.print_rank_0(f"\n📊 [DEBUG] Point visibility summary:")
+    # utils.print_rank_0(f"  - Total COLMAP points: {n_points}")
+    # utils.print_rank_0(f"  - Visible to ANY new camera: {n_visible_to_new}")
+    # utils.print_rank_0(f"  - Visible to ANY prev camera: {n_visible_to_prev}")
+    # utils.print_rank_0(f"  - Visible to both new and prev: {visible_to_both}")
+    # utils.print_rank_0(f"  - Only visible to new cameras: {n_only_to_new}")
+    #exit(1)
+    # Extract points
+    new_only_indices = np.where(visible_only_to_new)[0]
+    all_new_points = colmap_points[new_only_indices].tolist()
+
+    # utils.print_rank_0(f"\n🔍 [DEBUG] Point collection completed:")
+    # utils.print_rank_0(f"  - Total new points collected: {len(all_new_points)}")
+
+    # Add all collected points in a single operation
+    if all_new_points:
+        all_new_colors = colmap_colors[new_only_indices].tolist()
+        # utils.print_rank_0(f"\n✅ [DEBUG] Adding {len(all_new_points)} gaussians from {len(new_cameras)} new cameras")
+        # utils.print_rank_0(f"  - Gaussian count before: {len(gaussians.get_xyz)}")
+
+        _add_gaussians_from_points(gaussians, all_new_points, all_new_colors, opt_args)
+
+        # utils.print_rank_0(f"  - Gaussian count after: {len(gaussians.get_xyz)}")
+        # utils.print_rank_0(f"  - Net increase: {len(gaussians.get_xyz) - (len(gaussians.get_xyz) - len(all_new_points))}")
+    else:
+        pass
+        # utils.print_rank_0(f"⚠️ [DEBUG] No new points found for any of the {len(new_cameras)} new cameras")
+
+    # utils.print_rank_0("🔍 [DEBUG] _add_gaussians_only_visible_to_new_cameras COMPLETED")
+    # utils.print_rank_0("=" * 80)
+
+
+def _add_gaussians_from_points(gaussians, new_points, new_colors, opt_args):
     """
     Add new gaussians initialized from 3D points
 
     Args:
-        gaussians: GaussianModel to add gaussians to
+        gaussians: GaussiarModel to add gaussians to
         new_points: List of 3D points to create gaussians from
+        new_colors: List of RGB colors from COLMAP
         opt_args: Optimization arguments
     """
     import torch
     import numpy as np
+    from utils.sh_utils import RGB2SH
+    from simple_knn._C import distCUDA2
+
+    # utils.print_rank_0(f"\n🔍 [DEBUG] _add_gaussians_from_points called:")
+    # utils.print_rank_0(f"  - Number of points: {len(new_points)}")
+    # utils.print_rank_0(f"  - Current gaussian count: {len(gaussians.get_xyz)}")
 
     if len(new_points) == 0:
+        # utils.print_rank_0("⚠️ [DEBUG] No points to add - returning early")
         return
 
     try:
+        # Check input data
+        # utils.print_rank_0(f"🔍 [DEBUG] Input points info:")
+        # utils.print_rank_0(f"  - Type: {type(new_points)}")
+        # if isinstance(new_points, list) and len(new_points) > 0:
+        #     utils.print_rank_0(f"  - First point type: {type(new_points[0])}")
+        #     utils.print_rank_0(f"  - First point: {new_points[0]}")
+
         # Convert points to tensor
+        # utils.print_rank_0(f"🔍 [DEBUG] Converting points to tensor...")
         new_points_tensor = torch.tensor(new_points, dtype=torch.float32, device="cuda")
+        # utils.print_rank_0(f"  - Tensor shape: {new_points_tensor.shape}")
+        # utils.print_rank_0(f"  - Tensor dtype: {new_points_tensor.dtype}")
+        # utils.print_rank_0(f"  - Tensor device: {new_points_tensor.device}")
 
         # Initialize basic gaussian parameters for new points
         N = len(new_points)
+        # utils.print_rank_0(f"🔍 [DEBUG] Initializing parameters for {N} gaussians...")
 
-        # Random colors (will be optimized during training)
-        colors = torch.rand(N, 3, dtype=torch.float32, device="cuda")
+        # Convert RGB colors to SH coefficients
+        colors_tensor = torch.tensor(new_colors, dtype=torch.float32, device="cuda")
+        # utils.print_rank_0(f"  - Colors tensor shape: {colors_tensor.shape}, dtype: {colors_tensor.dtype}")
+        # utils.print_rank_0(f"  - First 5 colors: {colors_tensor[:min(5, len(colors_tensor))].tolist()}")
+        # exit(1)
+        fused_color = RGB2SH(colors_tensor)  # [N, 3]
+        # utils.print_rank_0(f"  - RGB colors converted to SH: shape={fused_color.shape}")
+        # utils.print_rank_0(f"  - First 5 SH colors: {fused_color[:min(5, len(fused_color))].tolist()}")
 
-        # Small initial scales
-        scales = torch.ones(N, 3, dtype=torch.float32, device="cuda") * 0.01
+        # Create features array with SH coefficients
+        features = torch.zeros((N, 3, (gaussians.max_sh_degree + 1) ** 2), dtype=torch.float32, device="cuda")
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
 
-        # Random rotations (quaternions)
-        rotations = torch.randn(N, 4, dtype=torch.float32, device="cuda")
-        rotations = rotations / rotations.norm(dim=-1, keepdim=True)  # Normalize quaternions
+        # Split into DC and rest components (matching gaussian_model.py:220-224)
+        new_features_dc = features[:, :, 0:1].transpose(1, 2).contiguous()  # [N, 1, 3]
+        new_features_rest = features[:, :, 1:].transpose(1, 2).contiguous()  # [N, num_rest, 3]
+        # utils.print_rank_0(f"  - Features DC: shape={new_features_dc.shape}")
+        # utils.print_rank_0(f"  - Features rest: shape={new_features_rest.shape}")
 
-        # Small initial opacity
-        opacities = torch.ones(N, 1, dtype=torch.float32, device="cuda") * 0.1
+        # Compute adaptive scales from nearest neighbor distances (like create_from_pcd)
+        dist2 = torch.clamp_min(distCUDA2(new_points_tensor), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        # utils.print_rank_0(f"  - Scales: shape={scales.shape}, computed from nearest neighbor distances")
+        # utils.print_rank_0(f"  - Scale range: min={scales.min().item():.4f}, max={scales.max().item():.4f}, mean={scales.mean().item():.4f}")
+
+        # Identity rotations (like create_from_pcd)
+        rotations = torch.zeros(N, 4, dtype=torch.float32, device="cuda")
+        rotations[:, 0] = 1  # w=1, x=y=z=0 (identity quaternion)
+        # utils.print_rank_0(f"  - Rotations: shape={rotations.shape} (identity quaternion)")
+
+        # Small initial opacity (inverse sigmoid of 0.1)
+        from utils.general_utils import inverse_sigmoid
+        opacities = inverse_sigmoid(0.1 * torch.ones(N, 1, dtype=torch.float32, device="cuda"))
+        # utils.print_rank_0(f"  - Opacities: shape={opacities.shape}, value=inverse_sigmoid(0.1)")
+
+        # Send to GPU count (matching gaussian_model.py:251-253)
+        shard_world_size = gaussians.group_for_redistribution().size()
+        new_send_to_gpui_cnt = torch.zeros((N, shard_world_size), dtype=torch.int, device="cuda")
+        # utils.print_rank_0(f"  - Send to GPU count: shape={new_send_to_gpui_cnt.shape}")
 
         # Add gaussians to the model
-        # This is a simplified version - actual implementation depends on GaussianModel structure
-        gaussians.densification_postfix(
-            new_points_tensor, colors, opacities, scales, rotations
-        )
+        # utils.print_rank_0(f"🔍 [DEBUG] Calling gaussians.densification_postfix...")
+        # utils.print_rank_0(f"  - Method exists: {hasattr(gaussians, 'densification_postfix')}")
 
-        utils.print_rank_0(f"✅ Successfully added {N} new gaussians")
+        before_count = len(gaussians.get_xyz)
+        gaussians.densification_postfix(
+            new_points_tensor,
+            new_features_dc,
+            new_features_rest,
+            opacities,
+            scales,
+            rotations,
+            new_send_to_gpui_cnt,
+        )
+        after_count = len(gaussians.get_xyz)
+
+        # utils.print_rank_0(f"✅ [DEBUG] Successfully added {N} new gaussians")
+        # utils.print_rank_0(f"  - Gaussian count: {before_count} -> {after_count} (delta: {after_count - before_count})")
 
     except Exception as e:
-        utils.print_rank_0(f"⚠️  Error adding gaussians from points: {e}")
+        utils.print_rank_0(f"❌ [DEBUG] Error adding gaussians from points: {e}")
         import traceback
         utils.print_rank_0(traceback.format_exc())

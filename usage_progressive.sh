@@ -23,8 +23,8 @@ INITIAL_CAMERAS=2                         # Number of initial cameras
 GPU_THRESHOLD=0.9                         # GPU memory threshold (0-1)
 ITERATIONS=30000                          # Training iterations
 #ITERATIONS_PER_WINDOW=600                # Iterations per sliding window
-ITERATIONS_PER_WINDOW=25                # Iterations per sliding window
-DENSIFICATION_INTERVAL=20               # Densification every 20 iterations
+ITERATIONS_PER_WINDOW=125                # Iterations per sliding window
+DENSIFICATION_INTERVAL=50               # Densification every 20 iterations
 #DENSIFICATION_INTERVAL=150               # Densification every 20 iterations
 DENSIFY_FROM_ITER=10                    # Start densification from iteration 10
 SH_DEGREE=3                              # Spherical harmonics degree
@@ -41,6 +41,8 @@ USE_CHUNK=true                           # Enable chunked SSIM for memory effici
 ONLY_ACTUALLY_VISIBLE=true             # Only keep points visible in camera frames
 TRACK_BY_PROJECTION=true               # Generate tracks by projection instead of using COLMAP tracks
 #TRACK_BY_PROJECTION=false               # Generate tracks by projection instead of using COLMAP tracks
+PRUNE_BY_VISIBILITY=true                # Prune gaussians outside all camera frustums
+VISIBILITY_MARGIN=0                     # Margin in pixels for visibility-based pruning (larger = stricter)
 
 # Advanced options (leave empty if not needed)
 DTM_MODULE=""                            # Path to external DTM module
@@ -94,6 +96,8 @@ echo "  Show Memory Debug Info: $SHOW_MEMORY_DEBUG_INFO"
 echo "  Use Chunk: $USE_CHUNK"
 echo "  Only Actually Visible: $ONLY_ACTUALLY_VISIBLE"
 echo "  Track By Projection: $TRACK_BY_PROJECTION"
+echo "  Prune By Visibility: $PRUNE_BY_VISIBILITY"
+echo "  Visibility Margin: $VISIBILITY_MARGIN"
 if [[ -n "$DTM_MODULE" ]]; then
     echo "  DTM Module: $DTM_MODULE"
 fi
@@ -175,6 +179,14 @@ fi
 
 if [[ "$TRACK_BY_PROJECTION" == "true" ]]; then
     CMD="$CMD --track_by_projection"
+fi
+
+if [[ "$PRUNE_BY_VISIBILITY" == "true" ]]; then
+    CMD="$CMD --prune_by_visibility"
+fi
+
+if [[ -n "$VISIBILITY_MARGIN" ]]; then
+    CMD="$CMD --visibility_prune_margin $VISIBILITY_MARGIN"
 fi
 
 # Add DTM module if specified

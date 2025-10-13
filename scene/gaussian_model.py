@@ -1166,7 +1166,7 @@ class GaussianModel:
             new_send_to_gpui_cnt,
         )
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, visibility_prune_mask=None):
         args = utils.get_args()
         if not args.gaussians_distribution and utils.DEFAULT_GROUP.size() > 1:
             torch.distributed.all_reduce(
@@ -1190,6 +1190,11 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+
+        # Add visibility-based pruning mask if provided
+        if visibility_prune_mask is not None:
+            prune_mask = torch.logical_or(prune_mask, visibility_prune_mask)
+
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             # NOTE: this is bug in its implementation.
