@@ -17,6 +17,7 @@ export PYTHONWARNINGS="ignore"
 # Required parameters
 #SOURCE_PATH="/data/samsung_dong_mini_5"  # Path to COLMAP reconstruction
 SOURCE_PATH="/data/sillim_ew_mini_100024_20"  # Path to COLMAP reconstruction
+#SOURCE_PATH="/data/samsung_dong"  # Path to COLMAP reconstruction
 OUTPUT_PATH="./output/progressive_test"   # Output directory
 
 # Optional parameters
@@ -34,18 +35,25 @@ ITERATIONS=30000                          # Training iterations
 #DENSIFY_FROM_ITER=10                    # Start densification from iteration 10
 #CAMERA_REMOVAL_MARGIN=0.25                # Margin below densify_memory_limit for camera removal (0.99 - 0.19 = 0.80 = 80%)
 ###
-#ITERATIONS_PER_WINDOW=45                # Iterations per sliding window
-#DENSIFICATION_INTERVAL=20               # Densification every 20 iterations
-#DENSIFY_FROM_ITER=10                    # Start densification from iteration 10
-#CAMERA_REMOVAL_MARGIN=0.25                # Margin below densify_memory_limit for camera removal (0.99 - 0.19 = 0.80 = 80%)
+ITERATIONS_PER_WINDOW=45                # Iterations per sliding window
+DENSIFICATION_INTERVAL=20               # Densification every 20 iterations
+DENSIFY_FROM_ITER=10                    # Start densification from iteration 10
+CAMERA_REMOVAL_MARGIN=0.25                # Margin below densify_memory_limit for camera removal (0.99 - 0.19 = 0.80 = 80%)
 ###
-ITERATIONS_PER_WINDOW=12                # Iterations per sliding window
-DENSIFICATION_INTERVAL=10               # Densification every 20 iterations
-DENSIFY_FROM_ITER=5                    # Start densification from iteration 10
-CAMERA_REMOVAL_MARGIN=0.27                # Margin below densify_memory_limit for camera removal (0.99 - 0.19 = 0.80 = 80%)
+#ITERATIONS_PER_WINDOW=12                # Iterations per sliding window
+#DENSIFICATION_INTERVAL=10               # Densification every 20 iterations
+#DENSIFY_FROM_ITER=5                    # Start densification from iteration 10
+#CAMERA_REMOVAL_MARGIN=0.26                # Margin below densify_memory_limit for camera removal (0.99 - 0.19 = 0.80 = 80%)
 ###
 
 DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.99    # GPU memory limit for densification (0.99 = 99%)
+
+# Maximum window size (number of cameras)
+# If set, removes camera when window reaches this size
+# Set to empty string "" or negative value (e.g., -1) for unlimited window size
+#MAX_WINDOW_SIZE=-1                      # Unlimited (alternative)
+MAX_WINDOW_SIZE=4                       # Example: limit to 5 cameras
+
 SH_DEGREE=3                              # Spherical harmonics degree
 RESOLUTION=1                             # Resolution downscaling factor
 BACKEND="gsplat"                         # Rendering backend: default or gsplat
@@ -59,7 +67,7 @@ SHOW_MEMORY_DEBUG_INFO=false          # Show detailed memory debug info (memory,
 USE_CHUNK=true                           # Enable chunked SSIM for memory efficiency
 #USE_CHUNK=false                           # Enable chunked SSIM for memory efficiency
 #ONLY_ACTUALLY_VISIBLE=false             # Only keep points visible in camera frames
-ONLY_ACTUALLY_VISIBLE=true             # Only keep points visible in camera frames
+ONLY_ACTUALLY_VISIBLE=true             # Only keep points visible in camera frames (disabled when SKIP_4_FAST_DEBUG=1)
 TRACK_BY_PROJECTION=true               # Generate tracks by projection instead of using COLMAP tracks
 #TRACK_BY_PROJECTION=false               # Generate tracks by projection instead of using COLMAP tracks
 PRUNE_BY_VISIBILITY=true                # Prune gaussians outside all camera frustums
@@ -68,6 +76,14 @@ VISIBILITY_MARGIN=0                     # Margin in pixels for visibility-based 
 # Camera removal strategy
 REMOVAL_STRATEGY="fifo"                 # Remove oldest camera first (predictable sliding window)
 #REMOVAL_STRATEGY="farthest"             # Remove camera farthest from newly added camera (original)
+
+# F (global center) calculation mode
+F_MODE="global"                         # Use all cameras for F (consistent reference)
+#F_MODE="remaining"                      # Use remaining cameras in A for F (dynamic, targets unprocessed cameras)
+
+# Direction filtering (Step 16.6)
+#ENABLE_DIRECTION_FILTERING=true         # Filter cameras by forward direction (angle <= 90°)
+ENABLE_DIRECTION_FILTERING=false        # Disable filtering, allow all cameras in S (footprint intersection only)
 
 # E camera selection strategy (for Window 2+)
 #E_SELECTION_STRATEGY="default"          # Use (yy - F) direction only (original)
@@ -87,11 +103,21 @@ E_POLAR_RADIUS_STEP=1.2                 # Radius multiplier for 'polar' strategy
 E_SPIRAL_ALPHA=0.3                      # Distance weight for 'outward_spiral_compact' strategy (낮춤 - window coherence 약하게)
 E_SPIRAL_BETA=2.0                       # Diversity weight for 'outward_spiral_compact' strategy (높임 - 나선형 강하게)
 E_SPIRAL_GAMMA=0.1                      # Variance penalty for 'outward_spiral_compact' strategy (낮춤 - window shape 덜 중요)
-E_OUTWARD_WEIGHT=0.04                   # Outward weight for 'balanced_smooth_trajectory' strategy
-E_COMPACT_WEIGHT=2.5                    # Compact weight for 'balanced_smooth_trajectory' strategy
-E_SMOOTH_WINDOW_WEIGHT=2.8              # Smooth window weight for 'balanced_smooth_trajectory' strategy
-E_SMOOTH_CAMERA_WEIGHT=0.7              # Smooth camera weight for 'balanced_smooth_trajectory' strategy
-E_DISTANCE_WEIGHT=0.5                   # Distance weight for 'balanced_smooth_trajectory' strategy (tiebreaker, not dominant)
+E_OUTWARD_WEIGHT=4.0                    # Outward weight for 'balanced_smooth_trajectory' strategy (increased for global exploration)
+E_COMPACT_WEIGHT=3.5                    # Compact weight for 'balanced_smooth_trajectory' strategy (increased to penalize high variance)
+E_SMOOTH_WINDOW_WEIGHT=2.8              # Smooth window weight for 'balanced_smooth_trajectory' strategy (maintained for trajectory smoothness)
+E_SMOOTH_CAMERA_WEIGHT=0.0              # Smooth camera weight for 'balanced_smooth_trajectory' strategy (disabled)
+E_DISTANCE_WEIGHT=1.0                   # Distance weight for 'balanced_smooth_trajectory' strategy (increased to prevent far outlier selection)
+E_DIRECTIONAL_WEIGHT=3.0                # Directional alignment weight for 'balanced_smooth_trajectory' strategy (candidate aligns with window movement direction)
+FOOTPRINT_INTERSECTION_THRESHOLD=0.62    # Minimum intersection area ratio (intersection/window_union) for candidate cameras (0.0-1.0, 0.0=disabled):
+
+# Gaussian addition strategy
+USE_ALL_PROCESSED_CAMERAS=true          # Use all ever-processed cameras when checking for gaussian addition (recommended)
+#USE_ALL_PROCESSED_CAMERAS=false        # Use only prev window cameras (may add duplicate gaussians)
+
+# Debug options
+#SKIP_4_FAST_DEBUG=1     # Skip sliding window visualization for faster debugging (1=skip, 0=enable)
+SKIP_4_FAST_DEBUG=0     # Skip sliding window visualization for faster debugging (1=skip, 0=enable)
 
 # Advanced options (leave empty if not needed)
 DTM_MODULE=""                            # Path to external DTM module
@@ -100,6 +126,9 @@ EXTRA_ARGS=""                            # Additional arguments
 # ====================================================
 # SCRIPT EXECUTION - DO NOT EDIT BELOW THIS LINE
 # ====================================================
+
+# Export environment variables for Python script
+export SKIP_4_FAST_DEBUG
 
 # Set up logging - redirect all output to log file
 LOG_FILE="usage_progressive.log"
@@ -137,6 +166,11 @@ echo "  Iterations Per Window: $ITERATIONS_PER_WINDOW"
 echo "  Densification Interval: $DENSIFICATION_INTERVAL"
 echo "  Densify From Iter: $DENSIFY_FROM_ITER"
 echo "  Densify Memory Limit: $DENSIFY_MEMORY_LIMIT_PERCENTAGE"
+if [[ -n "$MAX_WINDOW_SIZE" ]]; then
+    echo "  Max Window Size: $MAX_WINDOW_SIZE cameras"
+else
+    echo "  Max Window Size: Unlimited"
+fi
 echo "  SH Degree: $SH_DEGREE"
 echo "  Resolution: $RESOLUTION"
 echo "  Backend: $BACKEND"
@@ -149,6 +183,8 @@ echo "  Track By Projection: $TRACK_BY_PROJECTION"
 echo "  Prune By Visibility: $PRUNE_BY_VISIBILITY"
 echo "  Visibility Margin: $VISIBILITY_MARGIN"
 echo "  Removal Strategy: $REMOVAL_STRATEGY"
+echo "  F Mode: $F_MODE"
+echo "  Enable Direction Filtering: $ENABLE_DIRECTION_FILTERING"
 echo "  E Selection Strategy: $E_SELECTION_STRATEGY"
 if [[ "$E_SELECTION_STRATEGY" == "weighted" ]]; then
     echo "    - Alpha (R weight): $E_WEIGHTED_ALPHA"
@@ -168,6 +204,7 @@ elif [[ "$E_SELECTION_STRATEGY" == "balanced_smooth_trajectory" ]]; then
     echo "    - Smooth window weight: $E_SMOOTH_WINDOW_WEIGHT"
     echo "    - Smooth camera weight: $E_SMOOTH_CAMERA_WEIGHT"
     echo "    - Distance weight: $E_DISTANCE_WEIGHT"
+    echo "    - Directional weight: $E_DIRECTIONAL_WEIGHT"
 fi
 if [[ -n "$DTM_MODULE" ]]; then
     echo "  DTM Module: $DTM_MODULE"
@@ -224,6 +261,9 @@ CMD="$CMD --iterations_per_window $ITERATIONS_PER_WINDOW"
 CMD="$CMD --densification_interval $DENSIFICATION_INTERVAL"
 CMD="$CMD --densify_from_iter $DENSIFY_FROM_ITER"
 CMD="$CMD --densify_memory_limit_percentage $DENSIFY_MEMORY_LIMIT_PERCENTAGE"
+if [[ -n "$MAX_WINDOW_SIZE" ]]; then
+    CMD="$CMD --max_window_size $MAX_WINDOW_SIZE"
+fi
 CMD="$CMD --sh-degree $SH_DEGREE"
 CMD="$CMD --resolution $RESOLUTION"
 CMD="$CMD --backend $BACKEND"
@@ -245,7 +285,10 @@ if [[ "$USE_CHUNK" == "true" ]]; then
     CMD="$CMD --use_chunk"
 fi
 
-if [[ "$ONLY_ACTUALLY_VISIBLE" == "true" ]]; then
+# SKIP_4_FAST_DEBUG=1일 때는 ONLY_ACTUALLY_VISIBLE을 강제로 비활성화 (projection 시간 단축)
+if [[ "$SKIP_4_FAST_DEBUG" == "1" ]]; then
+    echo "  SKIP_4_FAST_DEBUG: Disabling ONLY_ACTUALLY_VISIBLE for faster projection"
+elif [[ "$ONLY_ACTUALLY_VISIBLE" == "true" ]]; then
     CMD="$CMD --only-actually-visible"
 fi
 
@@ -263,6 +306,14 @@ fi
 
 if [[ -n "$REMOVAL_STRATEGY" ]]; then
     CMD="$CMD --removal_strategy $REMOVAL_STRATEGY"
+fi
+
+if [[ -n "$F_MODE" ]]; then
+    CMD="$CMD --f_mode $F_MODE"
+fi
+
+if [[ "$ENABLE_DIRECTION_FILTERING" == "true" ]]; then
+    CMD="$CMD --enable_direction_filtering"
 fi
 
 if [[ -n "$E_SELECTION_STRATEGY" ]]; then
@@ -321,8 +372,20 @@ if [[ -n "$E_DISTANCE_WEIGHT" ]]; then
     CMD="$CMD --e_distance_weight $E_DISTANCE_WEIGHT"
 fi
 
+if [[ -n "$E_DIRECTIONAL_WEIGHT" ]]; then
+    CMD="$CMD --e_directional_weight $E_DIRECTIONAL_WEIGHT"
+fi
+
+if [[ -n "$FOOTPRINT_INTERSECTION_THRESHOLD" ]]; then
+    CMD="$CMD --footprint_intersection_threshold $FOOTPRINT_INTERSECTION_THRESHOLD"
+fi
+
 if [[ "$EXIT_AFTER_FIRST_REMOVAL" == "true" ]]; then
     CMD="$CMD --exit-after-first-removal"
+fi
+
+if [[ "$USE_ALL_PROCESSED_CAMERAS" == "true" ]]; then
+    CMD="$CMD --use_all_processed_cameras"
 fi
 
 # Add DTM module if specified
