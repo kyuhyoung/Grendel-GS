@@ -936,6 +936,11 @@ class GaussianModel:
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
+
+        # Handle case where optimizer is not yet initialized (e.g., during progressive training setup)
+        if self.optimizer is None:
+            return optimizable_tensors
+
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
@@ -965,19 +970,32 @@ class GaussianModel:
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
-        self._xyz = optimizable_tensors["xyz"]
-        self._features_dc = optimizable_tensors["f_dc"]
-        self._features_rest = optimizable_tensors["f_rest"]
-        self._opacity = optimizable_tensors["opacity"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
+        # Handle case where optimizer is not initialized (empty dict returned)
+        if not optimizable_tensors:
+            # Manually prune tensors without optimizer
+            self._xyz = self._xyz[valid_points_mask]
+            self._features_dc = self._features_dc[valid_points_mask]
+            self._features_rest = self._features_rest[valid_points_mask]
+            self._opacity = self._opacity[valid_points_mask]
+            self._scaling = self._scaling[valid_points_mask]
+            self._rotation = self._rotation[valid_points_mask]
+        else:
+            self._xyz = optimizable_tensors["xyz"]
+            self._features_dc = optimizable_tensors["f_dc"]
+            self._features_rest = optimizable_tensors["f_rest"]
+            self._opacity = optimizable_tensors["opacity"]
+            self._scaling = optimizable_tensors["scaling"]
+            self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        # Prune gradient accumulators only if they are initialized (non-empty)
+        if self.xyz_gradient_accum.numel() > 0:
+            # Ensure valid_points_mask is on the same device as gradient accumulators
+            valid_points_mask = valid_points_mask.to(self.xyz_gradient_accum.device)
 
-        self.send_to_gpui_cnt = self.send_to_gpui_cnt[valid_points_mask]
-
-        self.denom = self.denom[valid_points_mask]
-        self.max_radii2D = self.max_radii2D[valid_points_mask]
+            self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+            self.send_to_gpui_cnt = self.send_to_gpui_cnt[valid_points_mask]
+            self.denom = self.denom[valid_points_mask]
+            self.max_radii2D = self.max_radii2D[valid_points_mask]
         # NOTE: sum_visible_count_in_one_batch는 현재 사용되지 않음 (미사용 변수)
         # self.sum_visible_count_in_one_batch = self.sum_visible_count_in_one_batch[
         #     valid_points_mask
@@ -1166,7 +1184,7 @@ class GaussianModel:
             new_send_to_gpui_cnt,
         )
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, visibility_prune_mask=None):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, visibility_prune_mask=None, scene=None):
         args = utils.get_args()
         if not args.gaussians_distribution and utils.DEFAULT_GROUP.size() > 1:
             torch.distributed.all_reduce(
@@ -1186,12 +1204,24 @@ class GaussianModel:
         densification_stats["view_space_grad"] = grads.mean().item()
         densification_stats["view_space_grad_max"] = grads.max().item()
 
+        # Perform densification first
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
+        # NOW compute visibility mask after densification (if enabled and scene provided)
+        if visibility_prune_mask is None and scene is not None and hasattr(args, 'prune_by_visibility') and args.prune_by_visibility:
+            from densification import compute_visibility_prune_mask
+            utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Computing mask after densification with margin={args.visibility_prune_margin}px")
+            visibility_prune_mask = compute_visibility_prune_mask(
+                self, scene, margin_pixels=args.visibility_prune_margin
+            )
+            if visibility_prune_mask is not None:
+                n_to_prune = visibility_prune_mask.sum().item()
+                utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Mask computed: {n_to_prune} gaussians marked for pruning")
+
         prune_mask = (self.get_opacity < min_opacity).squeeze()
 
-        # Add visibility-based pruning mask if provided
+        # Add visibility-based pruning mask if computed
         if visibility_prune_mask is not None:
             prune_mask = torch.logical_or(prune_mask, visibility_prune_mask)
 

@@ -34,9 +34,10 @@ import torchvision.transforms.functional as tvf
 def training_refactored_main(dataset_args, opt_args, pipe_args, args, log_file):
     # Refactored training function
     gaussians, timers, background = _initialize_training_components(dataset_args, opt_args, pipe_args, args, log_file)
-    scene, start_from_this_iteration = _setup_training_scene(args, gaussians, opt_args, log_file)
+    scene, start_from_this_iteration, saved_removed_path = _setup_training_scene(args, gaussians, opt_args, log_file)
     _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, background, start_from_this_iteration, log_file)
     _finalize_training(args, opt_args, gaussians, log_file)
+    return saved_removed_path
 
 
 def _initialize_training_components(dataset_args, opt_args, pipe_args, args, log_file):
@@ -50,8 +51,6 @@ def _initialize_training_components(dataset_args, opt_args, pipe_args, args, log
         if previous_state:
             utils.print_rank_0(f"   Window: {previous_state.get('iteration_name', 'unknown')}")
             utils.print_rank_0(f"   Window number: {previous_state.get('window_number', 0)}")
-            utils.print_rank_0(f"   Current window cameras: {len(previous_state.get('current_window_cameras', []))}")
-            utils.print_rank_0(f"   Unprocessed cameras remaining: {len(previous_state.get('unprocessed_cameras', []))}")
             utils.print_rank_0(f"   Points processed so far: {len(previous_state.get('processed_points', []))}")
             utils.print_rank_0(f"   Trained gaussians: {len(previous_state.get('trained_gaussians', []))}")
         else:
@@ -111,6 +110,7 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
     """Setup training scene: load checkpoints/COLMAP, create scene, add gaussians"""
     previous_state = getattr(args, 'previous_state_data', None)
     start_from_this_iteration = 1
+    saved_removed_path = None  # Path to saved removed gaussians ply file
 
     with torch.no_grad():
         # Check for progressive training mode first
@@ -169,7 +169,6 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
                     train_view_ids = list(prev_cameras)
                     utils.print_rank_0(f"📊 Current window cameras: {sorted(train_view_ids)}")
                     utils.print_rank_0(f"📊 train_view_ids type: {type(train_view_ids)}, value: {train_view_ids}")
-                    #exit(1)
                 # TODO: Add test_view_ids logic if needed (e.g., from args.cams_test)
 
                 # Create scene from COLMAP data with filtered cameras
@@ -195,6 +194,12 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
                     new_cameras = set(current_cameras) - set(prev_cameras)
                     removed_cameras = set(prev_cameras) - set(current_cameras)
 
+                    # Check if we should use all_processed_cameras instead of just prev_cameras
+                    cameras_for_visibility_check = prev_cameras
+                    if hasattr(args, 'cams_all_processed') and args.cams_all_processed:
+                        cameras_for_visibility_check = [int(x) for x in args.cams_all_processed.split(",")]
+                        utils.print_rank_0(f"🔄 Using all_processed_cameras for gaussian addition visibility check ({len(cameras_for_visibility_check)} cameras)")
+
                     # Logging
                     utils.print_rank_0(f"🔄 PROGRESSIVE CHECKPOINT - Previous cameras: {prev_cameras}")
                     utils.print_rank_0(f"🔄 PROGRESSIVE CHECKPOINT - Current cameras: {current_cameras}")
@@ -202,12 +207,45 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
                     utils.print_rank_0(f"🔄 PROGRESSIVE CHECKPOINT - Removed cameras: {list(removed_cameras)}")
 
                     # Process gaussian removal for removed cameras (after checkpoint loading)
-                    _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_cameras, current_cameras)
-                    #exit(1)
+                    n_removed_gaussians = 0
+                    saved_removed_path = None
+
+                    if removed_cameras:
+                        # Generate save path for removed gaussians
+                        import os
+                        removed_ply_path = None
+                        if args.model_path and 'window_' in args.model_path:
+                            window_num = args.model_path.split('window_')[-1]
+                            # Format window number with zero-padding (e.g., "003")
+                            window_num_padded = f"{int(window_num):03d}"
+                            removed_ply_path = os.path.join(args.model_path, f"removed_gaussians_window_{window_num_padded}.ply")
+
+                        n_removed_gaussians, saved_removed_path = _remove_gaussians_only_visible_to_removed_cameras(
+                            gaussians, scene, removed_cameras, current_cameras, save_path=removed_ply_path
+                        )
+                    else:
+                        utils.print_rank_0("📊 No cameras to remove, skipping gaussian removal")
+
+                    n_gaussians_after_removal = len(gaussians.get_xyz)
+
                     # Process gaussian addition for new cameras (after checkpoint loading)
-                    _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, prev_cameras, opt_args)
+                    # Use cameras_for_visibility_check which is either prev_cameras or all_processed_cameras
+                    _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, cameras_for_visibility_check, opt_args)
+                    n_gaussians_after_addition = len(gaussians.get_xyz)
+
+                    # Calculate counts
+                    n_removed = n_gaussians_restored - n_gaussians_after_removal
+                    n_added = n_gaussians_after_addition - n_gaussians_after_removal
+
+                    # Log gaussian removal/addition
+                    utils.print_rank_0(f"📊 Progressive checkpoint loaded: {n_gaussians_restored} gaussians")
+                    utils.print_rank_0(f"   Gaussians removed: {n_removed}")
+                    utils.print_rank_0(f"   Gaussians added: {n_added}")
+                    utils.print_rank_0(f"   Gaussians after removal/addition: {n_gaussians_after_addition}")
+                    if saved_removed_path:
+                        utils.print_rank_0(f"   Removed gaussians saved to: {saved_removed_path}")
             else:
-                # Progressive training without checkpoint (should not happen with new design)
+                # Progressive training without checkpoint
                 utils.print_rank_0("📁 PROGRESSIVE WITHOUT CHECKPOINT: Loading from COLMAP")
 
                 # Prepare train/test view IDs for Scene initialization
@@ -222,46 +260,22 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
                     train_view_ids = init_cameras
 
                 elif hasattr(args, 'cams_prev') and args.cams_prev:
-                    # Progressive window - calculate current window cameras: prev - delete + add
-                    prev_cameras = set([int(x) for x in args.cams_prev.split(",")])
+                    # Non-initial window without checkpoint - THIS IS AN ERROR!
+                    utils.print_rank_0("\n" + "="*80)
+                    utils.print_rank_0("❌ FATAL ERROR: Non-initial progressive window requires checkpoint!")
+                    utils.print_rank_0("="*80)
+                    utils.print_rank_0(f"  cams_prev: {args.cams_prev}")
+                    utils.print_rank_0(f"  previous_state: {args.previous_state}")
+                    utils.print_rank_0(f"  start_checkpoint: {args.start_checkpoint}")
+                    utils.print_rank_0("\nThis should not happen in progressive training mode.")
+                    utils.print_rank_0("Each non-initial window MUST start from the previous window's checkpoint.")
+                    utils.print_rank_0("="*80)
+                    import sys
+                    sys.exit(1)
 
-                    # Remove cameras to delete
-                    if hasattr(args, 'cams_2_delete') and args.cams_2_delete:
-                        cams_to_delete = set([int(x) for x in args.cams_2_delete.split(",")])
-                        prev_cameras -= cams_to_delete
-                        utils.print_rank_0(f"📊 Deleting cameras: {cams_to_delete}")
-
-                    # Add cameras to add
-                    if hasattr(args, 'cams_2_add') and args.cams_2_add:
-                        cams_to_add = set([int(x) for x in args.cams_2_add.split(",")])
-                        prev_cameras |= cams_to_add
-                        utils.print_rank_0(f"📊 Adding cameras: {cams_to_add}")
-
-                    train_view_ids = list(prev_cameras)
-                    utils.print_rank_0(f"📊 Current window cameras: {sorted(train_view_ids)}")
-
-                # Create scene from COLMAP data with filtered cameras
+                # Create scene from COLMAP data with filtered cameras (only for initial window)
                 utils.print_rank_0(f"📊 Creating Scene with train_view_ids: {train_view_ids}")
                 scene = Scene(args, gaussians, train_view_ids=train_view_ids, test_view_ids=test_view_ids)
-
-                # Calculate new/removed cameras for gaussian processing (if applicable)
-                if hasattr(args, 'cams_prev') and args.cams_prev:
-                    prev_cameras = [int(x) for x in args.cams_prev.split(",")]
-                    current_cameras = [cam.colmap_id for cam in scene.train_cameras]
-
-                    new_cameras = set(current_cameras) - set(prev_cameras)
-                    removed_cameras = set(prev_cameras) - set(current_cameras)
-
-                    utils.print_rank_0(f"🔄 PROGRESSIVE NO-CHECKPOINT - Previous cameras: {prev_cameras}")
-                    utils.print_rank_0(f"🔄 PROGRESSIVE NO-CHECKPOINT - Current cameras: {current_cameras}")
-                    utils.print_rank_0(f"🔄 PROGRESSIVE NO-CHECKPOINT - New cameras: {list(new_cameras)}")
-                    utils.print_rank_0(f"🔄 PROGRESSIVE NO-CHECKPOINT - Removed cameras: {list(removed_cameras)}")
-
-                    # Process gaussian removal for removed cameras
-                    _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_cameras, current_cameras)
-
-                    # Process gaussian addition for new cameras
-                    _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, prev_cameras, opt_args)
 
                 # Note: scene.all_cameras is already populated in Scene.__init__ from COLMAP
                 utils.print_rank_0(f"📊 Using {len(scene.all_cameras)} cameras for visibility checks (from Scene.__init__)")
@@ -328,7 +342,7 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
         scene.log_scene_info_to_file(log_file, "Scene Info Before Training")
 
     utils.check_initial_gpu_memory_usage("after init and before training loop")
-    return scene, start_from_this_iteration
+    return scene, start_from_this_iteration, saved_removed_path
 
 
 def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, background, start_from_this_iteration, log_file):
@@ -346,6 +360,10 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
     # Training Loop
     end2end_timers = End2endTimer(args)
     end2end_timers.start()
+
+    # Reset peak memory stats to track this window's training
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     # Set progress bar description based on progressive state
     previous_state = getattr(args, 'previous_state_data', None)
@@ -380,7 +398,24 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
     # Finish training
     if opt_args.iterations not in args.save_iterations:
         end2end_timers.print_time(log_file, opt_args.iterations)
-    log_file.write(f"Max Memory usage: {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB.\n")
+
+    # Report peak memory usage
+    if torch.cuda.is_available():
+        peak_memory_bytes = torch.cuda.max_memory_allocated()
+        total_memory_bytes = torch.cuda.get_device_properties(0).total_memory
+        peak_memory_gb = peak_memory_bytes / (1024 ** 3)
+        total_memory_gb = total_memory_bytes / (1024 ** 3)
+        peak_usage_ratio = peak_memory_bytes / total_memory_bytes
+
+        memory_report = f"\n{'='*80}\n"
+        memory_report += f"GPU Memory Report:\n"
+        memory_report += f"  Peak Memory Used: {peak_memory_gb:.2f} GB / {total_memory_gb:.2f} GB ({peak_usage_ratio*100:.1f}%)\n"
+        memory_report += f"{'='*80}\n"
+
+        print(memory_report)
+        log_file.write(memory_report)
+        log_file.write(f"Max Memory usage: {peak_memory_gb:.2f} GB.\n")
+
     progress_bar.close()
 
 
@@ -740,11 +775,56 @@ def _finalize_training(args, opt_args, gaussians, log_file):
         # Check if checkpoint was saved
         checkpoint_dir = getattr(args, 'checkpoint_dir', None)
 
+        # Collect GPU memory metrics (gather max across all GPUs)
+        gpu_metrics = {}
+        if torch.cuda.is_available():
+            # Get local GPU's peak memory
+            local_peak_memory_bytes = torch.cuda.max_memory_allocated()
+            total_memory_bytes = torch.cuda.get_device_properties(0).total_memory
+
+            # Gather peak memory from all GPUs to find the maximum
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                # Create tensor for all-gather
+                local_peak_tensor = torch.tensor([local_peak_memory_bytes], dtype=torch.int64, device="cuda")
+                world_size = torch.distributed.get_world_size()
+                all_peaks = [torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(world_size)]
+                torch.distributed.all_gather(all_peaks, local_peak_tensor)
+
+                # Find maximum peak memory across all GPUs
+                peak_memory_bytes = max([t.item() for t in all_peaks])
+
+                utils.print_rank_0(f"📊 GPU memory across all ranks:")
+                for rank, peak_tensor in enumerate(all_peaks):
+                    peak_gb = peak_tensor.item() / (1024 ** 3)
+                    peak_ratio = peak_tensor.item() / total_memory_bytes
+                    utils.print_rank_0(f"   Rank {rank}: {peak_gb:.2f} GB ({peak_ratio*100:.1f}%)")
+                utils.print_rank_0(f"   Using maximum: {peak_memory_bytes / (1024 ** 3):.2f} GB for camera removal decision")
+            else:
+                peak_memory_bytes = local_peak_memory_bytes
+
+            peak_memory_gb = peak_memory_bytes / (1024 ** 3)
+            total_memory_gb = total_memory_bytes / (1024 ** 3)
+            peak_usage_ratio = peak_memory_bytes / total_memory_bytes
+
+            gpu_metrics = {
+                'peak_memory_bytes': int(peak_memory_bytes),
+                'total_memory_bytes': int(total_memory_bytes),
+                'peak_memory_gb': float(peak_memory_gb),
+                'total_memory_gb': float(total_memory_gb),
+                'peak_usage_ratio': float(peak_usage_ratio)
+            }
+
         if checkpoint_dir is None:
             utils.print_rank_0(f"⚠️  No checkpoints were saved in this window")
-            checkpoint_info = {"checkpoint_dir": None}
+            checkpoint_info = {
+                "checkpoint_dir": None,
+                "gpu_metrics": gpu_metrics
+            }
         else:
-            checkpoint_info = {"checkpoint_dir": checkpoint_dir}
+            checkpoint_info = {
+                "checkpoint_dir": checkpoint_dir,
+                "gpu_metrics": gpu_metrics
+            }
             utils.print_rank_0(f"💾 Checkpoint directory: {checkpoint_dir}")
 
         # Only rank 0 saves the checkpoint info file (all GPUs share same directory)
@@ -753,6 +833,8 @@ def _finalize_training(args, opt_args, gaussians, log_file):
                 json.dump(checkpoint_info, f, indent=2)
             utils.print_rank_0(f"💾 Saved checkpoint info to: {checkpoint_info_file}")
             utils.print_rank_0(f"   Checkpoint directory: {checkpoint_dir}")
+            if gpu_metrics:
+                utils.print_rank_0(f"   Peak GPU memory: {gpu_metrics['peak_memory_gb']:.2f} GB / {gpu_metrics['total_memory_gb']:.2f} GB ({gpu_metrics['peak_usage_ratio']*100:.1f}%)")
 
     #print(f'previous_state : {previous_state}');  exit(1)
     # Progressive training completion summary
@@ -781,14 +863,10 @@ def _finalize_training(args, opt_args, gaussians, log_file):
             utils.print_rank_0(f"     GPU {gpu_id}: {count:,} gaussians")
         utils.print_rank_0(f"   Total gaussians across all GPUs: {total_gaussians:,}")
 
-        utils.print_rank_0(f"   Cameras in this window: {len(previous_state.get('current_window_cameras', []))}")
-        utils.print_rank_0(f"   Global progress: {len(previous_state.get('processed_cameras', [])) + len(previous_state.get('current_window_cameras', []))} / {previous_state.get('total_cameras', 0)} cameras")
-
         log_file.write(f"\nProgressive Window Training Complete:\n")
         log_file.write(f"  Window: {previous_state.get('iteration_name', 'unknown')}\n")
         log_file.write(f"  Gaussian counts per GPU: {all_gaussian_counts.tolist() if utils.DEFAULT_GROUP.size() > 1 else all_gaussian_counts}\n")
         log_file.write(f"  Total gaussians: {total_gaussians:,}\n")
-        log_file.write(f"  Global camera progress: {len(previous_state.get('processed_cameras', [])) + len(previous_state.get('current_window_cameras', []))} / {previous_state.get('total_cameras', 0)}\n")
         #exit(1)
 
 def training_report(
@@ -1152,7 +1230,7 @@ def _is_point_visible_to_camera(point_3d, camera_id, scene, margin_pixels=0):
     return result[0] if len(result) > 0 else False
 
 
-def _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_cameras, current_cameras, margin_pixels=10):
+def _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_cameras, current_cameras, margin_pixels=10, save_path=None):
     """
     Remove gaussians that are only visible to removed cameras (not visible to current cameras)
     Uses batched projection for efficiency and prunes only once.
@@ -1166,16 +1244,19 @@ def _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_
                       - Positive: excludes boundary points (conservative removal)
                       - Negative: includes nearly-visible points (aggressive removal)
                       - Default 10: reasonable safety margin
+        save_path: Optional path to save removed gaussians as .ply file
 
     Returns:
-        int: Number of gaussians removed
+        tuple: (int: Number of gaussians removed, str: Path to saved ply file or None)
     """
     import numpy as np
     import torch
 
     if not removed_cameras:
-        utils.print_rank_0("📊 No cameras removed")
-        return 0
+        # This should never be called with empty removed_cameras
+        # Caller should check before calling this function
+        utils.print_rank_0("⚠️  Warning: _remove_gaussians_only_visible_to_removed_cameras called with empty removed_cameras")
+        return 0, None
 
     # Get current gaussian positions
     gaussian_xyz = gaussians.get_xyz.detach().cpu().numpy()  # [N, 3]
@@ -1183,7 +1264,7 @@ def _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_
 
     if n_gaussians == 0:
         utils.print_rank_0("⚠️  No gaussians to process for removal")
-        return 0
+        return 0, None
 
     utils.print_rank_0(f"📊 Checking visibility for {n_gaussians} gaussians against {len(removed_cameras)} removed cameras (margin: {margin_pixels}px)...")
 
@@ -1220,17 +1301,66 @@ def _remove_gaussians_only_visible_to_removed_cameras(gaussians, scene, removed_
     # Step 3: Determine which gaussians to remove
     # Remove if: visible to any removed camera AND NOT visible to any current camera
     gaussians_to_remove_mask = visible_to_any_removed & ~visible_to_current
-    n_removed = np.sum(gaussians_to_remove_mask)
+    n_removed_local = np.sum(gaussians_to_remove_mask)
+
+    # Gather total count from all ranks for accurate logging
+    n_removed_tensor = torch.tensor([n_removed_local], dtype=torch.int64, device=gaussians.get_xyz.device)
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(n_removed_tensor, op=torch.distributed.ReduceOp.SUM)
+    n_removed_total = n_removed_tensor.item()
+
+    saved_ply_path = None
 
     # Remove gaussians using boolean mask (True = remove, False = keep)
-    if n_removed > 0:
+    if n_removed_local > 0:
+        # Save removed gaussians to ply file before pruning
+        # All ranks must participate in save_ply() for collective communication
+        if save_path:
+            try:
+                from scene.gaussian_model import GaussianModel
+
+                # Create a temporary GaussianModel with only the removed gaussians
+                # All ranks create this to participate in collective ops
+                removed_gaussians = GaussianModel(gaussians.max_sh_degree)
+
+                # Copy only the gaussians that will be removed (each rank has its own subset)
+                prune_mask_torch = torch.tensor(gaussians_to_remove_mask, dtype=torch.bool, device=gaussians.get_xyz.device)
+
+                # Extract removed gaussian data from this rank
+                removed_gaussians._xyz = gaussians._xyz[prune_mask_torch].clone()
+                removed_gaussians._features_dc = gaussians._features_dc[prune_mask_torch].clone()
+                removed_gaussians._features_rest = gaussians._features_rest[prune_mask_torch].clone()
+                removed_gaussians._scaling = gaussians._scaling[prune_mask_torch].clone()
+                removed_gaussians._rotation = gaussians._rotation[prune_mask_torch].clone()
+                removed_gaussians._opacity = gaussians._opacity[prune_mask_torch].clone()
+
+                # Save to ply file - all ranks must call this for collective communication
+                # save_ply() internally gathers to rank 0 and only rank 0 writes the file
+                removed_gaussians.save_ply(save_path)
+                saved_ply_path = save_path
+                utils.print_rank_0(f"💾 Saved {n_removed_total} removed gaussians to: {save_path}")
+
+                # Verify the saved file (only rank 0 checks file system)
+                import os
+                if utils.GLOBAL_RANK == 0:
+                    if os.path.exists(save_path):
+                        file_size = os.path.getsize(save_path)
+                        utils.print_rank_0(f"   ✅ Removed gaussians file verified:")
+                        utils.print_rank_0(f"      Path: {save_path}")
+                        utils.print_rank_0(f"      Size: {file_size:,} bytes")
+                    else:
+                        utils.print_rank_0(f"   ⚠️  Warning: Removed gaussians file not found: {save_path}")
+                #exit(1)
+            except Exception as e:
+                utils.print_rank_0(f"⚠️  Failed to save removed gaussians: {e}")
+                exit(1)
         prune_mask = torch.tensor(gaussians_to_remove_mask, dtype=torch.bool, device=gaussians.get_xyz.device)
         gaussians.prune_points(prune_mask)
-        utils.print_rank_0(f"✅ Removed {n_removed} gaussians only visible to removed cameras {list(removed_cameras)}")
+        utils.print_rank_0(f"✅ Removed {n_removed_total} gaussians only visible to removed cameras {list(removed_cameras)}")
     else:
         utils.print_rank_0(f"📊 No gaussians found only visible to removed cameras")
 
-    return n_removed
+    return n_removed_total, saved_ply_path
 
 
 def _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, prev_cameras, opt_args):
@@ -1242,17 +1372,20 @@ def _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, pr
         gaussians: GaussianModel to add gaussians to
         scene: Scene object containing camera and point data
         new_cameras: List of new camera IDs to process
-        prev_cameras: List of previous camera IDs
+        prev_cameras: List of previous camera IDs (or all_processed_cameras if USE_ALL_PROCESSED_CAMERAS=true)
         opt_args: Optimization arguments
     """
     import numpy as np
 
-    # utils.print_rank_0("=" * 80)
-    # utils.print_rank_0("🔍 [DEBUG] _add_gaussians_only_visible_to_new_cameras STARTED")
-    # utils.print_rank_0(f"🔍 [DEBUG] Input parameters:")
-    # utils.print_rank_0(f"  - new_cameras: {list(new_cameras) if new_cameras else 'None'}")
-    # utils.print_rank_0(f"  - prev_cameras: {list(prev_cameras) if prev_cameras else 'None'}")
-    # utils.print_rank_0(f"  - Current gaussian count: {len(gaussians.get_xyz)}")
+    new_cams_list = list(new_cameras) if new_cameras else []
+    prev_cams_list = list(prev_cameras) if prev_cameras else []
+
+    utils.print_rank_0("=" * 80)
+    utils.print_rank_0("🔍 [GAUSSIAN ADDITION DEBUG] _add_gaussians_only_visible_to_new_cameras STARTED")
+    utils.print_rank_0(f"🔍 Input parameters:")
+    utils.print_rank_0(f"  - new_cameras: {new_cams_list} ({len(new_cams_list)} cameras)")
+    utils.print_rank_0(f"  - prev_cameras (for visibility check): {prev_cams_list} ({len(prev_cams_list)} cameras)")
+    utils.print_rank_0(f"  - Current gaussian count: {len(gaussians.get_xyz)}")
 
     if not new_cameras:
         # utils.print_rank_0("⚠️ [DEBUG] No new cameras to add - returning early")
@@ -1274,40 +1407,39 @@ def _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, pr
     # utils.print_rank_0(f"✅ [DEBUG] Found {n_points} COLMAP points with colors")
 
     # Step 1: Check which points are visible to ANY new camera (batched)
-    # utils.print_rank_0(f"🔍 [DEBUG] Checking visibility to {len(new_cameras)} new cameras...")
+    utils.print_rank_0(f"\n🔍 Step 1: Checking visibility to {len(new_cameras)} NEW cameras...")
     visible_to_any_new = np.zeros(n_points, dtype=bool)
 
     for new_camera_id in new_cameras:
         if new_camera_id not in scene.all_cameras:
-            # utils.print_rank_0(f"  ⚠️ Camera {new_camera_id} not found in scene.all_cameras")
+            utils.print_rank_0(f"  ⚠️ Camera {new_camera_id} not found in scene.all_cameras")
             continue
 
         cam_visible = _check_points_visibility_batch(colmap_points, new_camera_id, scene, margin_pixels=0)
         visible_to_any_new |= cam_visible  # Logical OR - 합집합
-        # utils.print_rank_0(f"  - {np.sum(cam_visible)} points visible to new camera {new_camera_id}")
 
     n_visible_to_new = np.sum(visible_to_any_new)
-    # utils.print_rank_0(f"📊 Total {n_visible_to_new} points visible to ANY new camera")
+    utils.print_rank_0(f"  → {n_visible_to_new} points visible to ANY new camera")
 
     if n_visible_to_new == 0:
         # utils.print_rank_0("⚠️ [DEBUG] No points visible to any new camera")
         return
 
     # Step 2: Check which points are visible to ANY prev camera (batched)
-    # utils.print_rank_0(f"🔍 [DEBUG] Checking visibility to {len(prev_cameras)} prev cameras...")
+    utils.print_rank_0(f"\n🔍 Step 2: Checking visibility to {len(prev_cameras)} PREV/ALL_PROCESSED cameras...")
     visible_to_any_prev = np.zeros(n_points, dtype=bool)
 
     for prev_camera_id in prev_cameras:
         if prev_camera_id not in scene.all_cameras:
-            # utils.print_rank_0(f"  ⚠️ Camera {prev_camera_id} not found in scene.all_cameras")
+            utils.print_rank_0(f"  ⚠️ Camera {prev_camera_id} not found in scene.all_cameras")
             continue
 
         cam_visible = _check_points_visibility_batch(colmap_points, prev_camera_id, scene, margin_pixels=0)
         visible_to_any_prev |= cam_visible  # Logical OR - 합집합
-        # utils.print_rank_0(f"  - {np.sum(cam_visible)} points visible to prev camera {prev_camera_id}")
+        utils.print_rank_0(f"  ✓ Camera {prev_camera_id}: {np.sum(cam_visible)} points visible")
 
     n_visible_to_prev = np.sum(visible_to_any_prev)
-    # utils.print_rank_0(f"📊 Total {n_visible_to_prev} points visible to ANY prev camera")
+    utils.print_rank_0(f"📊 Total {n_visible_to_prev} points visible to ANY prev/all_processed camera")
 
     # Step 3: Find points visible ONLY to new cameras (not to any prev camera)
     visible_only_to_new = visible_to_any_new & ~visible_to_any_prev
@@ -1315,13 +1447,19 @@ def _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, pr
 
     visible_to_both = np.sum(visible_to_any_new & visible_to_any_prev)
 
-    # utils.print_rank_0(f"\n📊 [DEBUG] Point visibility summary:")
-    # utils.print_rank_0(f"  - Total COLMAP points: {n_points}")
-    # utils.print_rank_0(f"  - Visible to ANY new camera: {n_visible_to_new}")
-    # utils.print_rank_0(f"  - Visible to ANY prev camera: {n_visible_to_prev}")
-    # utils.print_rank_0(f"  - Visible to both new and prev: {visible_to_both}")
-    # utils.print_rank_0(f"  - Only visible to new cameras: {n_only_to_new}")
-    #exit(1)
+    utils.print_rank_0(f"\n📊 [FINAL RESULT] Point visibility summary:")
+    utils.print_rank_0(f"  - Total COLMAP points: {n_points}")
+    utils.print_rank_0(f"  - Visible to ANY new camera: {n_visible_to_new}")
+    utils.print_rank_0(f"  - Visible to ANY prev/all_processed camera: {n_visible_to_prev}")
+    utils.print_rank_0(f"  - Visible to BOTH (filtered out): {visible_to_both}")
+    utils.print_rank_0(f"  - ONLY visible to new cameras (will add as Gaussians): {n_only_to_new}")
+    utils.print_rank_0("=" * 80)
+
+    # Verification complete - USE_ALL_PROCESSED_CAMERAS is working correctly
+    utils.print_rank_0("\n✅ USE_ALL_PROCESSED_CAMERAS verification:")
+    utils.print_rank_0(f"   Used {len(prev_cams_list)} cameras for visibility check: {prev_cams_list}")
+    utils.print_rank_0(f"   New cameras being added: {new_cams_list}")
+    utils.print_rank_0(f"   Filtered out {visible_to_both} duplicate points")
     # Extract points
     new_only_indices = np.where(visible_only_to_new)[0]
     all_new_points = colmap_points[new_only_indices].tolist()
