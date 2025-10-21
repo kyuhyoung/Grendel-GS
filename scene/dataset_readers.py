@@ -134,7 +134,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image = Image.open(
             image_path
         )  # this is a lazy load, the image is not loaded yet
-        width, height = image.size
+        width, height = image.width, image.height  # Use .width/.height instead of .size for speed
 
         cam_info = CameraInfo(
             uid=uid,

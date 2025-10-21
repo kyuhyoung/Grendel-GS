@@ -88,9 +88,23 @@ def read_images(images_path):
         parts = line.split()
         if len(parts) >= 10:  # IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
             try:
+                # Read quaternion and translation
+                qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
                 tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
                 camera_id = int(parts[8])
-                camera_positions.append([tx, ty, tz])
+
+                # Convert quaternion to rotation matrix (world-to-camera)
+                R = np.array([
+                    [1 - 2*qy*qy - 2*qz*qz, 2*qx*qy - 2*qz*qw, 2*qx*qz + 2*qy*qw],
+                    [2*qx*qy + 2*qz*qw, 1 - 2*qx*qx - 2*qz*qz, 2*qy*qz - 2*qx*qw],
+                    [2*qx*qz - 2*qy*qw, 2*qy*qz + 2*qx*qw, 1 - 2*qx*qx - 2*qy*qy]
+                ])
+
+                # Camera center in world coordinates: C = -R^T * t
+                t = np.array([tx, ty, tz])
+                camera_center = -R.T @ t
+
+                camera_positions.append(camera_center)
                 camera_ids.append(camera_id)
                 # Skip the next line (POINTS2D)
                 i += 2

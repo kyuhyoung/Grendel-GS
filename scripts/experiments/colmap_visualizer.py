@@ -332,42 +332,47 @@ class COLMAPVisualizer:
             print(f"  Z: [{outside_xyz[:, 2].min():.2f}, {outside_xyz[:, 2].max():.2f}]")
         
         # Track 정보와 실제 투영 가능성 비교
-        mismatch_count = 0
+        mismatch_points = set()
         for point_id, point in self.points3d.items():
             track_images = set([img_id for img_id, _ in point['track']])
             projectable = set(points_projectable.get(point_id, []))
-            
+
             # Track에는 있지만 실제로 프레임 밖인 경우
             if len(track_images - projectable) > 0:
-                mismatch_count += 1
-        
-        if mismatch_count > 0:
-            print(f"\n⚠️  WARNING: {mismatch_count} points have track info but project outside frame!")
-        
+                mismatch_points.add(point_id)
+
+        if len(mismatch_points) > 0:
+            print(f"\n⚠️  WARNING: {len(mismatch_points)} points have track info but project outside frame!")
+
         # only_actually_visible 플래그가 켜져있으면 프레임 밖 포인트 제거
-        #print(f'self.only_actually_visible : {self.only_actually_visible}, len(always_outside) : {len(always_outside)}');  exit(1) 
-        if self.only_actually_visible and len(always_outside) > 0:
-            print(f"\n🔧 Removing {len(always_outside)} points that are always outside frame...")
-            
-            # 제거 전 포인트 수
-            original_count = len(self.points3d)
-            
-            # 프레임 밖 포인트 제거
-            for point_id in always_outside:
-                if point_id in self.points3d:
-                    del self.points3d[point_id]
-            
-            # 제거 후 포인트 수
-            remaining_count = len(self.points3d)
-            print(f"   Points reduced from {original_count} to {remaining_count}")
-            
-            # 제거 후 bounding box 다시 계산
-            if remaining_count > 0:
-                remaining_xyz = np.array([p['xyz'] for p in self.points3d.values()])
-                print(f"\n   New bounding box after removal:")
-                print(f"   X: [{remaining_xyz[:, 0].min():.2f}, {remaining_xyz[:, 0].max():.2f}]")
-                print(f"   Y: [{remaining_xyz[:, 1].min():.2f}, {remaining_xyz[:, 1].max():.2f}]")
-                print(f"   Z: [{remaining_xyz[:, 2].min():.2f}, {remaining_xyz[:, 2].max():.2f}]")
+        #print(f'self.only_actually_visible : {self.only_actually_visible}, len(always_outside) : {len(always_outside)}');  exit(1)
+        if self.only_actually_visible:
+            points_to_remove = set(always_outside) | mismatch_points  # Union of both sets
+
+            if len(points_to_remove) > 0:
+                print(f"\n🔧 Removing {len(points_to_remove)} points:")
+                print(f"   - Always outside frame: {len(always_outside)}")
+                print(f"   - Track/projection mismatch: {len(mismatch_points)}")
+
+                # 제거 전 포인트 수
+                original_count = len(self.points3d)
+
+                # 프레임 밖 포인트 제거
+                for point_id in points_to_remove:
+                    if point_id in self.points3d:
+                        del self.points3d[point_id]
+
+                # 제거 후 포인트 수
+                remaining_count = len(self.points3d)
+                print(f"   Points reduced from {original_count} to {remaining_count}")
+
+                # 제거 후 bounding box 다시 계산
+                if remaining_count > 0:
+                    remaining_xyz = np.array([p['xyz'] for p in self.points3d.values()])
+                    print(f"\n   New bounding box after removal:")
+                    print(f"   X: [{remaining_xyz[:, 0].min():.2f}, {remaining_xyz[:, 0].max():.2f}]")
+                    print(f"   Y: [{remaining_xyz[:, 1].min():.2f}, {remaining_xyz[:, 1].max():.2f}]")
+                    print(f"   Z: [{remaining_xyz[:, 2].min():.2f}, {remaining_xyz[:, 2].max():.2f}]")
             
         # 카메라별 visible points 딕셔너리 생성 (points_projectable을 역변환)
         camera_visible_points = {}

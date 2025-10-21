@@ -94,23 +94,14 @@ def densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
             size_threshold = 20 if iteration > args.opacity_reset_interval else None
             num_gaussians_before = gaussians.get_xyz.shape[0]
 
-            # Compute visibility-based pruning mask if enabled
-            visibility_mask = None
-            if args.prune_by_visibility:
-                utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Enabled at iteration {iteration} with margin={args.visibility_prune_margin}px")
-                visibility_mask = compute_visibility_prune_mask(
-                    gaussians, scene, margin_pixels=args.visibility_prune_margin
-                )
-                if visibility_mask is not None:
-                    n_to_prune_visibility = visibility_mask.sum().item()
-                    utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Mask computed: {n_to_prune_visibility} gaussians marked for pruning")
-            exit(1)
+            # Pass scene to densify_and_prune so it can compute visibility mask AFTER densification
             gaussians.densify_and_prune(
                 args.densify_grad_threshold,
                 args.min_opacity,
                 scene.cameras_extent,
                 size_threshold,
-                visibility_prune_mask=visibility_mask,
+                visibility_prune_mask=None,
+                scene=scene,
             )
             num_gaussians_after = gaussians.get_xyz.shape[0]
             timers.stop("densify_and_prune")
@@ -212,23 +203,14 @@ def gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspa
             size_threshold = 20 if iteration > args.opacity_reset_interval else None
             num_gaussians_before = gaussians.get_xyz.shape[0]
 
-            # Compute visibility-based pruning mask if enabled
-            visibility_mask = None
-            if args.prune_by_visibility:
-                utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Enabled at iteration {iteration} with margin={args.visibility_prune_margin}px")
-                visibility_mask = compute_visibility_prune_mask(
-                    gaussians, scene, margin_pixels=args.visibility_prune_margin
-                )
-                if visibility_mask is not None:
-                    n_to_prune_visibility = visibility_mask.sum().item()
-                    utils.print_rank_0(f"🔍 [VISIBILITY PRUNE] Mask computed: {n_to_prune_visibility} gaussians marked for pruning")
-
+            # Pass scene to densify_and_prune so it can compute visibility mask AFTER densification
             gaussians.densify_and_prune(
                 args.densify_grad_threshold,
                 args.min_opacity,
                 scene.cameras_extent,
                 size_threshold,
-                visibility_prune_mask=visibility_mask,
+                visibility_prune_mask=None,
+                scene=scene,
             )
             num_gaussians_after = gaussians.get_xyz.shape[0]
             timers.stop("densify_and_prune")

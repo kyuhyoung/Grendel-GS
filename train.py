@@ -79,7 +79,6 @@ if __name__ == "__main__":
                     previous_state = json.load(f)
                 utils.print_rank_0(f"📖 Loaded previous state from: {args.previous_state}")
                 utils.print_rank_0(f"   Window: {previous_state.get('iteration_name', 'unknown')}")
-                utils.print_rank_0(f"   Unprocessed cameras: {len(previous_state.get('unprocessed_cameras', []))}")
                 utils.print_rank_0(f"   Processed cameras: {len(previous_state.get('processed_cameras', []))}")
                 utils.print_rank_0(f"   Unprocessed points: {len(previous_state.get('unprocessed_points', []))}")
             except Exception as e:

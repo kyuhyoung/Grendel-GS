@@ -351,17 +351,23 @@ def check_memory_usage(log_file, args, iteration, gaussians, n_gauss_max, before
         )
         mem_cur = max([a[0] for a in memory_usage_list])
         mem_max = args.densify_memory_limit_percentage * total_memory
+        mem_cur_ratio = mem_cur / total_memory
         is_over_memory = mem_cur > mem_max
         is_over_gauss = n_gauss_cur > n_gauss_max if (n_gauss_max is not None and n_gauss_max > 0) else False
-        if is_over_memory or is_over_gauss:  
-        #if (max([a[0] for a in memory_usage_list]) > args.densify_memory_limit_percentage * total_memory):  
+        if is_over_memory or is_over_gauss:
+        #if (max([a[0] for a in memory_usage_list]) > args.densify_memory_limit_percentage * total_memory):
         # If memory usage is reaching the upper bound of GPU memory, stop densification to avoid OOM by fragmentation and etc.
-            print(
-                "Reserved Memory usage is reaching the upper bound of GPU memory. stop densification.\n"
-            )
-            log_file.write(
-                "Reserved Memory usage is reaching the upper bound of GPU memory. stop densification.\n"
-            )
+            reason_msg = ""
+            if is_over_memory:
+                reason_msg += f"Memory: {mem_cur:.2f} GB / {total_memory:.2f} GB ({mem_cur_ratio*100:.1f}%) > threshold {args.densify_memory_limit_percentage*100:.1f}%"
+            if is_over_gauss:
+                if reason_msg:
+                    reason_msg += " | "
+                reason_msg += f"Gaussians: {n_gauss_cur} > {n_gauss_max}"
+
+            stop_msg = f"Reserved Memory usage is reaching the upper bound of GPU memory. stop densification.\n  Reason: {reason_msg}\n"
+            print(stop_msg)
+            log_file.write(stop_msg)
             args.disable_auto_densification = True
 
 

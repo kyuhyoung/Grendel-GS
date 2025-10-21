@@ -327,8 +327,9 @@ class Scene:
         elif 'initial' in self.model_path:
             i_win = 0
         print(f'i_win : {i_win}');
-        if 2 * 2 * 2 * 2 < i_win:
-            exit(1)
+        # Removed window limit check to allow all windows to train
+        # if 2 * 2 * 2 * 2 < i_win:
+        #     exit(1)
             
     #'''
 

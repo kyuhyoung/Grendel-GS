@@ -50,8 +50,8 @@ show_usage() {
 # Default values
 SOURCE_PATH=""
 OUTPUT_PATH=""
-INITIAL_CAMERAS=4
-GPU_THRESHOLD=0.9
+INITIAL_CAMERAS=2
+CAMERA_REMOVAL_MARGIN=0.15
 DEBUG=false
 DTM_MODULE=""
 ITERATIONS=30000
@@ -59,9 +59,33 @@ SH_DEGREE=3
 RESOLUTION=1
 BACKEND="gsplat"
 DETERMINISTIC=""
-WINDOW_SIZE=3
 ITERATIONS_PER_WINDOW=60
 DENSIFY_FROM_ITER=10
+DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.90
+MAX_WINDOW_SIZE=""
+REMOVAL_STRATEGY=""
+E_SELECTION_STRATEGY=""
+E_WEIGHTED_ALPHA=""
+E_WEIGHTED_BETA=""
+E_TANGENTIAL_COEFF=""
+E_POLAR_ANGLE_STEP=""
+E_POLAR_RADIUS_STEP=""
+E_SPIRAL_ALPHA=""
+E_SPIRAL_BETA=""
+E_SPIRAL_GAMMA=""
+E_OUTWARD_WEIGHT=""
+E_COMPACT_WEIGHT=""
+E_SMOOTH_WINDOW_WEIGHT=""
+E_SMOOTH_CAMERA_WEIGHT=""
+E_DISTANCE_WEIGHT=""
+E_DIRECTIONAL_WEIGHT=""
+F_MODE=""
+ENABLE_DIRECTION_FILTERING=""
+TRACK_BY_PROJECTION=""
+PRUNE_BY_VISIBILITY=""
+VISIBILITY_PRUNE_MARGIN=""
+FOOTPRINT_INTERSECTION_THRESHOLD=""
+USE_ALL_PROCESSED_CAMERAS=""
 EXTRA_ARGS=""
 
 # Parse command line arguments
@@ -79,8 +103,8 @@ while [[ $# -gt 0 ]]; do
             INITIAL_CAMERAS="$2"
             shift 2
             ;;
-        -t|--threshold)
-            GPU_THRESHOLD="$2"
+        -t|--camera-removal-margin)
+            CAMERA_REMOVAL_MARGIN="$2"
             shift 2
             ;;
         -d|--debug)
@@ -115,10 +139,6 @@ while [[ $# -gt 0 ]]; do
             BACKEND="$2"
             shift 2
             ;;
-        --window-size)
-            WINDOW_SIZE="$2"
-            shift 2
-            ;;
         --iterations-per-window)
             ITERATIONS_PER_WINDOW="$2"
             shift 2
@@ -131,12 +151,116 @@ while [[ $# -gt 0 ]]; do
             DENSIFY_FROM_ITER="$2"
             shift 2
             ;;
+        --densify_memory_limit_percentage)
+            DENSIFY_MEMORY_LIMIT_PERCENTAGE="$2"
+            shift 2
+            ;;
+        --max_window_size)
+            MAX_WINDOW_SIZE="$2"
+            shift 2
+            ;;
+        --removal_strategy)
+            REMOVAL_STRATEGY="$2"
+            shift 2
+            ;;
+        --e_selection_strategy)
+            E_SELECTION_STRATEGY="$2"
+            shift 2
+            ;;
+        --e_weighted_alpha)
+            E_WEIGHTED_ALPHA="$2"
+            shift 2
+            ;;
+        --e_weighted_beta)
+            E_WEIGHTED_BETA="$2"
+            shift 2
+            ;;
+        --e_tangential_coeff)
+            E_TANGENTIAL_COEFF="$2"
+            shift 2
+            ;;
+        --e_polar_angle_step)
+            E_POLAR_ANGLE_STEP="$2"
+            shift 2
+            ;;
+        --e_polar_radius_step)
+            E_POLAR_RADIUS_STEP="$2"
+            shift 2
+            ;;
+        --e_spiral_alpha)
+            E_SPIRAL_ALPHA="$2"
+            shift 2
+            ;;
+        --e_spiral_beta)
+            E_SPIRAL_BETA="$2"
+            shift 2
+            ;;
+        --e_spiral_gamma)
+            E_SPIRAL_GAMMA="$2"
+            shift 2
+            ;;
+        --e_outward_weight)
+            E_OUTWARD_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_compact_weight)
+            E_COMPACT_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_smooth_window_weight)
+            E_SMOOTH_WINDOW_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_smooth_camera_weight)
+            E_SMOOTH_CAMERA_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_distance_weight)
+            E_DISTANCE_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_directional_weight)
+            E_DIRECTIONAL_WEIGHT="$2"
+            shift 2
+            ;;
+        --f_mode)
+            F_MODE="$2"
+            shift 2
+            ;;
+        --enable_direction_filtering)
+            ENABLE_DIRECTION_FILTERING=true
+            shift
+            ;;
+        --track_by_projection)
+            TRACK_BY_PROJECTION=true
+            shift
+            ;;
+        --prune_by_visibility)
+            PRUNE_BY_VISIBILITY=true
+            shift
+            ;;
+        --visibility_prune_margin)
+            VISIBILITY_PRUNE_MARGIN="$2"
+            shift 2
+            ;;
+        --footprint_intersection_threshold)
+            FOOTPRINT_INTERSECTION_THRESHOLD="$2"
+            shift 2
+            ;;
+        --use_all_processed_cameras)
+            USE_ALL_PROCESSED_CAMERAS=true
+            shift
+            ;;
         --deterministic)
             DETERMINISTIC="--deterministic"
             shift
             ;;
         --show-memory-debug-info)
             SHOW_MEMORY_DEBUG_INFO="--show_memory_debug_info"
+            shift
+            ;;
+        --exit-after-first-removal)
+            EXIT_AFTER_FIRST_REMOVAL="--exit_after_first_removal"
             shift
             ;;
         -h|--help)
@@ -174,15 +298,18 @@ if [[ ! -d "$SOURCE_PATH/sparse" ]] && [[ ! -f "$SOURCE_PATH/cameras.txt" ]]; th
     exit 1
 fi
 
-# Create output directory
+# Remove existing output directory and create fresh one
+if [[ -d "$OUTPUT_PATH" ]]; then
+    print_colored $YELLOW "⚠️  Removing existing output directory: $OUTPUT_PATH"
+    rm -rf "$OUTPUT_PATH"
+fi
+
+print_colored $GREEN "✓ Creating fresh output directory: $OUTPUT_PATH"
 mkdir -p "$OUTPUT_PATH"
 if [[ $? -ne 0 ]]; then
     print_colored $RED "❌ Error: Cannot create output directory: $OUTPUT_PATH"
     exit 1
 fi
-
-# Create output directory if it doesn't exist
-mkdir -p "$OUTPUT_PATH"
 
 # Set up logging
 LOG_FILE="$OUTPUT_PATH/progressive_train.log"
@@ -197,7 +324,7 @@ print_colored $GREEN "Configuration:"
 echo "  Source Path: $SOURCE_PATH"
 echo "  Output Path: $OUTPUT_PATH"
 echo "  Initial Cameras: $INITIAL_CAMERAS"
-echo "  GPU Threshold: $GPU_THRESHOLD"
+echo "  Camera Removal Margin: $CAMERA_REMOVAL_MARGIN"
 echo "  Training Iterations: $ITERATIONS"
 echo "  SH Degree: $SH_DEGREE"
 echo "  Backend: $BACKEND"
@@ -265,17 +392,13 @@ PYTHON_ARGS=""
 PYTHON_ARGS="$PYTHON_ARGS --source_path=\"$SOURCE_PATH\""
 PYTHON_ARGS="$PYTHON_ARGS --output_path=\"$OUTPUT_PATH\""
 PYTHON_ARGS="$PYTHON_ARGS --initial_cameras=$INITIAL_CAMERAS"
-PYTHON_ARGS="$PYTHON_ARGS --gpu_threshold=$GPU_THRESHOLD"
+PYTHON_ARGS="$PYTHON_ARGS --camera_removal_margin=$CAMERA_REMOVAL_MARGIN"
 PYTHON_ARGS="$PYTHON_ARGS --iterations=$ITERATIONS"
 PYTHON_ARGS="$PYTHON_ARGS --sh_degree=$SH_DEGREE"
 PYTHON_ARGS="$PYTHON_ARGS --resolution=$RESOLUTION"
 PYTHON_ARGS="$PYTHON_ARGS --backend=$BACKEND"
 
-# Add sliding window parameters if specified
-if [[ -n "$WINDOW_SIZE" ]]; then
-    PYTHON_ARGS="$PYTHON_ARGS --window_size=$WINDOW_SIZE"
-fi
-
+# Add window parameters if specified
 if [[ -n "$ITERATIONS_PER_WINDOW" ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --iterations_per_window=$ITERATIONS_PER_WINDOW"
 fi
@@ -286,6 +409,102 @@ fi
 
 if [[ -n "$DENSIFY_FROM_ITER" ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --densify_from_iter=$DENSIFY_FROM_ITER"
+fi
+
+if [[ -n "$DENSIFY_MEMORY_LIMIT_PERCENTAGE" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --densify_memory_limit_percentage=$DENSIFY_MEMORY_LIMIT_PERCENTAGE"
+fi
+
+if [[ -n "$MAX_WINDOW_SIZE" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --max_window_size=$MAX_WINDOW_SIZE"
+fi
+
+if [[ -n "$REMOVAL_STRATEGY" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --removal_strategy=$REMOVAL_STRATEGY"
+fi
+
+if [[ -n "$E_SELECTION_STRATEGY" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_selection_strategy=$E_SELECTION_STRATEGY"
+fi
+
+if [[ -n "$E_WEIGHTED_ALPHA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_weighted_alpha=$E_WEIGHTED_ALPHA"
+fi
+
+if [[ -n "$E_WEIGHTED_BETA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_weighted_beta=$E_WEIGHTED_BETA"
+fi
+
+if [[ -n "$E_TANGENTIAL_COEFF" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_tangential_coeff=$E_TANGENTIAL_COEFF"
+fi
+
+if [[ -n "$E_POLAR_ANGLE_STEP" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_polar_angle_step=$E_POLAR_ANGLE_STEP"
+fi
+
+if [[ -n "$E_POLAR_RADIUS_STEP" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_polar_radius_step=$E_POLAR_RADIUS_STEP"
+fi
+
+if [[ -n "$E_SPIRAL_ALPHA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_spiral_alpha=$E_SPIRAL_ALPHA"
+fi
+
+if [[ -n "$E_SPIRAL_BETA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_spiral_beta=$E_SPIRAL_BETA"
+fi
+
+if [[ -n "$E_SPIRAL_GAMMA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_spiral_gamma=$E_SPIRAL_GAMMA"
+fi
+
+if [[ -n "$E_OUTWARD_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_outward_weight=$E_OUTWARD_WEIGHT"
+fi
+
+if [[ -n "$E_COMPACT_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_compact_weight=$E_COMPACT_WEIGHT"
+fi
+
+if [[ -n "$E_SMOOTH_WINDOW_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_smooth_window_weight=$E_SMOOTH_WINDOW_WEIGHT"
+fi
+
+if [[ -n "$E_SMOOTH_CAMERA_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_smooth_camera_weight=$E_SMOOTH_CAMERA_WEIGHT"
+fi
+
+if [[ -n "$E_DISTANCE_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_distance_weight=$E_DISTANCE_WEIGHT"
+fi
+
+if [[ -n "$E_DIRECTIONAL_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_directional_weight=$E_DIRECTIONAL_WEIGHT"
+fi
+
+if [[ -n "$F_MODE" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --f_mode=$F_MODE"
+fi
+
+if [[ "$ENABLE_DIRECTION_FILTERING" == true ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --enable_direction_filtering"
+fi
+
+if [[ "$TRACK_BY_PROJECTION" == true ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --track_by_projection"
+fi
+
+if [[ "$PRUNE_BY_VISIBILITY" == true ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --prune_by_visibility"
+fi
+
+if [[ -n "$VISIBILITY_PRUNE_MARGIN" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --visibility_prune_margin=$VISIBILITY_PRUNE_MARGIN"
+fi
+
+if [[ -n "$FOOTPRINT_INTERSECTION_THRESHOLD" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --footprint_intersection_threshold=$FOOTPRINT_INTERSECTION_THRESHOLD"
 fi
 
 if [[ "$DEBUG" == true ]]; then
@@ -310,6 +529,14 @@ fi
 
 if [[ -n "$USE_CHUNK" ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --use_chunk"
+fi
+
+if [[ -n "$EXIT_AFTER_FIRST_REMOVAL" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --exit_after_first_removal"
+fi
+
+if [[ "$USE_ALL_PROCESSED_CAMERAS" == true ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --use_all_processed_cameras"
 fi
 
 # Add any extra arguments
