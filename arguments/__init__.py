@@ -86,6 +86,7 @@ class AuxiliaryParams(ParamGroup):
         self.cams_prev = ""  # Comma-separated list of previous window camera IDs
         self.cams_2_delete = ""  # Comma-separated list of camera IDs to delete from window
         self.cams_2_add = ""  # Comma-separated list of camera IDs to add to window
+        self.cams_all_processed = ""  # Comma-separated list of all processed camera IDs (for USE_ALL_PROCESSED_CAMERAS)
 
         super().__init__(parser, "Loading Parameters", sentinel)
 

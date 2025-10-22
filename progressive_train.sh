@@ -62,6 +62,26 @@ DETERMINISTIC=""
 WINDOW_SIZE=3
 ITERATIONS_PER_WINDOW=60
 DENSIFY_FROM_ITER=10
+F_MODE=""
+E_SELECTION_STRATEGY=""
+E_WEIGHTED_ALPHA=""
+E_WEIGHTED_BETA=""
+E_TANGENTIAL_COEFF=""
+E_POLAR_ANGLE_STEP=""
+E_POLAR_RADIUS_STEP=""
+E_SPIRAL_ALPHA=""
+E_SPIRAL_BETA=""
+E_SPIRAL_GAMMA=""
+E_OUTWARD_WEIGHT=""
+E_COMPACT_WEIGHT=""
+E_SMOOTH_WINDOW_WEIGHT=""
+E_SMOOTH_CAMERA_WEIGHT=""
+E_DISTANCE_WEIGHT=""
+E_DIRECTIONAL_WEIGHT=""
+CAMERA_REMOVAL_MARGIN=""
+FOOTPRINT_INTERSECTION_THRESHOLD=""
+ENABLE_DIRECTION_FILTERING=""
+USE_ALL_PROCESSED_CAMERAS=""
 EXTRA_ARGS=""
 
 # Parse command line arguments
@@ -143,6 +163,86 @@ while [[ $# -gt 0 ]]; do
             REMOVAL_STRATEGY="$2"
             shift 2
             ;;
+        --f_mode)
+            F_MODE="$2"
+            shift 2
+            ;;
+        --e_selection_strategy)
+            E_SELECTION_STRATEGY="$2"
+            shift 2
+            ;;
+        --e_weighted_alpha)
+            E_WEIGHTED_ALPHA="$2"
+            shift 2
+            ;;
+        --e_weighted_beta)
+            E_WEIGHTED_BETA="$2"
+            shift 2
+            ;;
+        --e_tangential_coeff)
+            E_TANGENTIAL_COEFF="$2"
+            shift 2
+            ;;
+        --e_polar_angle_step)
+            E_POLAR_ANGLE_STEP="$2"
+            shift 2
+            ;;
+        --e_polar_radius_step)
+            E_POLAR_RADIUS_STEP="$2"
+            shift 2
+            ;;
+        --e_spiral_alpha)
+            E_SPIRAL_ALPHA="$2"
+            shift 2
+            ;;
+        --e_spiral_beta)
+            E_SPIRAL_BETA="$2"
+            shift 2
+            ;;
+        --e_spiral_gamma)
+            E_SPIRAL_GAMMA="$2"
+            shift 2
+            ;;
+        --e_outward_weight)
+            E_OUTWARD_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_compact_weight)
+            E_COMPACT_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_smooth_window_weight)
+            E_SMOOTH_WINDOW_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_smooth_camera_weight)
+            E_SMOOTH_CAMERA_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_distance_weight)
+            E_DISTANCE_WEIGHT="$2"
+            shift 2
+            ;;
+        --e_directional_weight)
+            E_DIRECTIONAL_WEIGHT="$2"
+            shift 2
+            ;;
+        --camera_removal_margin)
+            CAMERA_REMOVAL_MARGIN="$2"
+            shift 2
+            ;;
+        --footprint_intersection_threshold)
+            FOOTPRINT_INTERSECTION_THRESHOLD="$2"
+            shift 2
+            ;;
+        --enable_direction_filtering)
+            ENABLE_DIRECTION_FILTERING=true
+            shift
+            ;;
+        --use_all_processed_cameras)
+            USE_ALL_PROCESSED_CAMERAS=true
+            shift
+            ;;
         --deterministic)
             DETERMINISTIC="--deterministic"
             shift
@@ -158,13 +258,6 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             show_usage
             exit 0
-            ;;
-        --e_selection_strategy|--e_weighted_alpha|--e_weighted_beta|--e_tangential_coeff|--e_polar_angle_step|--e_polar_radius_step|--e_spiral_alpha|--e_spiral_beta|--e_spiral_gamma|--e_outward_weight|--e_compact_weight|--e_smooth_window_weight|--e_smooth_camera_weight|--e_distance_weight|--track_by_projection|--prune_by_visibility|--visibility_prune_margin)
-            # Ignore unsupported arguments for this commit (9384129)
-            shift
-            if [[ "$1" != --* ]] && [[ -n "$1" ]]; then
-                shift  # Also skip the value if present
-            fi
             ;;
         *)
             EXTRA_ARGS="$EXTRA_ARGS $1"
@@ -321,6 +414,86 @@ fi
 
 if [[ -n "$REMOVAL_STRATEGY" ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --removal_strategy=$REMOVAL_STRATEGY"
+fi
+
+if [[ -n "$F_MODE" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --f_mode=$F_MODE"
+fi
+
+if [[ -n "$E_SELECTION_STRATEGY" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_selection_strategy=$E_SELECTION_STRATEGY"
+fi
+
+if [[ -n "$E_WEIGHTED_ALPHA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_weighted_alpha=$E_WEIGHTED_ALPHA"
+fi
+
+if [[ -n "$E_WEIGHTED_BETA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_weighted_beta=$E_WEIGHTED_BETA"
+fi
+
+if [[ -n "$E_TANGENTIAL_COEFF" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_tangential_coeff=$E_TANGENTIAL_COEFF"
+fi
+
+if [[ -n "$E_POLAR_ANGLE_STEP" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_polar_angle_step=$E_POLAR_ANGLE_STEP"
+fi
+
+if [[ -n "$E_POLAR_RADIUS_STEP" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_polar_radius_step=$E_POLAR_RADIUS_STEP"
+fi
+
+if [[ -n "$E_SPIRAL_ALPHA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_spiral_alpha=$E_SPIRAL_ALPHA"
+fi
+
+if [[ -n "$E_SPIRAL_BETA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_spiral_beta=$E_SPIRAL_BETA"
+fi
+
+if [[ -n "$E_SPIRAL_GAMMA" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_spiral_gamma=$E_SPIRAL_GAMMA"
+fi
+
+if [[ -n "$E_OUTWARD_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_outward_weight=$E_OUTWARD_WEIGHT"
+fi
+
+if [[ -n "$E_COMPACT_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_compact_weight=$E_COMPACT_WEIGHT"
+fi
+
+if [[ -n "$E_SMOOTH_WINDOW_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_smooth_window_weight=$E_SMOOTH_WINDOW_WEIGHT"
+fi
+
+if [[ -n "$E_SMOOTH_CAMERA_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_smooth_camera_weight=$E_SMOOTH_CAMERA_WEIGHT"
+fi
+
+if [[ -n "$E_DISTANCE_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_distance_weight=$E_DISTANCE_WEIGHT"
+fi
+
+if [[ -n "$E_DIRECTIONAL_WEIGHT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --e_directional_weight=$E_DIRECTIONAL_WEIGHT"
+fi
+
+if [[ -n "$CAMERA_REMOVAL_MARGIN" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --camera_removal_margin=$CAMERA_REMOVAL_MARGIN"
+fi
+
+if [[ -n "$FOOTPRINT_INTERSECTION_THRESHOLD" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --footprint_intersection_threshold=$FOOTPRINT_INTERSECTION_THRESHOLD"
+fi
+
+if [[ "$ENABLE_DIRECTION_FILTERING" == true ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --enable_direction_filtering"
+fi
+
+if [[ "$USE_ALL_PROCESSED_CAMERAS" == true ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --use_all_processed_cameras"
 fi
 
 if [[ "$DEBUG" == true ]]; then

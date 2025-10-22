@@ -17,14 +17,17 @@ class WindowSelector:
     """
 
     def __init__(self, camera_positions: dict,
-                 camera_footprints: Optional[dict] = None):
+                 camera_footprints: Optional[dict] = None,
+                 f_mode: str = 'global'):
         """
         Args:
             camera_positions: Dict mapping camera_id -> [x, y] position (numpy array)
             camera_footprints: Dict mapping camera_id -> footprint rectangle [4, 2] array
+            f_mode: F calculation mode ('global' or 'remaining')
         """
         self.camera_positions = camera_positions  # {cam_id: [x, y]}
         self.camera_footprints = camera_footprints or {}  # footprint rectangles
+        self.f_mode = f_mode
 
         # A: Set of remaining camera IDs to process
         self.A = set(camera_positions.keys())
@@ -35,7 +38,7 @@ class WindowSelector:
         # Timestamp counter
         self.iteration = 0
 
-        # Global mean F (computed once)
+        # Global mean F (computed once if f_mode='global')
         self.F = None
 
     def distance(self, cam_id1: int, cam_id2: int) -> float:
@@ -163,9 +166,12 @@ class WindowSelector:
             List of N camera IDs forming the most compact cluster
         """
 
-        # Step 1: Compute global mean F
-        self.F = self.compute_mean(self.A)
-        print(f"\n[Step 1] Global mean F: {self.F}")
+        # Step 1: Compute global mean F (only if f_mode='global')
+        if self.f_mode == 'global':
+            self.F = self.compute_mean(self.A)
+            print(f"\n[Step 1] Global mean F: {self.F}")
+        else:
+            print(f"\n[Step 1] F mode: 'remaining' - skipping global mean calculation")
 
         # Step 2: Compute convex hull of A
         hull, C = self.compute_convex_hull(self.A)

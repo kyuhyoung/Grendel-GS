@@ -196,9 +196,26 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
 
                     # Check if we should use all_processed_cameras instead of just prev_cameras
                     cameras_for_visibility_check = prev_cameras
+
+                    # Log GPU memory before visibility check decision
+                    if torch.cuda.is_available():
+                        mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                        mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                        mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                        utils.print_rank_0(f"🧠 [MEMORY BEFORE VISIBILITY CHECK] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Total={mem_total:.2f}GB")
+
                     if hasattr(args, 'cams_all_processed') and args.cams_all_processed:
                         cameras_for_visibility_check = [int(x) for x in args.cams_all_processed.split(",")]
                         utils.print_rank_0(f"🔄 Using all_processed_cameras for gaussian addition visibility check ({len(cameras_for_visibility_check)} cameras)")
+
+                        # Show breakdown: prev_cameras vs removed_cameras
+                        removed_from_window = sorted(set(cameras_for_visibility_check) - set(prev_cameras))
+                        utils.print_rank_0(f"   📋 Breakdown:")
+                        utils.print_rank_0(f"      - Previous window cameras (현재 윈도우): {sorted(prev_cameras)} ({len(prev_cameras)} cameras)")
+                        utils.print_rank_0(f"      - Removed cameras (제거된 카메라): {removed_from_window} ({len(removed_from_window)} cameras)")
+                        utils.print_rank_0(f"      - Total for visibility check: {sorted(cameras_for_visibility_check)} ({len(cameras_for_visibility_check)} cameras)")
+                    else:
+                        utils.print_rank_0(f"🔄 Using prev_cameras for gaussian addition visibility check ({len(cameras_for_visibility_check)} cameras)")
 
                     # Logging
                     utils.print_rank_0(f"🔄 PROGRESSIVE CHECKPOINT - Previous cameras: {prev_cameras}")
@@ -228,10 +245,22 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
 
                     n_gaussians_after_removal = len(gaussians.get_xyz)
 
+                    # Log GPU memory after gaussian removal
+                    if torch.cuda.is_available():
+                        mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                        mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                        utils.print_rank_0(f"🧠 [MEMORY AFTER REMOVAL] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Gaussians={n_gaussians_after_removal}")
+
                     # Process gaussian addition for new cameras (after checkpoint loading)
                     # Use cameras_for_visibility_check which is either prev_cameras or all_processed_cameras
                     _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, cameras_for_visibility_check, opt_args)
                     n_gaussians_after_addition = len(gaussians.get_xyz)
+
+                    # Log GPU memory after gaussian addition
+                    if torch.cuda.is_available():
+                        mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                        mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                        utils.print_rank_0(f"🧠 [MEMORY AFTER ADDITION] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Gaussians={n_gaussians_after_addition}")
 
                     # Calculate counts
                     n_removed = n_gaussians_restored - n_gaussians_after_removal
@@ -386,7 +415,21 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
     ema_loss_for_log = 0
     debug_info_printed = False
     print(f'start_from_this_iteration : {start_from_this_iteration}, opt_args.iterations + 1 : {opt_args.iterations + 1}, args.bsz : {args.bsz}')
+
+    # Log initial memory before training loop
+    if torch.cuda.is_available():
+        mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+        mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+        utils.print_rank_0(f"🧠 [MEMORY BEFORE TRAINING LOOP] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB")
+
     for iteration in range(start_from_this_iteration, opt_args.iterations + 1, args.bsz):
+        # Log memory every 3 iterations
+        if iteration % 3 == 0 and torch.cuda.is_available():
+            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+            mem_peak = torch.cuda.max_memory_allocated(0) / 1024**3
+            utils.print_rank_0(f"🧠 [ITER {iteration}] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Peak={mem_peak:.2f}GB")
+
         ema_loss_for_log = _process_iteration(iteration, gaussians, scene, args, timers, strategy_history, train_dataset, background, pipe_args, progress_bar, ema_loss_for_log, debug_info_printed, end2end_timers, log_file, n_g_max)
 
     '''
@@ -1450,7 +1493,7 @@ def _add_gaussians_only_visible_to_new_cameras(gaussians, scene, new_cameras, pr
     utils.print_rank_0(f"\n📊 [FINAL RESULT] Point visibility summary:")
     utils.print_rank_0(f"  - Total COLMAP points: {n_points}")
     utils.print_rank_0(f"  - Visible to ANY new camera: {n_visible_to_new}")
-    utils.print_rank_0(f"  - Visible to ANY prev/all_processed camera: {n_visible_to_prev}")
+    utils.print_rank_0(f"  - Visible to ANY prev/all_processed camera: {n_visible_to_prev} (cameras: {prev_cams_list})")
     utils.print_rank_0(f"  - Visible to BOTH (filtered out): {visible_to_both}")
     utils.print_rank_0(f"  - ONLY visible to new cameras (will add as Gaussians): {n_only_to_new}")
     utils.print_rank_0("=" * 80)

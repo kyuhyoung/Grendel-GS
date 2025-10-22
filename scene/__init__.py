@@ -245,14 +245,24 @@ class Scene:
         log_file.write(
             "Number of local training cameras: {}\n".format(len(self.train_cameras))
         )
-        if len(self.train_cameras) > 0:
-            log_file.write(
-                "Image size: {}x{}\n".format(
-                    self.train_cameras[0].image_height,
-                    self.train_cameras[0].image_width,
-                )
-            )
+        utils.print_rank_0(f"🔍 [DEBUG] After logging training camera count")
 
+        if len(self.train_cameras) > 0:
+            utils.print_rank_0(f"🔍 [DEBUG] Accessing train_cameras[0] for image size...")
+            try:
+                log_file.write(
+                    "Image size: {}x{}\n".format(
+                        self.train_cameras[0].image_height,
+                        self.train_cameras[0].image_width,
+                    )
+                )
+                utils.print_rank_0(f"🔍 [DEBUG] Image size logged successfully")
+            except Exception as e:
+                utils.print_rank_0(f"❌ [DEBUG] Error getting image size: {e}")
+                import traceback
+                traceback.print_exc()
+
+        utils.print_rank_0(f"🔍 [DEBUG] Before test cameras section, args.eval={args.eval}")
         if args.eval:
             utils.print_rank_0("Decoding Test Cameras")
             if args.num_test_cameras >= 0:
@@ -320,16 +330,6 @@ class Scene:
             utils.print_rank_0(f"   self.all_cameras IDs: {self.all_cameras.keys()}")
         else:
             utils.print_rank_0("⚠️  Scene constructor completed: self.all_cameras is empty or not initialized")
-        i_win = -1
-        # model_path가 "output/model_window_3" 형태인 경우
-        if 'window_' in self.model_path:
-            i_win = int(self.model_path.split('window_')[-1])
-        elif 'initial' in self.model_path:
-            i_win = 0
-        print(f'i_win : {i_win}');
-        if 2 * 2 * 2 * 2 < i_win:
-            exit(1)
-            
     #'''
 
     def _initialize_basic_attributes(self, args, gaussians, load_iteration):

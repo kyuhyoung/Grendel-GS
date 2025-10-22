@@ -46,7 +46,28 @@ def main():
     parser.add_argument('--track_by_projection', action='store_true', help='Generate tracks by projection instead of using COLMAP tracks')
     parser.add_argument('--prune_by_visibility', action='store_true', help='Prune gaussians outside all camera frustums')
     parser.add_argument('--visibility_prune_margin', type=int, default=20, help='Margin in pixels for visibility-based pruning')
-    parser.add_argument('--exit_after_first_removal', action='store_true', help='Exit after first camera removal (for testing max_window_size)')
+    parser.add_argument('--f_mode', type=str, default='global', choices=['global', 'remaining'], help='F (global center) calculation mode: global (all cameras) or remaining (only cameras in A)')
+    parser.add_argument('--enable_direction_filtering', action='store_true', help='Enable direction filtering (Step 16.6): only cameras in forward hemisphere (angle <= 90°)')
+    parser.add_argument('--e_selection_strategy', type=str, default='default', choices=['default', 'momentum', 'weighted', 'tangential', 'polar', 'outward_spiral_compact', 'balanced_smooth_trajectory'], help='E camera selection strategy')
+    parser.add_argument('--e_weighted_alpha', type=float, default=0.7, help='Weight for R in weighted strategy (default: 0.7)')
+    parser.add_argument('--e_weighted_beta', type=float, default=0.3, help='Weight for (yy-F) in weighted strategy (default: 0.3)')
+    parser.add_argument('--e_tangential_coeff', type=float, default=0.5, help='Tangential coefficient for tangential strategy (default: 0.5)')
+    parser.add_argument('--e_polar_angle_step', type=float, default=30.0, help='Angle step in degrees for polar strategy (default: 30)')
+    parser.add_argument('--e_polar_radius_step', type=float, default=1.2, help='Radius multiplier for polar strategy (default: 1.2)')
+    parser.add_argument('--e_spiral_alpha', type=float, default=1.0, help='Distance weight for outward_spiral_compact strategy (default: 1.0)')
+    parser.add_argument('--e_spiral_beta', type=float, default=0.3, help='Diversity weight for outward_spiral_compact strategy (default: 0.3)')
+    parser.add_argument('--e_spiral_gamma', type=float, default=0.5, help='Variance penalty weight for outward_spiral_compact strategy (default: 0.5)')
+    # Balanced smooth trajectory strategy parameters (6-force)
+    parser.add_argument('--e_outward_weight', type=float, default=0.04, help='Weight for outward movement in balanced_smooth_trajectory strategy (default: 0.04)')
+    parser.add_argument('--e_compact_weight', type=float, default=2.5, help='Weight for window compactness in balanced_smooth_trajectory strategy (default: 2.5)')
+    parser.add_argument('--e_smooth_window_weight', type=float, default=2.8, help='Weight for smooth window trajectory in balanced_smooth_trajectory strategy (default: 2.8)')
+    parser.add_argument('--e_smooth_camera_weight', type=float, default=0.7, help='Weight for smooth camera trajectory in balanced_smooth_trajectory strategy (default: 0.7)')
+    parser.add_argument('--e_distance_weight', type=float, default=0.5, help='Weight for distance to current window center in balanced_smooth_trajectory strategy (default: 0.5)')
+    parser.add_argument('--e_directional_weight', type=float, default=0.0, help='Weight for directional alignment (candidate aligns with window movement) in balanced_smooth_trajectory strategy (default: 0.0)')
+    parser.add_argument('--footprint_intersection_threshold', type=float, default=0.0, help='Minimum intersection area ratio (intersection/union) for candidate cameras (0.0-1.0, default: 0.0 = disabled)')
+    parser.add_argument('--exit_after_first_removal', action='store_true', help='Exit after first camera removal for testing')
+    parser.add_argument('--use_all_processed_cameras', action='store_true', help='Check all processed cameras (not just prev window) when adding gaussians')
+    parser.add_argument('--camera_removal_margin', type=float, default=0.15, help='Margin below densify_memory_limit for camera removal (default: 0.15)')
 
     args = parser.parse_args()
 
@@ -70,6 +91,7 @@ def main():
         dtm_module=dtm_module,
         initial_cameras=args.initial_cameras,
         gpu_memory_threshold=args.gpu_threshold,
+        camera_removal_margin=args.camera_removal_margin,
         debug=args.debug,
         only_actually_visible=args.only_actually_visible
     )
@@ -86,12 +108,31 @@ def main():
     trainer.densify_memory_limit_percentage = args.densify_memory_limit_percentage
     trainer.max_window_size = args.max_window_size
     trainer.removal_strategy = args.removal_strategy
+    trainer.f_mode = args.f_mode
+    trainer.enable_direction_filtering = args.enable_direction_filtering
+    trainer.e_selection_strategy = args.e_selection_strategy
+    trainer.e_weighted_alpha = args.e_weighted_alpha
+    trainer.e_weighted_beta = args.e_weighted_beta
+    trainer.e_tangential_coeff = args.e_tangential_coeff
+    trainer.e_polar_angle_step = args.e_polar_angle_step
+    trainer.e_polar_radius_step = args.e_polar_radius_step
+    trainer.e_spiral_alpha = args.e_spiral_alpha
+    trainer.e_spiral_beta = args.e_spiral_beta
+    trainer.e_spiral_gamma = args.e_spiral_gamma
+    trainer.e_outward_weight = args.e_outward_weight
+    trainer.e_compact_weight = args.e_compact_weight
+    trainer.e_smooth_window_weight = args.e_smooth_window_weight
+    trainer.e_smooth_camera_weight = args.e_smooth_camera_weight
+    trainer.e_distance_weight = args.e_distance_weight
+    trainer.e_directional_weight = args.e_directional_weight
+    trainer.footprint_intersection_threshold = args.footprint_intersection_threshold
+    trainer.exit_after_first_removal = args.exit_after_first_removal
+    trainer.use_all_processed_cameras = args.use_all_processed_cameras
     trainer.show_memory_debug_info = args.show_memory_debug_info
     trainer.auto_save_final_iteration = args.auto_save_final_iteration
     trainer.track_by_projection = args.track_by_projection
     trainer.prune_by_visibility = args.prune_by_visibility
     trainer.visibility_prune_margin = args.visibility_prune_margin
-    trainer.exit_after_first_removal = args.exit_after_first_removal
 
     # Run the progressive training pipeline with sliding window
     try:

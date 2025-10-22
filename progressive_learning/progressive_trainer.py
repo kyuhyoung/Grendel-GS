@@ -21,14 +21,17 @@ from colmap_visualizer import COLMAPVisualizer
 def calculate_balanced_smooth_score(candidate_idx, D_indices, positions, F, prev_window_center,
                                    prev_movement, window_size, outward_weight, compact_weight,
                                    smooth_window_weight, smooth_camera_weight, distance_weight,
-                                   last_added_idx, second_last_added_idx):
+                                   directional_weight, last_added_idx, second_last_added_idx,
+                                   initial_window_indices=None, debug=False, candidate_cam_id=None,
+                                   D_cam_ids=None, idx_to_cam_id=None):
     """
-    Calculate score balancing five forces:
+    Calculate score balancing six forces:
     1. Outward: Window center moves away from F
     2. Compact: Window variance is minimized
     3. Smooth Window: Window center trajectory is smooth (velocity continuity)
     4. Smooth Camera: Added camera trajectory is smooth (directional continuity)
     5. Distance: Candidate is close to current window center
+    6. Directional Alignment: Candidate aligns with window movement direction
 
     Args:
         candidate_idx: Index of candidate camera
@@ -43,42 +46,121 @@ def calculate_balanced_smooth_score(candidate_idx, D_indices, positions, F, prev
         smooth_window_weight: Weight for smooth window score
         smooth_camera_weight: Weight for smooth camera score
         distance_weight: Weight for distance score
+        directional_weight: Weight for directional alignment score
         last_added_idx: Index of last added camera or None
         second_last_added_idx: Index of second-to-last added camera or None
 
     Returns:
         Tuple of (total_score, outward_score, compact_score, smooth_window_score,
-                 smooth_camera_score, distance_score, D_prime_center, variance)
+                 smooth_camera_score, distance_score, directional_score, D_prime_center, variance)
     """
 
-    # Create new window D' with candidate
-    D_prime_indices = list(D_indices) + [candidate_idx]
+    # Create new window D' with candidate, considering FIFO removal
+    D_prime_indices = list(D_indices)
 
-    # Apply sliding window (FIFO if exceeds window_size)
-    if len(D_prime_indices) > window_size:
-        D_prime_indices = D_prime_indices[-window_size:]
+    # FIFO removal logic (matches line 2720-2732 in main loop)
+    if initial_window_indices is not None and len(D_prime_indices) >= window_size:
+        # Check how many initial window cameras remain in D
+        remaining_initial_in_D = [idx for idx in D_prime_indices if idx in initial_window_indices]
+
+        if len(remaining_initial_in_D) >= 2:
+            # 2개 이상 남아있으면 → candidate와 가장 먼 initial camera 제거
+            candidate_pos = positions[candidate_idx]
+            max_distance = -1
+            farthest_idx = None
+
+            for idx in remaining_initial_in_D:
+                dist = np.linalg.norm(positions[idx] - candidate_pos)
+                if dist > max_distance:
+                    max_distance = dist
+                    farthest_idx = idx
+
+            if farthest_idx is not None:
+                D_prime_indices.remove(farthest_idx)
+        else:
+            # 1개 이하면 → 진짜 FIFO (D_indices[0] 제거)
+            oldest_cam_idx = D_prime_indices[0]
+            D_prime_indices.remove(oldest_cam_idx)
+
+    # Add candidate
+    D_prime_indices.append(candidate_idx)
 
     D_prime_positions = positions[D_prime_indices]
     D_prime_center = np.mean(D_prime_positions, axis=0)
 
-    # 1. Outward score: Distance from F should increase
-    dist_to_F = np.linalg.norm(D_prime_center - F)
+    # 1. Outward score: Candidate camera's distance from F (normalized)
+    # Reward cameras farther from global center F
+    candidate_pos = positions[candidate_idx]
+    candidate_dist_to_F = np.linalg.norm(candidate_pos - F)
 
-    if prev_window_center is not None:
-        prev_dist_to_F = np.linalg.norm(prev_window_center - F)
-        # Reward moving away from F, penalize moving toward F
-        outward_delta = dist_to_F - prev_dist_to_F
-        outward_score = outward_delta  # Positive = good, negative = bad
-    else:
-        # First selection, just use distance
-        outward_score = dist_to_F / 100.0  # Normalize
+    # Normalize by mean distance from F to all cameras for scale independence
+    F_mean_radius = np.mean(np.linalg.norm(positions - F, axis=1)) + 1e-6
+    normalized_dist_to_F = candidate_dist_to_F / F_mean_radius
+    outward_score = normalized_dist_to_F  # Typically 0.5 ~ 1.5 range
 
     # 2. Compact score: Window radius (max distance from center) should be small
     distances_from_center = np.linalg.norm(D_prime_positions - D_prime_center, axis=1)
     variance = np.var(distances_from_center)  # Still keep for logging
     max_distance = np.max(distances_from_center) + 1e-6
-    # Lower max distance = higher score (smaller window radius)
-    compact_score = 1.0 / (1.0 + max_distance)  # Normalize to [0, 1]
+
+    # Normalize by current window D's mean radius for scale independence
+    D_positions = positions[D_indices]
+    if len(D_indices) == 1:
+        D_positions = D_positions.reshape(1, -1)
+    D_center = np.mean(D_positions, axis=0)
+    D_mean_radius = np.mean(np.linalg.norm(D_positions - D_center, axis=1)) + 1e-6
+
+    # Normalized max distance (relative to current window size)
+    normalized_max_distance = max_distance / D_mean_radius
+    # Lower normalized distance = higher score (exponential decay)
+    compact_score = np.exp(-normalized_max_distance)
+
+    # Debug logging for compact score calculation
+    if debug and candidate_cam_id is not None:
+        print(f"\n{'='*80}")
+        print(f"🔍 COMPACT SCORE DEBUG for Camera {candidate_cam_id}")
+        print(f"{'='*80}")
+
+        # Build D' camera IDs list
+        if D_cam_ids is not None:
+            D_prime_cam_ids = D_cam_ids + [candidate_cam_id]
+            if len(D_prime_cam_ids) > window_size:
+                D_prime_cam_ids = D_prime_cam_ids[-window_size:]
+            print(f"D' = D ∪ {{candidate {candidate_cam_id}}} = Camera IDs: {D_prime_cam_ids}")
+        else:
+            print(f"D' = D ∪ {{candidate {candidate_cam_id}}}")
+        print(f"D' array indices: {D_prime_indices}")
+
+        if len(D_prime_center) == 2:
+            print(f"D'_center: ({D_prime_center[0]:.2f}, {D_prime_center[1]:.2f})")
+        else:
+            print(f"D'_center: {D_prime_center}")
+        print(f"\nDistances from D'_center to each camera in D':")
+        for i, (idx, dist) in enumerate(zip(D_prime_indices, distances_from_center)):
+            marker = " ← candidate" if idx == candidate_idx else ""
+            cam_id_str = ""
+            if idx_to_cam_id is not None and idx in idx_to_cam_id:
+                cam_id_str = f" (Camera {idx_to_cam_id[idx]})"
+            pos_str = f"({positions[idx][0]:.2f}, {positions[idx][1]:.2f})" if len(positions[idx]) == 2 else str(positions[idx])
+            print(f"  D'[{i}]{cam_id_str} at {pos_str}: {dist:.3f}m{marker}")
+        print(f"Max distance in D': {max_distance:.3f}m")
+        print(f"Variance of D': {variance:.3f}")
+
+        print(f"\nCurrent window D:")
+        if D_cam_ids is not None:
+            print(f"D Camera IDs: {D_cam_ids}")
+        print(f"D array indices: {D_indices}")
+        if len(D_center) == 2:
+            print(f"D_center: ({D_center[0]:.2f}, {D_center[1]:.2f})")
+        else:
+            print(f"D_center: {D_center}")
+        D_distances = np.linalg.norm(D_positions - D_center, axis=1)
+        print(f"D distances from D_center: {[f'{d:.3f}' for d in D_distances]}")
+        print(f"D_mean_radius: {D_mean_radius:.3f}m")
+        print(f"\n📐 Calculation:")
+        print(f"  Normalized max distance = {max_distance:.3f} / {D_mean_radius:.3f} = {normalized_max_distance:.6f}")
+        print(f"  Compact score = exp(-{normalized_max_distance:.6f}) = {compact_score:.6f}")
+        print(f"{'='*80}\n")
 
     # 3. Smooth Window score: Window center movement direction should be continuous
     smooth_window_score = 0.0
@@ -124,31 +206,78 @@ def calculate_balanced_smooth_score(candidate_idx, D_indices, positions, F, prev
             # Score: high when directions are similar
             smooth_camera_score = (1 + cos_similarity_cam) / 2.0
 
-    # 5. Distance score: Candidate should be close to current window center
-    # Calculate current window D center (before adding candidate)
-    D_positions = positions[D_indices]
-    if len(D_indices) == 1:
+    # 5. Distance score: Candidate should be close to FUTURE window center
+    # Determine which cameras will remain after FIFO removal
+    D_for_distance_indices = D_indices
+
+    if initial_window_indices is not None and len(D_indices) >= window_size:
+        # Check how many initial cameras remain in D
+        remaining_initial_in_D = [idx for idx in D_indices if idx in initial_window_indices]
+
+        if len(remaining_initial_in_D) <= 1:
+            # FIFO will definitely remove D_indices[0]
+            # Use only cameras that will remain in future window
+            D_for_distance_indices = D_indices[1:]
+
+    # Calculate future window center
+    if len(D_for_distance_indices) == 0:
+        # Fallback: use full D if something goes wrong
+        D_for_distance_indices = D_indices
+
+    D_positions = positions[D_for_distance_indices]
+    if len(D_for_distance_indices) == 1:
         D_positions = D_positions.reshape(1, -1)
     D_center = np.mean(D_positions, axis=0)
 
-    # Distance from candidate to current window center
+    # Distance from candidate to future window center
     candidate_pos = positions[candidate_idx]
     dist_to_D_center = np.linalg.norm(candidate_pos - D_center)
 
-    # Calculate normalization factor (mean radius of current window)
+    # Calculate normalization factor (mean radius of future window)
     D_mean_radius = np.mean(np.linalg.norm(D_positions - D_center, axis=1)) + 1e-6
 
     # Exponential decay score (closer = higher score)
     distance_score = np.exp(-dist_to_D_center / (2 * D_mean_radius))
+
+    # 6. Directional Alignment score: Candidate should align with window movement direction
+    directional_score = 0.0
+    if prev_window_center is not None:
+        # Calculate current window center (before adding candidate)
+        D_positions_current = positions[D_indices]
+        if len(D_indices) == 1:
+            D_positions_current = D_positions_current.reshape(1, -1)
+        current_window_center = np.mean(D_positions_current, axis=0)
+
+        # Window movement direction: from current window center to future window center (D')
+        # Both vectors start from the same point (current_window_center)
+        window_movement = D_prime_center - current_window_center
+
+        # Direction from current window center to candidate
+        candidate_direction = candidate_pos - current_window_center
+
+        # Calculate cosine similarity
+        window_norm = np.linalg.norm(window_movement)
+        candidate_norm = np.linalg.norm(candidate_direction)
+
+        if window_norm > 1e-6 and candidate_norm > 1e-6:
+            window_unit = window_movement / window_norm
+            candidate_unit = candidate_direction / candidate_norm
+
+            cos_similarity = np.dot(window_unit, candidate_unit)
+            cos_similarity = np.clip(cos_similarity, -1.0, 1.0)
+
+            # Score: high when candidate is in the direction of window movement
+            directional_score = (1 + cos_similarity) / 2.0
 
     # Weighted sum
     total_score = (outward_weight * outward_score +
                    compact_weight * compact_score +
                    smooth_window_weight * smooth_window_score +
                    smooth_camera_weight * smooth_camera_score +
-                   distance_weight * distance_score)
+                   distance_weight * distance_score +
+                   directional_weight * directional_score)
 
-    return total_score, outward_score, compact_score, smooth_window_score, smooth_camera_score, distance_score, D_prime_center, variance
+    return total_score, outward_score, compact_score, smooth_window_score, smooth_camera_score, distance_score, directional_score, D_prime_center, variance
 
 
 class ProgressiveTrainer:
@@ -227,6 +356,7 @@ class ProgressiveTrainer:
         # Sliding window global state
         self.unprocessed_cameras = set()  # Cameras remaining to be processed
         self.processed_cameras = set()  # Cameras that have been fully processed
+        self.all_processed_cameras = set()  # All cameras that have ever been in any window (including removed ones)
         self.unprocessed_points = set()  # 3D points not yet covered by any processed camera
         self.trained_gaussians = set()  # Gaussians that have completed training and been saved
         # Note: We only track processed_gaussians, not processed_points
@@ -716,7 +846,7 @@ class ProgressiveTrainer:
         #print(f"Computed {len(self.camera_footprints)} footprints")
         avg_points = np.mean([len(pts) for pts in self.points_in_view.values()])
         print(f"Average points per footprint: {avg_points:.1f}")
-        #print(f'self.debug : {self.debug}');    exit(1)    
+        #print(f'self.debug : {self.debug}');    exit(1)
         if self.debug and self.dtm_module is not None:
             # Use existing verified visualization from colmap_visualizer
             try:
@@ -731,7 +861,7 @@ class ProgressiveTrainer:
                 scene_center = self.dtm_module.visualize_3d_scene(save_path=scene_path)
                 print(f'ortho_path : {ortho_path}')
                 self.dtm_module.render_orthographic_view(scene_center, save_path=ortho_path)
-                
+
                 print(f"Visualizations saved:")
                 print(f"  - 3D scene: {scene_path}")
                 print(f"  - Orthographic: {ortho_path}")
@@ -1096,6 +1226,11 @@ class ProgressiveTrainer:
                 if new_camera_id is not None:
                     cmd.extend(["--cams_2_add", str(new_camera_id)])
 
+                # Add all processed cameras if use_all_processed_cameras flag is set
+                if hasattr(self, 'use_all_processed_cameras') and self.use_all_processed_cameras:
+                    all_proc_cams = list(self.all_processed_cameras)
+                    cmd.extend(["--cams_all_processed", ",".join(map(str, all_proc_cams))])
+                    print(f"   Passing all_processed_cameras ({len(all_proc_cams)} cameras) to train.py")
 
         if self.debug:
             print(f"   Training command: {' '.join(cmd)}")
@@ -1122,6 +1257,12 @@ class ProgressiveTrainer:
 
                 # Update processed points after successful training (this calls _save_progressive_state)
                 self._update_processed_points_after_training(dataset, iteration_name)
+
+                # Clear GPU memory cache to prevent memory accumulation across windows
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    print(f"🧹 Cleared GPU memory cache after {iteration_name}")
             else:
                 error_msg = f"Training failed with exit code {result.returncode}"
                 if result.stderr:
@@ -1410,6 +1551,7 @@ class ProgressiveTrainer:
             "iteration_name": iteration_name,
             "window_number": window_number,
             "processed_cameras": list(self.processed_cameras),
+            "all_processed_cameras": list(self.all_processed_cameras),
             "unprocessed_points": list(self.unprocessed_points),
             # "processed_points": removed - only track processed_gaussians
             "trained_gaussians": list(self.trained_gaussians),
@@ -1743,7 +1885,7 @@ class ProgressiveTrainer:
                 ax.annotate(f'{cam_id}',
                            (pos[0], pos[1]),
                            xytext=(5, 5), textcoords='offset points',
-                           fontsize=8, alpha=0.6)
+                           fontsize=12, alpha=0.6)
 
             # Plot convex hull
             if len(all_positions) >= 3:
@@ -1779,15 +1921,30 @@ class ProgressiveTrainer:
                            fontsize=10, fontweight='bold', color='red',
                            bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
 
-            # Plot global mean F
-            F = self.window_selector.F
-            ax.scatter(F[0], F[1],
-                      c='green', s=200, marker='x', linewidths=3,
-                      label='Global Mean (F)', zorder=7)
-            ax.annotate('F (Global Mean)',
-                       (F[0], F[1]),
-                       xytext=(10, 10), textcoords='offset points',
-                       fontsize=9, color='green', fontweight='bold')
+            # Plot mean F
+            f_mode = getattr(self, 'f_mode', 'global')
+            if f_mode == 'remaining' and hasattr(self, 'current_F_remaining'):
+                # Use stored F from remaining cameras
+                F = self.current_F_remaining
+                A_count = len(self.window_selector.A)
+                ax.scatter(F[0], F[1],
+                          c='green', s=200, marker='x', linewidths=3,
+                          label=f'Remaining Mean (F, n={A_count})', zorder=7)
+                ax.annotate(f'F (Remaining Mean, n={A_count})',
+                           (F[0], F[1]),
+                           xytext=(10, 10), textcoords='offset points',
+                           fontsize=9, color='green', fontweight='bold')
+            elif f_mode == 'global':
+                # Use pre-calculated global mean
+                F = self.window_selector.F
+                if F is not None:
+                    ax.scatter(F[0], F[1],
+                              c='green', s=200, marker='x', linewidths=3,
+                              label='Global Mean (F)', zorder=7)
+                    ax.annotate('F (Global Mean)',
+                               (F[0], F[1]),
+                               xytext=(10, 10), textcoords='offset points',
+                               fontsize=9, color='green', fontweight='bold')
 
             # Plot window mean P
             ax.scatter(P[0], P[1],
@@ -1973,7 +2130,7 @@ class ProgressiveTrainer:
                 ax.annotate(f'{cam_id}',
                            (pos[0], pos[1]),
                            xytext=(5, 5), textcoords='offset points',
-                           fontsize=8, alpha=0.6)
+                           fontsize=12, alpha=0.6)
 
             # Plot cameras in A (remaining) with different marker
             A_cam_ids = list(self.window_selector.A)
@@ -1994,7 +2151,7 @@ class ProgressiveTrainer:
             if len(D_positions) == 2:
                 # Two cameras: draw a line between them
                 ax.plot(D_positions[:, 0], D_positions[:, 1],
-                       'r--', linewidth=2, alpha=0.5,
+                       'c--', linewidth=2, alpha=0.6,
                        label='Window D Extent', zorder=5)
             elif len(D_positions) >= 3:
                 # Three or more cameras: draw convex hull
@@ -2003,11 +2160,11 @@ class ProgressiveTrainer:
                 # Plot hull polygon
                 for simplex in hull.simplices:
                     ax.plot(D_positions[simplex, 0], D_positions[simplex, 1],
-                           'r--', linewidth=2, alpha=0.5, zorder=5)
+                           'c--', linewidth=2, alpha=0.6, zorder=5)
                 # Fill hull area
                 hull_points = D_positions[hull.vertices]
                 ax.fill(hull_points[:, 0], hull_points[:, 1],
-                       color='red', alpha=0.1, label='Window D Convex Hull', zorder=4)
+                       color='cyan', alpha=0.15, label='Window D Convex Hull', zorder=4)
 
             # Annotate D camera IDs
             for cam_id in D_cam_ids:
@@ -2018,11 +2175,22 @@ class ProgressiveTrainer:
                            fontsize=9, fontweight='bold', color='red',
                            bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
 
-            # Plot global mean F
-            F = self.window_selector.F
-            ax.scatter(F[0], F[1],
-                      c='green', s=200, marker='x', linewidths=3,
-                      label='Global Mean (F)', zorder=7)
+            # Plot mean F
+            f_mode = getattr(self, 'f_mode', 'global')
+            if f_mode == 'remaining' and hasattr(self, 'current_F_remaining'):
+                # Use stored F from remaining cameras
+                F = self.current_F_remaining
+                A_count = len(self.window_selector.A)
+                ax.scatter(F[0], F[1],
+                          c='green', s=200, marker='x', linewidths=3,
+                          label=f'Remaining Mean (F, n={A_count})', zorder=7)
+            elif f_mode == 'global':
+                # Use pre-calculated global mean
+                F = self.window_selector.F
+                if F is not None:
+                    ax.scatter(F[0], F[1],
+                              c='green', s=200, marker='x', linewidths=3,
+                              label='Global Mean (F)', zorder=7)
 
             # Plot window mean P
             ax.scatter(P[0], P[1],
@@ -2101,23 +2269,30 @@ class ProgressiveTrainer:
         print("="*60)
 
         # Validate and adjust max_window_size if needed
+        print(f"\n🔍 [MAX_WINDOW_SIZE DEBUG] Initializing max_window_size...")
         max_window_size = getattr(self, 'max_window_size', None)
+        print(f"   [DEBUG] Initial self.max_window_size = {max_window_size}")
+        print(f"   [DEBUG] self.initial_cameras = {self.initial_cameras}")
 
         # Treat negative values as unlimited
         if max_window_size is not None and max_window_size < 0:
             print(f"\n   max_window_size is negative ({max_window_size}), treating as unlimited")
             self.max_window_size = None
             max_window_size = None
+            print(f"   [DEBUG] After negative check: self.max_window_size = {self.max_window_size}")
         elif max_window_size is not None and max_window_size < self.initial_cameras:
             print(f"\n⚠️  Warning: max_window_size ({max_window_size}) is less than initial_cameras ({self.initial_cameras})")
             print(f"   Adjusting max_window_size to {self.initial_cameras} to allow initial window creation")
             self.max_window_size = self.initial_cameras
             max_window_size = self.initial_cameras
+            print(f"   [DEBUG] After adjustment: self.max_window_size = {self.max_window_size}")
 
         if max_window_size is not None:
-            print(f"   Max window size: {max_window_size} cameras")
+            print(f"   ✅ Max window size: {max_window_size} cameras")
+            print(f"   [DEBUG] self.max_window_size is SET and will be checked in each window")
         else:
-            print(f"   Max window size: Unlimited")
+            print(f"   ✅ Max window size: Unlimited")
+            print(f"   [DEBUG] self.max_window_size is None (unlimited)")
 
         # Step 1: Compute camera footprints
         self.compute_camera_footprints()
@@ -2132,15 +2307,18 @@ class ProgressiveTrainer:
             camera_positions[img_id] = np.array([pos[0], pos[1]])  # Take only (x, y)
 
         # Create WindowSelector
+        f_mode = getattr(self, 'f_mode', 'global')
         self.window_selector = WindowSelector(
             camera_positions=camera_positions,
-            camera_footprints=self.camera_footprints
+            camera_footprints=self.camera_footprints,
+            f_mode=f_mode
         )
 
         print(f"\n✅ WindowSelector initialized:")
         print(f"   Total cameras: {len(camera_positions)}")
         print(f"   Initial cameras: {self.initial_cameras}")
         print(f"   Footprints available: {len(self.camera_footprints)}")
+        print(f"   F mode: {f_mode}")
 
         # Initialize sliding window global state
         all_camera_ids = sorted(self.images.keys())
@@ -2229,6 +2407,9 @@ class ProgressiveTrainer:
         # Store current window cameras for next iteration
         self.prev_window_cameras = list(window_cameras)
 
+        # Track all cameras that have ever been in any window
+        self.all_processed_cameras = set(window_cameras)  # All cameras ever in any window (starts with initial window)
+
         self.train_grendel_gs(dataset, -1, -1, iterations_per_window, "initial",sliding_window=True)
 
         print("="*80)
@@ -2253,25 +2434,69 @@ class ProgressiveTrainer:
         # yy = P (initial window mean), R = [0, 0] (no direction yet)
 
         # Initialize F (global mean)
-        F = self.window_selector.F
-        print(f"\n     [9] Using projection-based E selection (unified with Window 2+)")
-        print(f"         F (global mean): ({F[0]:.3f}, {F[1]:.3f})")
+        f_mode = getattr(self, 'f_mode', 'global')
+        if f_mode == 'remaining':
+            # Dynamic F: Use only remaining cameras in A
+            A_positions = np.array([camera_positions[cam_id] for cam_id in self.window_selector.A])
+            F = np.mean(A_positions, axis=0)
+            self.current_F_remaining = F  # Store for visualization
+            print(f"\n     [9] Using projection-based E selection (unified with Window 2+)")
+            print(f"         F mode: 'remaining' (mean of {len(self.window_selector.A)} cameras in A): ({F[0]:.3f}, {F[1]:.3f})")
+        else:
+            # Static F: Use all cameras (original behavior)
+            F = self.window_selector.F
+            print(f"\n     [9] Using projection-based E selection (unified with Window 2+)")
+            print(f"         F mode: 'global' (mean of all cameras): ({F[0]:.3f}, {F[1]:.3f})")
         print(f"         P (initial window mean): ({P[0]:.3f}, {P[1]:.3f})")
 
         # Step 9.1: Find cameras in A that intersect with Z
+        intersection_threshold = getattr(self, 'footprint_intersection_threshold', 0.0)
         print(f"\n     [9.1] Finding cameras in A that intersect with Z...")
+        print(f"         Intersection threshold: {intersection_threshold:.2f}")
         S = set()
         if Z is not None:
+            Z_area = Z.area
             for cam_id in self.window_selector.A:
                 if cam_id in self.camera_footprints:
                     footprint_coords = self.camera_footprints[cam_id]
                     from shapely.geometry import Polygon
                     footprint_polygon = Polygon(footprint_coords)
+
+                    # Check if footprints intersect
                     if footprint_polygon.intersects(Z):
-                        S.add(cam_id)
+                        # If threshold > 0, check intersection area ratio
+                        if intersection_threshold > 0.0:
+                            intersection = footprint_polygon.intersection(Z)
+                            intersection_area = intersection.area
+                            candidate_area = footprint_polygon.area
+                            ratio = intersection_area / candidate_area if candidate_area > 0 else 0.0
+
+                            if ratio >= intersection_threshold:
+                                S.add(cam_id)
+                                if self.debug:
+                                    print(f"         Camera {cam_id}: intersection ratio = {ratio:.3f} >= {intersection_threshold:.2f} ✓")
+                            else:
+                                if self.debug:
+                                    print(f"         Camera {cam_id}: intersection ratio = {ratio:.3f} < {intersection_threshold:.2f} ✗")
+                        else:
+                            # No threshold, just check intersection
+                            S.add(cam_id)
 
         print(f"         Cameras intersecting with Z: {len(S)}")
         print(f"         S = {sorted(S)}")
+
+        # DEBUG: Exit after showing intersection filtering results
+        if intersection_threshold > 0.0:
+            print("\n" + "="*80)
+            print("✅ INTERSECTION FILTERING TEST COMPLETED (Window 1)")
+            print(f"   Current window D: {window_cameras}")
+            print(f"   Threshold: {intersection_threshold:.2f}")
+            print(f"   Total cameras in A: {len(self.window_selector.A)}")
+            print(f"   Cameras passing filter: {len(S)}")
+            print(f"   Filtered cameras: {sorted(S)}")
+            print("="*80)
+            #import sys
+            #sys.exit(0)
 
         if len(S) == 0:
             print("  ❌ Error: No cameras intersecting with Z. Stopping.")
@@ -2283,32 +2508,141 @@ class ProgressiveTrainer:
         print(f"\n     [9.2] Window 1: Using all intersecting cameras (no direction filtering)")
         print(f"         X = {sorted(X)}")
 
-        # Step 9.3: Find E (maximum projection from F along P direction)
-        print(f"\n     [9.3] Finding camera E (maximum projection from F along P direction)...")
-        yy_direction = P - F  # Direction from F to initial window mean
-        yy_direction_norm = yy_direction / np.linalg.norm(yy_direction)
-        print(f"         yy direction (P - F): ({yy_direction[0]:.3f}, {yy_direction[1]:.3f})")
+        # Step 9.3: Find E using selected strategy
+        print(f"\n     [9.3] Finding camera E using '{e_strategy}' strategy...")
 
-        max_projection = -float('inf')
-        E_cam_id = None
-        for xx_cam_id in X:
-            xx_pos = camera_positions[xx_cam_id]
-            xx_direction = xx_pos - F
-            projection = np.dot(xx_direction, yy_direction_norm)
+        # Check if we should use balanced_smooth_trajectory
+        if e_strategy == 'balanced_smooth_trajectory':
+            # Use balanced_smooth_trajectory for Window 1
+            # Note: smooth_window and smooth_camera scores will be 0 (no history yet)
 
-            if projection > max_projection:
-                max_projection = projection
-                E_cam_id = xx_cam_id
+            # Get weights
+            outward_weight = getattr(self, 'e_outward_weight', 0.04)
+            compact_weight = getattr(self, 'e_compact_weight', 2.5)
+            smooth_window_weight = getattr(self, 'e_smooth_window_weight', 2.8)
+            smooth_camera_weight = getattr(self, 'e_smooth_camera_weight', 0.7)
+            distance_weight = getattr(self, 'e_distance_weight', 0.5)
+            directional_weight = getattr(self, 'e_directional_weight', 0.0)
 
-            print(f"         Camera {xx_cam_id}: projection={projection:.3f}")
+            print(f"            Strategy: balanced_smooth_trajectory")
+            print(f"            Weights: outward={outward_weight:.2f}, compact={compact_weight:.2f}, "
+                  f"smooth_win={smooth_window_weight:.2f}, smooth_cam={smooth_camera_weight:.2f}, "
+                  f"distance={distance_weight:.2f}, directional={directional_weight:.2f}")
+            print(f"            F (dynamic): ({F[0]:.3f}, {F[1]:.3f})")
+            print(f"            Note: Window 1 has no history, so smooth scores will be 0")
 
-        if E_cam_id is None:
-            print("  ❌ Error: Could not find camera E. Stopping.")
-            return
+            # Build arrays for vectorized calculation
+            all_cam_ids = sorted(camera_positions.keys())
+            positions_array = np.array([camera_positions[cam_id] for cam_id in all_cam_ids])
+            cam_id_to_idx = {cam_id: idx for idx, cam_id in enumerate(all_cam_ids)}
 
-        E_pos = camera_positions[E_cam_id]
-        print(f"\n         Selected E: camera {E_cam_id} at ({E_pos[0]:.3f}, {E_pos[1]:.3f})")
-        print(f"         Maximum projection from F: {max_projection:.3f}")
+            # Current window D indices (Window 1 uses window_cameras)
+            D_array_indices = [cam_id_to_idx[cam_id] for cam_id in window_cameras]
+            window_size = max_window_size  # Use max_window_size, not current size
+
+            # Convert initial_window_cam_ids to array indices
+            initial_window_array_indices = [cam_id_to_idx[cam_id] for cam_id in self.initial_window_cam_ids] if hasattr(self, 'initial_window_cam_ids') else None
+
+            # For Window 1: no previous history
+            prev_window_center = None
+            prev_movement = None
+            last_added_array_idx = None
+            second_last_added_array_idx = None
+
+            # Calculate scores for all candidates
+            scores = []
+            max_score = -float('inf')
+            E_cam_id = None
+
+            # Create reverse mapping: array_idx -> cam_id
+            idx_to_cam_id = {idx: cam_id for cam_id, idx in cam_id_to_idx.items()}
+
+            for xx_cam_id in X:
+                xx_array_idx = cam_id_to_idx[xx_cam_id]
+
+                # Enable debug for specific cameras (21, 35) to diagnose compact score differences
+                enable_debug = (xx_cam_id in [21, 35])
+
+                # Calculate 6-force score
+                total_score, outward_score, compact_score, smooth_window_score, smooth_camera_score, distance_score, directional_score, D_prime_center, variance = \
+                    calculate_balanced_smooth_score(
+                        xx_array_idx, D_array_indices, positions_array, F,
+                        prev_window_center, prev_movement, window_size,
+                        outward_weight, compact_weight, smooth_window_weight, smooth_camera_weight, distance_weight, directional_weight,
+                        last_added_array_idx, second_last_added_array_idx, initial_window_array_indices,
+                        debug=enable_debug, candidate_cam_id=xx_cam_id,
+                        D_cam_ids=window_cameras, idx_to_cam_id=idx_to_cam_id
+                    )
+
+                scores.append((xx_cam_id, total_score, outward_score, compact_score,
+                              smooth_window_score, smooth_camera_score, distance_score, directional_score, variance))
+
+                if total_score > max_score:
+                    max_score = total_score
+                    E_cam_id = xx_cam_id
+
+            # Print ALL candidates with their scores
+            print(f"\n" + "="*80)
+            print(f"📊 WINDOW 1 CANDIDATE SCORES (total={len(scores)} candidates)")
+            print("="*80)
+            print(f"Weights applied: outward={outward_weight}, compact={compact_weight}, "
+                  f"smooth_win={smooth_window_weight}, smooth_cam={smooth_camera_weight}, "
+                  f"distance={distance_weight}, directional={directional_weight}")
+            print("="*80)
+
+            sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
+            for rank, (cam_id, total, outward, compact, smooth_win, smooth_cam, dist, direc, var) in enumerate(sorted_scores, 1):
+                cam_pos = camera_positions[cam_id]
+                selected_marker = "✓ SELECTED" if cam_id == E_cam_id else ""
+                print(f"  [{rank:2d}] Camera {cam_id:3d}: total={total:7.4f} | "
+                      f"outward={outward:7.3f} | compact={compact:.3f} | "
+                      f"smooth_win={smooth_win:.3f} | smooth_cam={smooth_cam:.3f} | "
+                      f"dist={dist:.3f} | direc={direc:.3f} | var={var:6.2f} {selected_marker}")
+
+            print("="*80)
+            print(f"🎯 SELECTED: Camera {E_cam_id} with total score {max_score:.4f}")
+            print("="*80)
+
+            # Exit immediately after Window 1 if camera 21 or 35 is selected
+            if E_cam_id in [21, 35]:
+                print(f"\n✅ Window 1 selected Camera {E_cam_id} (21 or 35). Exiting as requested.")
+                #import sys
+                #sys.exit(0)
+
+            if E_cam_id is None:
+                print("  ❌ Error: Could not find camera E. Stopping.")
+                return
+
+            E_pos = camera_positions[E_cam_id]
+            print(f"\n         Selected E: camera {E_cam_id} at ({E_pos[0]:.3f}, {E_pos[1]:.3f})")
+
+        else:
+            # Default: Simple projection-based selection
+            print(f"            Using simple projection (default strategy)")
+            yy_direction = P - F  # Direction from F to initial window mean
+            yy_direction_norm = yy_direction / np.linalg.norm(yy_direction)
+            print(f"            yy direction (P - F): ({yy_direction[0]:.3f}, {yy_direction[1]:.3f})")
+
+            max_projection = -float('inf')
+            E_cam_id = None
+            for xx_cam_id in X:
+                xx_pos = camera_positions[xx_cam_id]
+                xx_direction = xx_pos - F
+                projection = np.dot(xx_direction, yy_direction_norm)
+
+                if projection > max_projection:
+                    max_projection = projection
+                    E_cam_id = xx_cam_id
+
+                print(f"         Camera {xx_cam_id}: projection={projection:.3f}")
+
+            if E_cam_id is None:
+                print("  ❌ Error: Could not find camera E. Stopping.")
+                return
+
+            E_pos = camera_positions[E_cam_id]
+            print(f"\n         Selected E: camera {E_cam_id} at ({E_pos[0]:.3f}, {E_pos[1]:.3f})")
+            print(f"         Maximum projection from F: {max_projection:.3f}")
 
         print(f"\n  ✅ Step 9 completed:")
         print(f"     E camera ID: {E_cam_id}")
@@ -2342,6 +2676,9 @@ class ProgressiveTrainer:
 
         # Step 12: A = A - E
         self.window_selector.A.discard(E_cam_id)
+
+        # NOTE: Do NOT add E to all_processed_cameras yet - it hasn't been trained!
+        # It will be added after training completes.
 
         print(f"\n  ✅ Steps 11-12 completed:")
         print(f"     D before: {window_cameras} (size: {len(window_cameras)})")
@@ -2399,22 +2736,41 @@ class ProgressiveTrainer:
             memory_exceeded = peak_usage_ratio >= camera_removal_threshold
 
         # Check max_window_size
+        print(f"\n  " + "="*80)
+        print(f"  🔍 [MAX_WINDOW_SIZE DEBUG] Checking window size...")
+        print(f"  " + "="*80)
+
         max_window_size = getattr(self, 'max_window_size', None)
+        print(f"  [DEBUG] self.max_window_size = {max_window_size}")
+        print(f"  [DEBUG] D_cam_ids = {D_cam_ids}")
+        print(f"  [DEBUG] len(D_cam_ids) = {len(D_cam_ids)}")
+
         window_size_exceeded = False
         if max_window_size is not None:
             current_window_size = len(D_cam_ids)
             print(f"\n  📊 Window Size Check:")
             print(f"     Max window size: {max_window_size}")
-            print(f"     Current window size: {current_window_size}")
+            print(f"     Current window size (after adding E): {current_window_size}")
+            print(f"     D_cam_ids: {D_cam_ids}")
+            print(f"     Checking: {current_window_size} > {max_window_size}")
             window_size_exceeded = current_window_size > max_window_size
+            print(f"     Result: window_size_exceeded = {window_size_exceeded}")
             if window_size_exceeded:
-                print(f"     ⚠️  Window size limit exceeded!")
+                print(f"     ⚠️  Window size limit EXCEEDED! ({current_window_size} > {max_window_size})")
+            else:
+                print(f"     ✓ Window size OK ({current_window_size} <= {max_window_size})")
         else:
             print(f"\n  📊 Window Size Check:")
             print(f"     Max window size: Not set (unlimited)")
+            print(f"     window_size_exceeded will be False")
+
+        print(f"\n  [DEBUG] Final values before removal decision:")
+        print(f"     memory_exceeded = {memory_exceeded}")
+        print(f"     window_size_exceeded = {window_size_exceeded}")
 
         # Make removal decision (remove if EITHER condition is met)
         skip_removal = not (memory_exceeded or window_size_exceeded)
+        print(f"     skip_removal = not ({memory_exceeded} or {window_size_exceeded}) = {skip_removal}")
 
         if skip_removal:
             print(f"\n  💡 Removal not needed:")
@@ -2566,9 +2922,20 @@ class ProgressiveTrainer:
         print("ALGORITHM STEP 16: Iterative Expansion Loop")
         print("="*80)
 
-        # Initialize F (global mean of all cameras in A)
-        F = self.window_selector.F
-        print(f"\n  Global mean F: ({F[0]:.3f}, {F[1]:.3f})")
+        # Initialize F (global mean)
+        f_mode = getattr(self, 'f_mode', 'global')
+        if f_mode == 'remaining':
+            # Dynamic F: Use only remaining cameras in A
+            A_positions = np.array([camera_positions[cam_id] for cam_id in self.window_selector.A])
+            F = np.mean(A_positions, axis=0)
+            self.current_F_remaining = F  # Store for visualization
+            print(f"\n  F mode: 'remaining' (dynamic, based on cameras in A)")
+            print(f"  Current F (mean of {len(self.window_selector.A)} cameras in A): ({F[0]:.3f}, {F[1]:.3f})")
+        else:
+            # Static F: Use all cameras (original behavior)
+            F = self.window_selector.F
+            print(f"\n  F mode: 'global' (static, based on all cameras)")
+            print(f"  Global mean F: ({F[0]:.3f}, {F[1]:.3f})")
 
         # Initialize camera history for momentum strategy
         self.camera_history = []
@@ -2635,9 +3002,16 @@ class ProgressiveTrainer:
                 E_footprint = Polygon(E_footprint_coords)
 
                 # Calculate previous window's footprint union (before adding E)
-                # Use prev_D_cam_ids which are the cameras used for training (before E was added)
+                # Use all_processed_cameras if use_all_processed_cameras flag is set, otherwise use prev_D_cam_ids
+                if hasattr(self, 'use_all_processed_cameras') and self.use_all_processed_cameras:
+                    cameras_to_exclude = self.all_processed_cameras
+                    print(f"     [USE_ALLPROCESSED_CAMERAS] Using all_processed_cameras ({len(cameras_to_exclude)} cameras) for visualization")
+                else:
+                    cameras_to_exclude = prev_D_cam_ids
+                    print(f"     [Visualization] Using prev_D_cam_ids ({len(cameras_to_exclude)} cameras) for visualization")
+
                 prev_window_polys = []
-                for cam_id in prev_D_cam_ids:
+                for cam_id in cameras_to_exclude:
                     if cam_id in self.camera_footprints:
                         fp_coords = self.camera_footprints[cam_id]
                         prev_window_polys.append(Polygon(fp_coords))
@@ -2705,6 +3079,11 @@ class ProgressiveTrainer:
             else:
                 print(f"\n⚠️  Warning: State file not found: {state_file}")
 
+            # Track that E camera has now been trained and processed
+            if current_E_cam_id is not None and current_E_cam_id != -1:
+                self.all_processed_cameras.add(current_E_cam_id)
+                print(f"   ✅ Added camera {current_E_cam_id} to all_processed_cameras (now {len(self.all_processed_cameras)} cameras)")
+
             print("="*80)
             print(f"✅ WINDOW_{Q:03d} COMPLETED")
             print("="*80)
@@ -2716,20 +3095,30 @@ class ProgressiveTrainer:
                 print("="*80)
                 break
 
+            # Update F based on f_mode (for 'remaining' mode, recalculate based on current A)
+            if f_mode == 'remaining':
+                A_positions = np.array([camera_positions[cam_id] for cam_id in self.window_selector.A])
+                F = np.mean(A_positions, axis=0)
+                self.current_F_remaining = F  # Store for visualization
+                print(f"\n     [F UPDATE] F (dynamic): ({F[0]:.3f}, {F[1]:.3f}) based on {len(self.window_selector.A)} cameras in A")
+
             # Step 16.4: Find cameras in A that intersect with Z
             print("\n  " + "="*80)
             print("  ALGORITHM STEP 16.4: Find Cameras in A that Intersect with Z")
             print("  " + "="*80)
 
+            intersection_threshold = getattr(self, 'footprint_intersection_threshold', 0.0)
             print(f"\n     [16.4] Finding cameras in A that intersect with footprint union Z...")
             print(f"            Z type: {Z.geom_type if Z else 'None'}")
             print(f"            A size: {len(self.window_selector.A)}")
+            print(f"            Intersection threshold: {intersection_threshold:.2f}")
 
             S = set()  # Cameras in A that intersect with Z
 
             if Z is None:
                 print("  ⚠️  Warning: Z is None. Cannot find intersecting cameras.")
             else:
+                Z_area = Z.area
                 for cam_id in self.window_selector.A:
                     if cam_id in self.camera_footprints:
                         footprint_coords = self.camera_footprints[cam_id]
@@ -2738,15 +3127,53 @@ class ProgressiveTrainer:
                         from shapely.geometry import Polygon
                         footprint_polygon = Polygon(footprint_coords)
 
-                        # Check intersection with Z
+                        # Check if footprints intersect
                         if footprint_polygon.intersects(Z):
-                            S.add(cam_id)
+                            # If threshold > 0, check intersection area ratio
+                            if intersection_threshold > 0.0:
+                                intersection = footprint_polygon.intersection(Z)
+                                intersection_area = intersection.area
+                                candidate_area = footprint_polygon.area
+                                ratio = intersection_area / candidate_area if candidate_area > 0 else 0.0
+
+                                if ratio >= intersection_threshold:
+                                    S.add(cam_id)
+                                    if self.debug:
+                                        print(f"            Camera {cam_id}: intersection ratio = {ratio:.3f} >= {intersection_threshold:.2f} ✓")
+                                else:
+                                    if self.debug:
+                                        print(f"            Camera {cam_id}: intersection ratio = {ratio:.3f} < {intersection_threshold:.2f} ✗")
+                            else:
+                                # No threshold, just check intersection
+                                S.add(cam_id)
 
             print(f"\n  ✅ Step 16.4 completed:")
+            print(f"     Current window D: {D_cam_ids}")
             print(f"     Total cameras in A: {len(self.window_selector.A)}")
             print(f"     Cameras intersecting with Z: {len(S)}")
             print(f"     S = {sorted(S)}")
             print("  " + "="*80)
+
+            # DEBUG: Exit after showing intersection filtering results for Window 2+
+            if intersection_threshold > 0.0 and iteration_count == 1:
+                print("\n" + "="*80)
+                print(f"✅ INTERSECTION FILTERING TEST COMPLETED (Window {Q})")
+                print(f"   Current window D: {D_cam_ids}")
+                if current_G_cam_id is not None:
+                    future_window_E = [c for c in D_cam_ids if c != current_G_cam_id]
+                    print(f"   FIFO removal: Camera {current_G_cam_id} will be removed")
+                    print(f"   Future window E (after FIFO): {future_window_E}")
+                    print(f"   ✅ Using E's footprint union for intersection check")
+                else:
+                    print(f"   No FIFO removal (window size < max)")
+                    print(f"   Using D's footprint union for intersection check")
+                print(f"   Threshold: {intersection_threshold:.2f}")
+                print(f"   Total cameras in A: {len(self.window_selector.A)}")
+                print(f"   Cameras passing filter: {len(S)}")
+                print(f"   Filtered cameras: {sorted(S)}")
+                print("="*80)
+                #import sys
+                #sys.exit(0)
 
             if len(S) == 0:
                 print("  ⚠️  No cameras intersecting with Z. Stopping iteration.")
@@ -2760,46 +3187,58 @@ class ProgressiveTrainer:
             print(f"\n  ✅ Step 16.5 completed: X = {X}")
             print("  " + "="*80)
 
-            # Step 16.6: Filter S by angle with R
+            # Step 16.6: Filter S by angle with R (optional)
             print("\n  " + "="*80)
             print("  ALGORITHM STEP 16.6: Filter Cameras by Direction")
             print("  " + "="*80)
 
-            print(f"\n     [16.6] Filtering cameras in S by angle with R...")
-            print(f"            Current P: ({P[0]:.3f}, {P[1]:.3f})")
-            print(f"            Direction R: ({R[0]:.3f}, {R[1]:.3f})")
+            enable_direction_filtering = getattr(self, 'enable_direction_filtering', True)
 
-            for T_cam_id in S:
-                T_pos = camera_positions[T_cam_id]
+            if enable_direction_filtering:
+                print(f"\n     [16.6] Filtering cameras in S by angle with R...")
+                print(f"            Current P: ({P[0]:.3f}, {P[1]:.3f})")
+                print(f"            Direction R: ({R[0]:.3f}, {R[1]:.3f})")
 
-                # Step 16.6.1: V = T - P
-                V = T_pos - P
+                for T_cam_id in S:
+                    T_pos = camera_positions[T_cam_id]
 
-                # Step 16.6.2: Check angle between V and R
-                # angle <= 90 degrees means forward hemisphere (same direction as R)
-                # This is equivalent to dot(V, R) >= 0
-                dot_product = np.dot(V, R)
-                V_norm = np.linalg.norm(V)
-                R_norm = np.linalg.norm(R)
+                    # Step 16.6.1: V = T - P
+                    V = T_pos - P
 
-                if V_norm > 0 and R_norm > 0:
-                    cos_angle = np.clip(dot_product / (V_norm * R_norm), -1.0, 1.0)
-                    angle_deg = np.degrees(np.arccos(cos_angle))
+                    # Step 16.6.2: Check angle between V and R
+                    # angle <= 90 degrees means forward hemisphere (same direction as R)
+                    # This is equivalent to dot(V, R) >= 0
+                    dot_product = np.dot(V, R)
+                    V_norm = np.linalg.norm(V)
+                    R_norm = np.linalg.norm(R)
 
-                    if angle_deg <= 90:  # Forward hemisphere only
-                        X.add(T_cam_id)
-                        print(f"            Camera {T_cam_id}: angle={angle_deg:.1f}° → Added to X")
-                    else:
-                        print(f"            Camera {T_cam_id}: angle={angle_deg:.1f}° → Rejected (backward)")
+                    if V_norm > 0 and R_norm > 0:
+                        cos_angle = np.clip(dot_product / (V_norm * R_norm), -1.0, 1.0)
+                        angle_deg = np.degrees(np.arccos(cos_angle))
 
-            print(f"\n  ✅ Step 16.6 completed:")
-            print(f"     Cameras in X (forward direction): {len(X)}")
-            print(f"     X = {sorted(X)}")
-            print("  " + "="*80)
+                        if angle_deg <= 90:  # Forward hemisphere only
+                            X.add(T_cam_id)
+                            print(f"            Camera {T_cam_id}: angle={angle_deg:.1f}° → Added to X")
+                        else:
+                            print(f"            Camera {T_cam_id}: angle={angle_deg:.1f}° → Rejected (backward)")
 
-            if len(X) == 0:
-                print("  ⚠️  No cameras in forward direction. Stopping iteration.")
-                break
+                print(f"\n  ✅ Step 16.6 completed:")
+                print(f"     Cameras in X (forward direction): {len(X)}")
+                print(f"     X = {sorted(X)}")
+                print("  " + "="*80)
+
+                if len(X) == 0:
+                    print("  ⚠️  No cameras in forward direction. Stopping iteration.")
+                    break
+            else:
+                # Skip direction filtering, use all cameras in S
+                X = S.copy()
+                print(f"\n     [16.6] Direction filtering DISABLED")
+                print(f"            Using all cameras in S (no angle filtering)")
+                print(f"\n  ✅ Step 16.6 completed:")
+                print(f"     X = S (all {len(X)} cameras in S)")
+                print(f"     X = {sorted(X)}")
+                print("  " + "="*80)
 
             # Step 16.7: Find E (maximum projection from F along computed direction)
             print("\n  " + "="*80)
@@ -2987,12 +3426,13 @@ class ProgressiveTrainer:
                 use_score_selection = True
 
             elif e_strategy == 'balanced_smooth_trajectory':
-                # Balanced Smooth Trajectory: 5-force camera selection
+                # Balanced Smooth Trajectory: 6-force camera selection
                 # 1. Outward: Window center moves away from F
                 # 2. Compact: Window radius minimization
                 # 3. Smooth Window: Window center trajectory continuity
                 # 4. Smooth Camera: Camera addition trajectory continuity
                 # 5. Distance: Candidate close to current window center
+                # 6. Directional Alignment: Candidate aligns with window movement direction
 
                 # Get weights (with defaults matching visualization)
                 outward_weight = getattr(self, 'e_outward_weight', 0.04)
@@ -3000,11 +3440,12 @@ class ProgressiveTrainer:
                 smooth_window_weight = getattr(self, 'e_smooth_window_weight', 2.8)
                 smooth_camera_weight = getattr(self, 'e_smooth_camera_weight', 0.7)
                 distance_weight = getattr(self, 'e_distance_weight', 0.5)
+                directional_weight = getattr(self, 'e_directional_weight', 0.0)
 
                 print(f"            Strategy: balanced_smooth_trajectory")
                 print(f"            Weights: outward={outward_weight:.2f}, compact={compact_weight:.2f}, "
                       f"smooth_win={smooth_window_weight:.2f}, smooth_cam={smooth_camera_weight:.2f}, "
-                      f"distance={distance_weight:.2f}")
+                      f"distance={distance_weight:.2f}, directional={directional_weight:.2f}")
 
                 # Initialize history tracking if needed
                 if not hasattr(self, 'balanced_window_center_history'):
@@ -3014,7 +3455,7 @@ class ProgressiveTrainer:
 
                 # Get current window D
                 D_indices = list(D_cam_ids)
-                window_size = len(D_indices)
+                window_size = max_window_size  # Use max_window_size, not current size
 
                 # Previous window center and movement
                 prev_window_center = None
@@ -3041,6 +3482,16 @@ class ProgressiveTrainer:
                 # Convert D_indices and X to array indices
                 D_array_indices = [cam_id_to_idx[cam_id] for cam_id in D_indices]
 
+                # Convert initial_window_cam_ids to array indices
+                initial_window_array_indices = [cam_id_to_idx[cam_id] for cam_id in self.initial_window_cam_ids] if hasattr(self, 'initial_window_cam_ids') else None
+
+                # Update F based on f_mode (for 'remaining' mode, recalculate based on current A)
+                if f_mode == 'remaining':
+                    A_positions = np.array([camera_positions[cam_id] for cam_id in self.window_selector.A])
+                    F = np.mean(A_positions, axis=0)
+                    self.current_F_remaining = F  # Store for visualization
+                    print(f"            F (dynamic): ({F[0]:.3f}, {F[1]:.3f}) based on {len(self.window_selector.A)} cameras in A")
+
                 # Score calculation for each candidate (NO hard filtering - outward is just a weighted component)
                 print(f"            Evaluating all {len(X)} candidates in X (no hard filtering)")
                 max_score = -float('inf')
@@ -3051,20 +3502,28 @@ class ProgressiveTrainer:
                 last_added_array_idx = cam_id_to_idx[last_added_idx] if last_added_idx is not None else None
                 second_last_added_array_idx = cam_id_to_idx[second_last_added_idx] if second_last_added_idx is not None else None
 
+                # Create reverse mapping: array_idx -> cam_id
+                idx_to_cam_id = {idx: cam_id for cam_id, idx in cam_id_to_idx.items()}
+
                 for xx_cam_id in X:
                     xx_array_idx = cam_id_to_idx[xx_cam_id]
 
-                    # Calculate 5-force score
-                    total_score, outward_score, compact_score, smooth_window_score, smooth_camera_score, distance_score, D_prime_center, variance = \
+                    # Enable debug for specific cameras (21, 35) to diagnose compact score differences
+                    enable_debug = (xx_cam_id in [21, 35])
+
+                    # Calculate 6-force score
+                    total_score, outward_score, compact_score, smooth_window_score, smooth_camera_score, distance_score, directional_score, D_prime_center, variance = \
                         calculate_balanced_smooth_score(
                             xx_array_idx, D_array_indices, positions_array, F,
                             prev_window_center, prev_movement, window_size,
-                            outward_weight, compact_weight, smooth_window_weight, smooth_camera_weight, distance_weight,
-                            last_added_array_idx, second_last_added_array_idx
+                            outward_weight, compact_weight, smooth_window_weight, smooth_camera_weight, distance_weight, directional_weight,
+                            last_added_array_idx, second_last_added_array_idx, initial_window_array_indices,
+                            debug=enable_debug, candidate_cam_id=xx_cam_id,
+                            D_cam_ids=window_cameras, idx_to_cam_id=idx_to_cam_id
                         )
 
                     scores.append((xx_cam_id, total_score, outward_score, compact_score,
-                                  smooth_window_score, smooth_camera_score, distance_score, variance))
+                                  smooth_window_score, smooth_camera_score, distance_score, directional_score, variance))
 
                     if total_score > max_score:
                         max_score = total_score
@@ -3077,17 +3536,17 @@ class ProgressiveTrainer:
                 print("="*80)
                 print(f"Weights applied: outward={outward_weight}, compact={compact_weight}, "
                       f"smooth_win={smooth_window_weight}, smooth_cam={smooth_camera_weight}, "
-                      f"distance={distance_weight}")
+                      f"distance={distance_weight}, directional={directional_weight}")
                 print("="*80)
 
                 sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
-                for rank, (cam_id, total, outward, compact, smooth_win, smooth_cam, dist, var) in enumerate(sorted_scores, 1):
+                for rank, (cam_id, total, outward, compact, smooth_win, smooth_cam, dist, direc, var) in enumerate(sorted_scores, 1):
                     cam_pos = camera_positions[cam_id]
                     selected_marker = "✓ SELECTED" if cam_id == next_E_cam_id else ""
                     print(f"  [{rank:2d}] Camera {cam_id:3d}: total={total:7.4f} | "
                           f"outward={outward:7.3f} | compact={compact:.3f} | "
                           f"smooth_win={smooth_win:.3f} | smooth_cam={smooth_cam:.3f} | "
-                          f"dist={dist:.3f} | var={var:6.2f} {selected_marker}")
+                          f"dist={dist:.3f} | direc={direc:.3f} | var={var:6.2f} {selected_marker}")
 
                 print("="*80)
                 print(f"🎯 SELECTED: Camera {next_E_cam_id} with total score {max_score:.4f}")
@@ -3097,12 +3556,13 @@ class ProgressiveTrainer:
                 print("\n" + "="*80)
                 print("🛑 WEIGHT VERIFICATION COMPLETE - EXITING")
                 print("="*80)
-                print("This confirms all 5 weights are applied:")
+                print("This confirms all 6 weights are applied:")
                 print(f"  - Outward weight:       {outward_weight}")
                 print(f"  - Compact weight:       {compact_weight}")
                 print(f"  - Smooth window weight: {smooth_window_weight}")
                 print(f"  - Smooth camera weight: {smooth_camera_weight}")
                 print(f"  - Distance weight:      {distance_weight}")
+                print(f"  - Directional weight:   {directional_weight}")
                 print("="*80)
                 print("Remove this sys.exit(0) to continue training")
                 print("="*80)
@@ -3155,7 +3615,10 @@ class ProgressiveTrainer:
 
             next_E_pos = camera_positions[next_E_cam_id]
             print(f"\n            Selected E: camera {next_E_cam_id} at ({next_E_pos[0]:.3f}, {next_E_pos[1]:.3f})")
-            print(f"            Maximum projection from F: {max_projection:.3f}")
+
+            # Only print max_projection if it was calculated (projection-based selection)
+            if 'max_projection' in locals():
+                print(f"            Maximum projection from F: {max_projection:.3f}")
 
             print(f"\n  ✅ Step 16.7 completed:")
             print(f"     E camera ID: {next_E_cam_id}")
@@ -3191,6 +3654,10 @@ class ProgressiveTrainer:
             print(f"\n     [16.9] Adding E to D...")
             print(f"            D before: {D_cam_ids} (size: {len(D_cam_ids)})")
             D_cam_ids.append(next_E_cam_id)
+
+            # NOTE: Do NOT add next_E to all_processed_cameras yet - it hasn't been trained!
+            # It will be added after training completes in the next iteration.
+
             print(f"            D after: {D_cam_ids} (size: {len(D_cam_ids)})")
 
             print(f"\n  ✅ Step 16.9 completed")
@@ -3209,35 +3676,79 @@ class ProgressiveTrainer:
             print(f"\n  ✅ Step 16.10 completed")
             print("  " + "="*80)
 
-            # Step 16.10.5: Check if camera removal is needed based on memory
+            # Step 16.10.5: Check if camera removal is needed based on memory + window size
             print("\n  " + "="*80)
-            print("  MEMORY-BASED REMOVAL DECISION")
+            print("  🔍 [STEP 16.10.5] REMOVAL DECISION (Memory + Window Size)")
             print("  " + "="*80)
 
-            # Handle None densify_memory_limit_percentage (commit 9384129 compatibility)
+            # Check memory condition
+            memory_exceeded = False
             if self.densify_memory_limit_percentage is None:
                 print(f"\n     ⚠️  Warning: densify_memory_limit_percentage is None")
-                print(f"        Assuming no memory limit, will not remove camera")
-                skip_removal = True
-                next_G_cam_id = None
+                print(f"        Assuming no memory limit")
+                memory_exceeded = False
             else:
                 camera_removal_threshold = self.densify_memory_limit_percentage - self.camera_removal_margin
-                print(f"\n     Densify limit: {self.densify_memory_limit_percentage*100:.1f}%")
-                print(f"     Removal margin: {self.camera_removal_margin*100:.1f}%")
-                print(f"     Removal threshold: {camera_removal_threshold*100:.1f}%")
-                print(f"     Current peak usage: {peak_usage_ratio*100:.1f}%")
+                print(f"\n     📊 Memory Check:")
+                print(f"        Densify limit: {self.densify_memory_limit_percentage*100:.1f}%")
+                print(f"        Removal margin: {self.camera_removal_margin*100:.1f}%")
+                print(f"        Removal threshold: {camera_removal_threshold*100:.1f}%")
+                print(f"        Current peak usage: {peak_usage_ratio*100:.1f}%")
+                memory_exceeded = peak_usage_ratio >= camera_removal_threshold
+                print(f"        Result: memory_exceeded = {memory_exceeded}")
 
-                skip_removal = peak_usage_ratio < camera_removal_threshold
+            # Check window size condition
+            print(f"\n     🔍 [MAX_WINDOW_SIZE DEBUG] Checking window size in Step 16 loop...")
+            max_window_size = getattr(self, 'max_window_size', None)
+            print(f"        [DEBUG] self.max_window_size = {max_window_size}")
+            print(f"        [DEBUG] D_cam_ids = {D_cam_ids}")
+            print(f"        [DEBUG] len(D_cam_ids) = {len(D_cam_ids)}")
 
-                if skip_removal:
-                    print(f"\n     💡 Memory sufficient ({peak_usage_ratio*100:.1f}% < {camera_removal_threshold*100:.1f}%)")
-                    print(f"        Skipping camera removal - window will grow")
-                    next_G_cam_id = None
+            window_size_exceeded = False
+            if max_window_size is not None:
+                current_window_size = len(D_cam_ids)
+                print(f"\n     📊 Window Size Check:")
+                print(f"        Max window size: {max_window_size}")
+                print(f"        Current window size (after adding E): {current_window_size}")
+                print(f"        Checking: {current_window_size} > {max_window_size}")
+                window_size_exceeded = current_window_size > max_window_size
+                print(f"        Result: window_size_exceeded = {window_size_exceeded}")
+                if window_size_exceeded:
+                    print(f"        ⚠️  Window size limit EXCEEDED! ({current_window_size} > {max_window_size})")
                 else:
-                    print(f"\n     ⚠️  Memory threshold reached ({peak_usage_ratio*100:.1f}% >= {camera_removal_threshold*100:.1f}%)")
-                    print(f"        Camera removal required")
+                    print(f"        ✓ Window size OK ({current_window_size} <= {max_window_size})")
+            else:
+                print(f"\n     📊 Window Size Check:")
+                print(f"        Max window size: Not set (unlimited)")
+                print(f"        window_size_exceeded will be False")
 
-            print(f"\n  ✅ Memory decision completed")
+            # Make removal decision (remove if EITHER condition is met)
+            print(f"\n     [DEBUG] Final values:")
+            print(f"        memory_exceeded = {memory_exceeded}")
+            print(f"        window_size_exceeded = {window_size_exceeded}")
+            skip_removal = not (memory_exceeded or window_size_exceeded)
+            print(f"        skip_removal = not ({memory_exceeded} or {window_size_exceeded}) = {skip_removal}")
+
+            if skip_removal:
+                print(f"\n     💡 Removal not needed:")
+                if not memory_exceeded:
+                    if self.densify_memory_limit_percentage is None:
+                        print(f"        ✓ Memory limit not set")
+                    else:
+                        print(f"        ✓ Memory OK: {peak_usage_ratio*100:.1f}% < {camera_removal_threshold*100:.1f}%")
+                if max_window_size is None or not window_size_exceeded:
+                    print(f"        ✓ Window size OK: {len(D_cam_ids)} <= {max_window_size if max_window_size else 'unlimited'}")
+                print(f"        → Window will grow to {len(D_cam_ids)} cameras: {D_cam_ids}")
+                next_G_cam_id = None
+            else:
+                print(f"\n     ⚠️  Camera removal required:")
+                if memory_exceeded:
+                    print(f"        - Memory threshold reached ({peak_usage_ratio*100:.1f}% >= {camera_removal_threshold*100:.1f}%)")
+                if window_size_exceeded:
+                    print(f"        - Window size limit exceeded ({len(D_cam_ids)} > {max_window_size})")
+                print(f"        → Will remove one camera from window")
+
+            print(f"\n  ✅ Removal decision completed")
             print("  " + "="*80)
 
             # Step 16.11: Find G - only if removal needed
