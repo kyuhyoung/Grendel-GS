@@ -42,14 +42,13 @@ ITERATIONS=30000                          # Training iterations
 ITERATIONS_PER_WINDOW=12                # Iterations per sliding window
 DENSIFICATION_INTERVAL=10               # Densification every 20 iterations
 DENSIFY_FROM_ITER=5                    # Start densification from iteration 10
-CAMERA_REMOVAL_MARGIN=0.27                # Margin below densify_memory_limit for camera removal (0.99 - 0.19 = 0.80 = 80%)
+CAMERA_REMOVAL_MARGIN=0.25                # Margin below densify_memory_limit for camera removal (0.99 - 0.25 = 0.74 = 74%)
 ###
 
 DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.99    # GPU memory limit for densification (0.99 = 99%)
 #MAX_WINDOW_SIZE=""                       # Maximum window size (number of cameras). Empty = unlimited
 MAX_WINDOW_SIZE=3                       # Maximum window size (number of cameras). Empty = unlimited
-SH_DEGREE=3                              # Spherical harmonics degree
-RESOLUTION=1                             # Resolution downscaling factor
+SH_DEGREE=0                              # Spherical harmonics degree (0 for testing, less memory)
 BACKEND="gsplat"                         # Rendering backend: default or gsplat
 
 # Flags (set to "true" to enable, "false" to disable)
@@ -71,6 +70,10 @@ VISIBILITY_MARGIN=0                     # Margin in pixels for visibility-based 
 REMOVAL_STRATEGY="fifo"                 # Remove oldest camera first (predictable sliding window)
 #REMOVAL_STRATEGY="farthest"             # Remove camera farthest from newly added camera (original)
 
+# F (global center) calculation mode
+F_MODE="global"                         # Use global mean F (computed once from all cameras)
+#F_MODE="remaining"                      # Use remaining cameras mean F (recomputed each time)
+
 # E camera selection strategy (for Window 2+)
 #E_SELECTION_STRATEGY="default"          # Use (yy - F) direction only (original)
 #E_SELECTION_STRATEGY="momentum"        # Use recent camera movement momentum (smooth spiral)
@@ -89,11 +92,21 @@ E_POLAR_RADIUS_STEP=1.2                 # Radius multiplier for 'polar' strategy
 E_SPIRAL_ALPHA=0.3                      # Distance weight for 'outward_spiral_compact' strategy (낮춤 - window coherence 약하게)
 E_SPIRAL_BETA=2.0                       # Diversity weight for 'outward_spiral_compact' strategy (높임 - 나선형 강하게)
 E_SPIRAL_GAMMA=0.1                      # Variance penalty for 'outward_spiral_compact' strategy (낮춤 - window shape 덜 중요)
-E_OUTWARD_WEIGHT=0.04                   # Outward weight for 'balanced_smooth_trajectory' strategy
-E_COMPACT_WEIGHT=2.5                    # Compact weight for 'balanced_smooth_trajectory' strategy
-E_SMOOTH_WINDOW_WEIGHT=2.8              # Smooth window weight for 'balanced_smooth_trajectory' strategy
-E_SMOOTH_CAMERA_WEIGHT=0.7              # Smooth camera weight for 'balanced_smooth_trajectory' strategy
-E_DISTANCE_WEIGHT=0.5                   # Distance weight for 'balanced_smooth_trajectory' strategy (tiebreaker, not dominant)
+E_OUTWARD_WEIGHT=4.0                    # Outward weight for 'balanced_smooth_trajectory' strategy (increased for global exploration)
+E_COMPACT_WEIGHT=3.5                    # Compact weight for 'balanced_smooth_trajectory' strategy (increased to penalize high variance)
+E_SMOOTH_WINDOW_WEIGHT=2.8              # Smooth window weight for 'balanced_smooth_trajectory' strategy (maintained for trajectory smoothness)
+E_SMOOTH_CAMERA_WEIGHT=0.0              # Smooth camera weight for 'balanced_smooth_trajectory' strategy (disabled)
+E_DISTANCE_WEIGHT=1.0                   # Distance weight for 'balanced_smooth_trajectory' strategy (increased to prevent far outlier selection)
+E_DIRECTIONAL_WEIGHT=3.0                # Directional alignment weight for 'balanced_smooth_trajectory' strategy (candidate aligns with window movement direction)
+
+# Intersection and filtering options
+FOOTPRINT_INTERSECTION_THRESHOLD=0.62    # Minimum intersection area ratio (intersection/window_union) for candidate cameras (0.0-1.0, 0.0=disabled):
+#ENABLE_DIRECTION_FILTERING=true        # Filter cameras by forward direction (angle <= 90°)
+ENABLE_DIRECTION_FILTERING=false        # Disable filtering, allow all cameras in S (footprint intersection only)
+
+# Camera removal and processing options
+USE_ALL_PROCESSED_CAMERAS=true         # Use all ever-processed cameras when checking for gaussian addition (recommended)
+#USE_ALL_PROCESSED_CAMERAS=false         # Use only prev window cameras (may add duplicate gaussians)
 
 # Advanced options (leave empty if not needed)
 DTM_MODULE=""                            # Path to external DTM module
@@ -141,7 +154,6 @@ echo "  Densify From Iter: $DENSIFY_FROM_ITER"
 echo "  Densify Memory Limit: $DENSIFY_MEMORY_LIMIT_PERCENTAGE"
 echo "  Max Window Size: ${MAX_WINDOW_SIZE:-unlimited}"
 echo "  SH Degree: $SH_DEGREE"
-echo "  Resolution: $RESOLUTION"
 echo "  Backend: $BACKEND"
 echo "  Deterministic: $DETERMINISTIC"
 echo "  Debug: $DEBUG"
@@ -152,6 +164,11 @@ echo "  Track By Projection: $TRACK_BY_PROJECTION"
 echo "  Prune By Visibility: $PRUNE_BY_VISIBILITY"
 echo "  Visibility Margin: $VISIBILITY_MARGIN"
 echo "  Removal Strategy: $REMOVAL_STRATEGY"
+echo "  Camera Removal Margin: $CAMERA_REMOVAL_MARGIN"
+echo "  F Mode: $F_MODE"
+echo "  Enable Direction Filtering: $ENABLE_DIRECTION_FILTERING"
+echo "  Footprint Intersection Threshold: $FOOTPRINT_INTERSECTION_THRESHOLD"
+echo "  Use All Processed Cameras: $USE_ALL_PROCESSED_CAMERAS"
 echo "  E Selection Strategy: $E_SELECTION_STRATEGY"
 if [[ "$E_SELECTION_STRATEGY" == "weighted" ]]; then
     echo "    - Alpha (R weight): $E_WEIGHTED_ALPHA"
@@ -171,6 +188,7 @@ elif [[ "$E_SELECTION_STRATEGY" == "balanced_smooth_trajectory" ]]; then
     echo "    - Smooth window weight: $E_SMOOTH_WINDOW_WEIGHT"
     echo "    - Smooth camera weight: $E_SMOOTH_CAMERA_WEIGHT"
     echo "    - Distance weight: $E_DISTANCE_WEIGHT"
+    echo "    - Directional weight: $E_DIRECTIONAL_WEIGHT"
 fi
 if [[ -n "$DTM_MODULE" ]]; then
     echo "  DTM Module: $DTM_MODULE"
@@ -234,7 +252,6 @@ if [[ -n "$MAX_WINDOW_SIZE" ]]; then
 fi
 
 CMD="$CMD --sh-degree $SH_DEGREE"
-CMD="$CMD --resolution $RESOLUTION"
 CMD="$CMD --backend $BACKEND"
 
 # Add flags
@@ -272,6 +289,10 @@ fi
 
 if [[ -n "$REMOVAL_STRATEGY" ]]; then
     CMD="$CMD --removal_strategy $REMOVAL_STRATEGY"
+fi
+
+if [[ -n "$F_MODE" ]]; then
+    CMD="$CMD --f_mode $F_MODE"
 fi
 
 if [[ -n "$E_SELECTION_STRATEGY" ]]; then
@@ -330,8 +351,28 @@ if [[ -n "$E_DISTANCE_WEIGHT" ]]; then
     CMD="$CMD --e_distance_weight $E_DISTANCE_WEIGHT"
 fi
 
+if [[ -n "$E_DIRECTIONAL_WEIGHT" ]]; then
+    CMD="$CMD --e_directional_weight $E_DIRECTIONAL_WEIGHT"
+fi
+
+if [[ -n "$CAMERA_REMOVAL_MARGIN" ]]; then
+    CMD="$CMD --camera_removal_margin $CAMERA_REMOVAL_MARGIN"
+fi
+
+if [[ -n "$FOOTPRINT_INTERSECTION_THRESHOLD" ]]; then
+    CMD="$CMD --footprint_intersection_threshold $FOOTPRINT_INTERSECTION_THRESHOLD"
+fi
+
+if [[ "$ENABLE_DIRECTION_FILTERING" == "true" ]]; then
+    CMD="$CMD --enable_direction_filtering"
+fi
+
+if [[ "$USE_ALL_PROCESSED_CAMERAS" == "true" ]]; then
+    CMD="$CMD --use_all_processed_cameras"
+fi
+
 if [[ "$EXIT_AFTER_FIRST_REMOVAL" == "true" ]]; then
-    CMD="$CMD --exit-after-first-removal"
+    CMD="$CMD --exit_after_first_removal"
 fi
 
 # Add DTM module if specified
