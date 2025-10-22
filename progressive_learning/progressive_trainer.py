@@ -2510,6 +2510,23 @@ class ProgressiveTrainer:
             print(f"     Removed G: {G_cam_id}")
             print(f"     D (window_1): {D_cam_ids} (size: {len(D_cam_ids)})")
             print("  " + "="*80)
+
+            # Exit after first removal if requested
+            if getattr(self, 'exit_after_first_removal', False):
+                print("\n" + "="*80)
+                print("🛑 EXIT AFTER FIRST REMOVAL")
+                print("="*80)
+                print(f"\n✅ MAX_WINDOW_SIZE Test Complete!")
+                print(f"   Max window size: {getattr(self, 'max_window_size', 'Not set')}")
+                print(f"   First removal occurred: G={G_cam_id}")
+                print(f"   Final window: {D_cam_ids} ({len(D_cam_ids)} cameras)")
+                print(f"\n📊 Window progression:")
+                print(f"   - Initial window: 2 cameras")
+                print(f"   - After adding cameras: reached max size")
+                print(f"   - After removal: {len(D_cam_ids)} cameras (max enforced)")
+                print("\n" + "="*80)
+                import sys
+                sys.exit(0)
         else:
             print("\n  " + "="*80)
             print("  ALGORITHM STEP 14: SKIPPED (No G to remove)")

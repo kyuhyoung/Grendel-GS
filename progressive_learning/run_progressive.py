@@ -46,6 +46,7 @@ def main():
     parser.add_argument('--track_by_projection', action='store_true', help='Generate tracks by projection instead of using COLMAP tracks')
     parser.add_argument('--prune_by_visibility', action='store_true', help='Prune gaussians outside all camera frustums')
     parser.add_argument('--visibility_prune_margin', type=int, default=20, help='Margin in pixels for visibility-based pruning')
+    parser.add_argument('--exit_after_first_removal', action='store_true', help='Exit after first camera removal (for testing max_window_size)')
 
     args = parser.parse_args()
 
@@ -90,6 +91,7 @@ def main():
     trainer.track_by_projection = args.track_by_projection
     trainer.prune_by_visibility = args.prune_by_visibility
     trainer.visibility_prune_margin = args.visibility_prune_margin
+    trainer.exit_after_first_removal = args.exit_after_first_removal
 
     # Run the progressive training pipeline with sliding window
     try:

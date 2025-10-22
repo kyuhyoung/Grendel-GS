@@ -151,11 +151,15 @@ while [[ $# -gt 0 ]]; do
             SHOW_MEMORY_DEBUG_INFO="--show_memory_debug_info"
             shift
             ;;
+        --exit-after-first-removal)
+            EXIT_AFTER_FIRST_REMOVAL="--exit_after_first_removal"
+            shift
+            ;;
         -h|--help)
             show_usage
             exit 0
             ;;
-        --e_selection_strategy|--e_weighted_alpha|--e_weighted_beta|--e_tangential_coeff|--e_polar_angle_step|--e_polar_radius_step|--e_spiral_alpha|--e_spiral_beta|--e_spiral_gamma|--e_outward_weight|--e_compact_weight|--e_smooth_window_weight|--e_smooth_camera_weight|--e_distance_weight|--exit-after-first-removal|--track_by_projection|--prune_by_visibility|--visibility_prune_margin)
+        --e_selection_strategy|--e_weighted_alpha|--e_weighted_beta|--e_tangential_coeff|--e_polar_angle_step|--e_polar_radius_step|--e_spiral_alpha|--e_spiral_beta|--e_spiral_gamma|--e_outward_weight|--e_compact_weight|--e_smooth_window_weight|--e_smooth_camera_weight|--e_distance_weight|--track_by_projection|--prune_by_visibility|--visibility_prune_margin)
             # Ignore unsupported arguments for this commit (9384129)
             shift
             if [[ "$1" != --* ]] && [[ -n "$1" ]]; then
@@ -341,6 +345,10 @@ fi
 
 if [[ -n "$USE_CHUNK" ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --use_chunk"
+fi
+
+if [[ -n "$EXIT_AFTER_FIRST_REMOVAL" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --exit_after_first_removal"
 fi
 
 # Add any extra arguments
