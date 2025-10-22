@@ -46,8 +46,8 @@ CAMERA_REMOVAL_MARGIN=0.27                # Margin below densify_memory_limit fo
 ###
 
 DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.99    # GPU memory limit for densification (0.99 = 99%)
-MAX_WINDOW_SIZE=""                       # Maximum window size (number of cameras). Empty = unlimited
-#MAX_WINDOW_SIZE=4                       # Maximum window size (number of cameras). Empty = unlimited
+#MAX_WINDOW_SIZE=""                       # Maximum window size (number of cameras). Empty = unlimited
+MAX_WINDOW_SIZE=3                       # Maximum window size (number of cameras). Empty = unlimited
 SH_DEGREE=3                              # Spherical harmonics degree
 RESOLUTION=1                             # Resolution downscaling factor
 BACKEND="gsplat"                         # Rendering backend: default or gsplat
