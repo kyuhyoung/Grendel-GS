@@ -52,7 +52,8 @@ DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.99    # GPU memory limit for densification (0.
 # If set, removes camera when window reaches this size
 # Set to empty string "" or negative value (e.g., -1) for unlimited window size
 #MAX_WINDOW_SIZE=-1                      # Unlimited (alternative)
-MAX_WINDOW_SIZE=4                       # Example: limit to 5 cameras
+#MAX_WINDOW_SIZE=4                       # Example: limit to 5 cameras
+MAX_WINDOW_SIZE=6                       # Example: limit to 5 cameras
 
 SH_DEGREE=3                              # Spherical harmonics degree
 RESOLUTION=1                             # Resolution downscaling factor
@@ -64,8 +65,8 @@ DEBUG=true                               # Enable debug output
 EXIT_AFTER_FIRST_REMOVAL=true            # Exit after first camera removal (for testing)
 #EXIT_AFTER_FIRST_REMOVAL=false            # Exit after first camera removal (for testing)
 SHOW_MEMORY_DEBUG_INFO=false          # Show detailed memory debug info (memory, tensor stats)
-USE_CHUNK=true                           # Enable chunked SSIM for memory efficiency
-#USE_CHUNK=false                           # Enable chunked SSIM for memory efficiency
+#USE_CHUNK=true                           # Enable chunked SSIM for memory efficiency
+USE_CHUNK=false                           # Enable chunked SSIM for memory efficiency
 #ONLY_ACTUALLY_VISIBLE=false             # Only keep points visible in camera frames
 ONLY_ACTUALLY_VISIBLE=true             # Only keep points visible in camera frames (disabled when SKIP_4_FAST_DEBUG=1)
 TRACK_BY_PROJECTION=true               # Generate tracks by projection instead of using COLMAP tracks
