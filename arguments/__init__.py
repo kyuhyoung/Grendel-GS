@@ -84,6 +84,7 @@ class AuxiliaryParams(ParamGroup):
         # Progressive training parameters
         self.cams_init = ""  # Comma-separated list of initial window camera IDs
         self.cams_prev = ""  # Comma-separated list of previous window camera IDs
+        self.cams_all_processed = ""  # Comma-separated list of all cameras ever processed (for gaussian addition)
         self.cams_2_delete = ""  # Comma-separated list of camera IDs to delete from window
         self.cams_2_add = ""  # Comma-separated list of camera IDs to add to window
         self.cams_all_processed = ""  # Comma-separated list of all processed camera IDs (for USE_ALL_PROCESSED_CAMERAS)
@@ -149,7 +150,8 @@ class OptimizationParams(ParamGroup):
         #self.densify_memory_limit_percentage = 0.9 #   ori
         #self.densify_memory_limit_percentage = 0.98
         #self.densify_memory_limit_percentage = 0.999999
-        self.densify_memory_limit_percentage = 1.999999
+        #self.densify_memory_limit_percentage = 1.999999  # old (unlimited)
+        self.densify_memory_limit_percentage = 0.90  # Progressive training default
         self.disable_auto_densification = False
         self.prune_by_visibility = False  # Prune gaussians outside all camera frustums
         self.visibility_prune_margin = 20  # Margin in pixels for visibility-based pruning

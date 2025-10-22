@@ -332,42 +332,47 @@ class COLMAPVisualizer:
             print(f"  Z: [{outside_xyz[:, 2].min():.2f}, {outside_xyz[:, 2].max():.2f}]")
         
         # Track 정보와 실제 투영 가능성 비교
-        mismatch_count = 0
+        mismatch_points = set()
         for point_id, point in self.points3d.items():
             track_images = set([img_id for img_id, _ in point['track']])
             projectable = set(points_projectable.get(point_id, []))
-            
+
             # Track에는 있지만 실제로 프레임 밖인 경우
             if len(track_images - projectable) > 0:
-                mismatch_count += 1
-        
-        if mismatch_count > 0:
-            print(f"\n⚠️  WARNING: {mismatch_count} points have track info but project outside frame!")
-        
+                mismatch_points.add(point_id)
+
+        if len(mismatch_points) > 0:
+            print(f"\n⚠️  WARNING: {len(mismatch_points)} points have track info but project outside frame!")
+
         # only_actually_visible 플래그가 켜져있으면 프레임 밖 포인트 제거
-        #print(f'self.only_actually_visible : {self.only_actually_visible}, len(always_outside) : {len(always_outside)}');  exit(1) 
-        if self.only_actually_visible and len(always_outside) > 0:
-            print(f"\n🔧 Removing {len(always_outside)} points that are always outside frame...")
-            
-            # 제거 전 포인트 수
-            original_count = len(self.points3d)
-            
-            # 프레임 밖 포인트 제거
-            for point_id in always_outside:
-                if point_id in self.points3d:
-                    del self.points3d[point_id]
-            
-            # 제거 후 포인트 수
-            remaining_count = len(self.points3d)
-            print(f"   Points reduced from {original_count} to {remaining_count}")
-            
-            # 제거 후 bounding box 다시 계산
-            if remaining_count > 0:
-                remaining_xyz = np.array([p['xyz'] for p in self.points3d.values()])
-                print(f"\n   New bounding box after removal:")
-                print(f"   X: [{remaining_xyz[:, 0].min():.2f}, {remaining_xyz[:, 0].max():.2f}]")
-                print(f"   Y: [{remaining_xyz[:, 1].min():.2f}, {remaining_xyz[:, 1].max():.2f}]")
-                print(f"   Z: [{remaining_xyz[:, 2].min():.2f}, {remaining_xyz[:, 2].max():.2f}]")
+        #print(f'self.only_actually_visible : {self.only_actually_visible}, len(always_outside) : {len(always_outside)}');  exit(1)
+        if self.only_actually_visible:
+            points_to_remove = set(always_outside) | mismatch_points  # Union of both sets
+
+            if len(points_to_remove) > 0:
+                print(f"\n🔧 Removing {len(points_to_remove)} points:")
+                print(f"   - Always outside frame: {len(always_outside)}")
+                print(f"   - Track/projection mismatch: {len(mismatch_points)}")
+
+                # 제거 전 포인트 수
+                original_count = len(self.points3d)
+
+                # 프레임 밖 포인트 제거
+                for point_id in points_to_remove:
+                    if point_id in self.points3d:
+                        del self.points3d[point_id]
+
+                # 제거 후 포인트 수
+                remaining_count = len(self.points3d)
+                print(f"   Points reduced from {original_count} to {remaining_count}")
+
+                # 제거 후 bounding box 다시 계산
+                if remaining_count > 0:
+                    remaining_xyz = np.array([p['xyz'] for p in self.points3d.values()])
+                    print(f"\n   New bounding box after removal:")
+                    print(f"   X: [{remaining_xyz[:, 0].min():.2f}, {remaining_xyz[:, 0].max():.2f}]")
+                    print(f"   Y: [{remaining_xyz[:, 1].min():.2f}, {remaining_xyz[:, 1].max():.2f}]")
+                    print(f"   Z: [{remaining_xyz[:, 2].min():.2f}, {remaining_xyz[:, 2].max():.2f}]")
             
         # 카메라별 visible points 딕셔너리 생성 (points_projectable을 역변환)
         camera_visible_points = {}
@@ -1185,36 +1190,68 @@ class COLMAPVisualizer:
                              levels=50, cmap='terrain', alpha=0.8)
         
         #print('444') 
-        # 카메라 위치들 표시
+        # 카메라 위치들과 footprint 표시
         image_count = 0
+
+        # Prepare points data for footprint computation
+        if self.points3d:
+            all_points_3d = np.array([pt['xyz'] for pt in self.points3d.values()])
+            all_point_ids = list(self.points3d.keys())
+        else:
+            all_points_3d = np.array([])
+            all_point_ids = []
+
         for image_id, image in self.images.items():
             image_count += 1
-            #camera_color = colors[(image_count - 1) % len(colors)]
             camera_color = self.color_cam[image_id % len(self.color_cam)]
-            
+
+            # Get camera parameters
             camera_center = image['camera_center']
-            ax.plot(camera_center[0], camera_center[1], '^', 
-                   color=camera_color, markersize=8, alpha=0.8)
-            # 이미지 footprint
-            _, ray_dirs = self.get_camera_corners(image_id)
-            ground_points = []
-            
-            for i in range(4):
-                result = self.raycast_to_dtm(camera_center, ray_dirs[:, i])
-                if result[0] is not None:  # 성공한 경우
-                    intersection, _ = result
-                    ground_points.append(intersection[:2])  # X, Y만
-                    
-            if len(ground_points) >= 3:  # 최소 3개 점이 있으면 다각형 그리기
-                try:
-                    ground_points = np.array(ground_points)
-                    # 다각형 그리기 (카메라별 색상 사용)
-                    polygon = plt.Polygon(ground_points, fill=False, 
-                                         edgecolor=camera_color, linewidth=1, alpha=0.7)
-                    ax.add_patch(polygon)
-                except Exception as e:
-                    pass
-                    # print(f"DEBUG: Error creating polygon: {e}")
+            camera_rotation = image['R']
+            camera = self.cameras[image['camera_id']]
+
+            # Camera position marker
+            ax.plot(camera_center[0], camera_center[1], '^',
+                   color=camera_color, markersize=10, alpha=1.0,
+                   label=f'Cam {image_id}' if image_count <= 5 else "")
+
+            # Prepare camera intrinsics
+            camera_intrinsics = {
+                'fx': camera['params']['fx'],
+                'fy': camera['params']['fy'],
+                'cx': camera['params']['cx'],
+                'cy': camera['params']['cy'],
+                'width': camera['width'],
+                'height': camera['height']
+            }
+
+            # Compute footprint using the new method
+            try:
+                footprint, points_in_footprint = self.compute_camera_footprint(
+                    camera_center,
+                    camera_rotation,
+                    camera_intrinsics,
+                    all_points_3d if len(all_points_3d) > 0 else np.zeros((0, 3)),
+                    all_point_ids
+                )
+
+                # Draw footprint polygon with filled area
+                polygon = plt.Polygon(footprint,
+                                     fill=True,               # Fill the polygon
+                                     facecolor=camera_color,   # Fill color
+                                     alpha=0.2,                # Transparency for fill
+                                     edgecolor=camera_color,   # Border color
+                                     linewidth=2,              # Border width
+                                     linestyle='-')            # Solid line
+                ax.add_patch(polygon)
+
+                # Add text label near camera position
+                if image_count <= 10:  # Limit labels to avoid clutter
+                    ax.text(camera_center[0], camera_center[1], f'{image_id}',
+                           fontsize=8, ha='center', va='bottom')
+
+            except Exception as e:
+                print(f"Warning: Could not compute footprint for camera {image_id}: {e}")
         
         #print('555') 
         # Scene center 표시
@@ -1234,11 +1271,11 @@ class COLMAPVisualizer:
         # 컬러바
         plt.colorbar(contour, ax=ax, label='Elevation (m)')
         
-        #print('777') 
+        #print('777')
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
-        ax.set_title('Orthographic View from Aerial Camera')
-        ax.legend()
+        ax.set_title(f'Orthographic View with Camera Footprints ({image_count} cameras)')
+        ax.legend(loc='upper right', fontsize=8, ncol=2)
         ax.grid(True, alpha=0.3)
         ax.set_aspect('equal')
         
@@ -1613,6 +1650,97 @@ class COLMAPVisualizer:
 
         #print(f"Nadir multi view saved to {save_path}")
         #exit(1)
+
+    def compute_camera_footprint(self,
+                                camera_center: np.ndarray,
+                                camera_rotation: np.ndarray,
+                                camera_intrinsics: dict,
+                                points_3d: np.ndarray,
+                                point_ids: list) -> tuple:
+        """
+        Compute camera footprint on DTM surface from camera parameters
+
+        Args:
+            camera_center: [3] - Camera position in world coordinates (x, y, z)
+            camera_rotation: [3, 3] - Rotation matrix R (world -> camera)
+            camera_intrinsics: dict - {'fx': float, 'fy': float, 'cx': float, 'cy': float, 'width': int, 'height': int}
+            points_3d: [N, 3] - 3D point coordinates (x, y, z)
+            point_ids: [N] - Point IDs corresponding to points_3d
+
+        Returns:
+            footprint: [4, 2] - Footprint rectangle corners on DTM (x, y)
+            points_in_footprint: List[int] - Point IDs inside the footprint
+        """
+        if not hasattr(self, 'dtm'):
+            raise ValueError("DTM not created. Call create_dtm() first")
+
+        # Extract camera parameters
+        fx = camera_intrinsics['fx']
+        fy = camera_intrinsics['fy']
+        cx = camera_intrinsics['cx']
+        cy = camera_intrinsics['cy']
+        width = camera_intrinsics['width']
+        height = camera_intrinsics['height']
+
+        # Camera intrinsic matrix
+        K = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0, 1]
+        ])
+
+        # Image corner coordinates (pixel coordinates)
+        corners_2d = np.array([
+            [0, 0, 1],        # Top-left
+            [width, 0, 1],    # Top-right
+            [width, height, 1], # Bottom-right
+            [0, height, 1]    # Bottom-left
+        ]).T
+
+        # Normalize coordinates to camera space
+        corners_normalized = np.linalg.inv(K) @ corners_2d
+
+        # Transform ray directions to world coordinates
+        ray_dirs = camera_rotation.T @ corners_normalized
+
+        # Normalize ray directions to unit vectors
+        ray_dirs = ray_dirs / np.linalg.norm(ray_dirs, axis=0, keepdims=True)
+
+        # Compute footprint from ray-DTM intersections
+        corners_3d = []
+        for i in range(4):  # 4 corners
+            ray_dir = ray_dirs[:, i].copy()
+
+            # For aerial photos: if ray points upward, flip Z direction
+            if ray_dir[2] > 0:
+                ray_dir[2] = -ray_dir[2]  # Flip Z component to point downward
+
+            # Ray-cast to DTM surface
+            intersection, status = self.raycast_to_dtm(camera_center, ray_dir)
+            if intersection is not None:
+                corners_3d.append(intersection[:2])  # Only (x, y) coordinates
+
+        if len(corners_3d) != 4:
+            raise RuntimeError(
+                f"Failed to compute footprint from DTM ray-casting. "
+                f"Got {len(corners_3d)} corners but need exactly 4 for rectangular footprint."
+            )
+
+        # Create footprint polygon
+        footprint = np.array(corners_3d)
+
+        # Filter points within footprint using polygon containment
+        from matplotlib.path import Path
+        poly_path = Path(footprint)
+
+        # Extract (x, y) coordinates from points_3d
+        points_2d = points_3d[:, :2]  # Only x, y coordinates
+        mask = poly_path.contains_points(points_2d)
+
+        # Get point IDs that are within the footprint
+        points_in_footprint = [point_ids[i] for i, is_inside in enumerate(mask) if is_inside]
+
+        return footprint, points_in_footprint
 
 def main():
     """메인 실행 함수"""
