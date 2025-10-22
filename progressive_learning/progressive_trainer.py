@@ -2406,9 +2406,9 @@ class ProgressiveTrainer:
             print(f"\n  📊 Window Size Check:")
             print(f"     Max window size: {max_window_size}")
             print(f"     Current window size: {current_window_size}")
-            window_size_exceeded = current_window_size >= max_window_size
+            window_size_exceeded = current_window_size > max_window_size
             if window_size_exceeded:
-                print(f"     ⚠️  Window size limit reached!")
+                print(f"     ⚠️  Window size limit exceeded!")
         else:
             print(f"\n  📊 Window Size Check:")
             print(f"     Max window size: Not set (unlimited)")
@@ -2432,7 +2432,7 @@ class ProgressiveTrainer:
             if memory_exceeded:
                 print(f"     - Memory threshold reached ({peak_usage_ratio*100:.1f}% >= {camera_removal_threshold*100:.1f}%)")
             if window_size_exceeded:
-                print(f"     - Window size limit reached ({len(D_cam_ids)} >= {max_window_size})")
+                print(f"     - Window size limit exceeded ({len(D_cam_ids)} > {max_window_size})")
 
         print(f"\n  ✅ Memory decision completed")
         print("  " + "="*80)
