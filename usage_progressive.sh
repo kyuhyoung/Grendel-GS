@@ -46,6 +46,8 @@ CAMERA_REMOVAL_MARGIN=0.27                # Margin below densify_memory_limit fo
 ###
 
 DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.99    # GPU memory limit for densification (0.99 = 99%)
+MAX_WINDOW_SIZE=""                       # Maximum window size (number of cameras). Empty = unlimited
+#MAX_WINDOW_SIZE=4                       # Maximum window size (number of cameras). Empty = unlimited
 SH_DEGREE=3                              # Spherical harmonics degree
 RESOLUTION=1                             # Resolution downscaling factor
 BACKEND="gsplat"                         # Rendering backend: default or gsplat
@@ -137,6 +139,7 @@ echo "  Iterations Per Window: $ITERATIONS_PER_WINDOW"
 echo "  Densification Interval: $DENSIFICATION_INTERVAL"
 echo "  Densify From Iter: $DENSIFY_FROM_ITER"
 echo "  Densify Memory Limit: $DENSIFY_MEMORY_LIMIT_PERCENTAGE"
+echo "  Max Window Size: ${MAX_WINDOW_SIZE:-unlimited}"
 echo "  SH Degree: $SH_DEGREE"
 echo "  Resolution: $RESOLUTION"
 echo "  Backend: $BACKEND"
@@ -224,6 +227,12 @@ CMD="$CMD --iterations_per_window $ITERATIONS_PER_WINDOW"
 CMD="$CMD --densification_interval $DENSIFICATION_INTERVAL"
 CMD="$CMD --densify_from_iter $DENSIFY_FROM_ITER"
 CMD="$CMD --densify_memory_limit_percentage $DENSIFY_MEMORY_LIMIT_PERCENTAGE"
+
+# Add max_window_size if set
+if [[ -n "$MAX_WINDOW_SIZE" ]]; then
+    CMD="$CMD --max_window_size $MAX_WINDOW_SIZE"
+fi
+
 CMD="$CMD --sh-degree $SH_DEGREE"
 CMD="$CMD --resolution $RESOLUTION"
 CMD="$CMD --backend $BACKEND"
