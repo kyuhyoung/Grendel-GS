@@ -131,6 +131,18 @@ while [[ $# -gt 0 ]]; do
             DENSIFY_FROM_ITER="$2"
             shift 2
             ;;
+        --densify_memory_limit_percentage)
+            DENSIFY_MEMORY_LIMIT_PERCENTAGE="$2"
+            shift 2
+            ;;
+        --max_window_size)
+            MAX_WINDOW_SIZE="$2"
+            shift 2
+            ;;
+        --removal_strategy)
+            REMOVAL_STRATEGY="$2"
+            shift 2
+            ;;
         --deterministic)
             DETERMINISTIC="--deterministic"
             shift
@@ -142,6 +154,13 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             show_usage
             exit 0
+            ;;
+        --e_selection_strategy|--e_weighted_alpha|--e_weighted_beta|--e_tangential_coeff|--e_polar_angle_step|--e_polar_radius_step|--e_spiral_alpha|--e_spiral_beta|--e_spiral_gamma|--e_outward_weight|--e_compact_weight|--e_smooth_window_weight|--e_smooth_camera_weight|--e_distance_weight|--exit-after-first-removal|--track_by_projection|--prune_by_visibility|--visibility_prune_margin)
+            # Ignore unsupported arguments for this commit (9384129)
+            shift
+            if [[ "$1" != --* ]] && [[ -n "$1" ]]; then
+                shift  # Also skip the value if present
+            fi
             ;;
         *)
             EXTRA_ARGS="$EXTRA_ARGS $1"
@@ -286,6 +305,18 @@ fi
 
 if [[ -n "$DENSIFY_FROM_ITER" ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --densify_from_iter=$DENSIFY_FROM_ITER"
+fi
+
+if [[ -n "$DENSIFY_MEMORY_LIMIT_PERCENTAGE" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --densify_memory_limit_percentage=$DENSIFY_MEMORY_LIMIT_PERCENTAGE"
+fi
+
+if [[ -n "$MAX_WINDOW_SIZE" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --max_window_size=$MAX_WINDOW_SIZE"
+fi
+
+if [[ -n "$REMOVAL_STRATEGY" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --removal_strategy=$REMOVAL_STRATEGY"
 fi
 
 if [[ "$DEBUG" == true ]]; then

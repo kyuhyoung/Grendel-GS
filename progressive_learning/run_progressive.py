@@ -32,6 +32,9 @@ def main():
     parser.add_argument('--iterations_per_window', type=int, default=60, help='Iterations per sliding window')
     parser.add_argument('--densification_interval', type=int, default=100, help='Densification interval')
     parser.add_argument('--densify_from_iter', type=int, default=50, help='Start densification from iteration')
+    parser.add_argument('--densify_memory_limit_percentage', type=float, default=None, help='GPU memory limit for densification (0.0-1.0)')
+    parser.add_argument('--max_window_size', type=int, default=None, help='Maximum window size (number of cameras). If set, removes camera when window reaches this size.')
+    parser.add_argument('--removal_strategy', default='farthest', choices=['fifo', 'farthest'], help='Camera removal strategy: fifo or farthest')
     parser.add_argument('--backend', default='gsplat', help='Rendering backend')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--show_memory_debug_info', action='store_true', help='Show detailed memory and tensor debug info')
@@ -79,6 +82,9 @@ def main():
     trainer.use_chunk = args.use_chunk
     trainer.densification_interval = args.densification_interval
     trainer.densify_from_iter = args.densify_from_iter
+    trainer.densify_memory_limit_percentage = args.densify_memory_limit_percentage
+    trainer.max_window_size = args.max_window_size
+    trainer.removal_strategy = args.removal_strategy
     trainer.show_memory_debug_info = args.show_memory_debug_info
     trainer.auto_save_final_iteration = args.auto_save_final_iteration
     trainer.track_by_projection = args.track_by_projection

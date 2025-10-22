@@ -175,7 +175,8 @@ class ProgressiveTrainer:
         camera_removal_margin: float = 0.15,
         debug: bool = False,
         only_positive_z: bool = True,
-        only_actually_visible: bool = True
+        only_actually_visible: bool = True,
+        gpu_memory_threshold: float = None  # Ignored in this commit (9384129)
     ):
         """
         Initialize progressive trainer
@@ -1019,8 +1020,8 @@ class ProgressiveTrainer:
         if hasattr(self, 'densify_from_iter'):
             cmd.extend(["--densify_from_iter", str(self.densify_from_iter)])
 
-        # Add densify_memory_limit_percentage if set
-        if hasattr(self, 'densify_memory_limit_percentage'):
+        # Add densify_memory_limit_percentage if set and not None
+        if hasattr(self, 'densify_memory_limit_percentage') and self.densify_memory_limit_percentage is not None:
             cmd.extend(["--densify_memory_limit_percentage", str(self.densify_memory_limit_percentage)])
 
         # Add show_memory_debug_info if set
@@ -2086,17 +2087,37 @@ class ProgressiveTrainer:
             import traceback
             traceback.print_exc()
 
-    def run(self, iterations_per_window: int = 60):
+    def run(self, iterations_per_window: int = 60, **kwargs):
         """
         Main execution pipeline - Dynamic Window Approach
 
         Args:
             iterations_per_window: Training iterations per window
+            **kwargs: Additional arguments (ignored in this commit 9384129)
         """
         print("="*60)
         print("Starting Progressive Training with Dynamic Window")
         print(f"Initial cameras: {self.initial_cameras}, Iterations per window: {iterations_per_window}")
         print("="*60)
+
+        # Validate and adjust max_window_size if needed
+        max_window_size = getattr(self, 'max_window_size', None)
+
+        # Treat negative values as unlimited
+        if max_window_size is not None and max_window_size < 0:
+            print(f"\n   max_window_size is negative ({max_window_size}), treating as unlimited")
+            self.max_window_size = None
+            max_window_size = None
+        elif max_window_size is not None and max_window_size < self.initial_cameras:
+            print(f"\n⚠️  Warning: max_window_size ({max_window_size}) is less than initial_cameras ({self.initial_cameras})")
+            print(f"   Adjusting max_window_size to {self.initial_cameras} to allow initial window creation")
+            self.max_window_size = self.initial_cameras
+            max_window_size = self.initial_cameras
+
+        if max_window_size is not None:
+            print(f"   Max window size: {max_window_size} cameras")
+        else:
+            print(f"   Max window size: Unlimited")
 
         # Step 1: Compute camera footprints
         self.compute_camera_footprints()
@@ -2361,23 +2382,57 @@ class ProgressiveTrainer:
             print(f"\n  ⚠️  Warning: Initial window state.json not found at {initial_state_file}")
             print(f"     Assuming memory sufficient, will not remove camera")
 
-        camera_removal_threshold = self.densify_memory_limit_percentage - self.camera_removal_margin
-        print(f"\n  📊 Memory Threshold Calculation:")
-        print(f"     Densify limit: {self.densify_memory_limit_percentage*100:.1f}%")
-        print(f"     Removal margin: {self.camera_removal_margin*100:.1f}%")
-        print(f"     Removal threshold: {camera_removal_threshold*100:.1f}%")
-        print(f"     Current peak usage: {peak_usage_ratio*100:.1f}%")
+        # Handle None densify_memory_limit_percentage (commit 9384129 compatibility)
+        memory_exceeded = False
+        if self.densify_memory_limit_percentage is None:
+            print(f"\n  ⚠️  Warning: densify_memory_limit_percentage is None")
+            print(f"     Assuming no memory limit")
+            memory_exceeded = False
+        else:
+            camera_removal_threshold = self.densify_memory_limit_percentage - self.camera_removal_margin
+            print(f"\n  📊 Memory Threshold Calculation:")
+            print(f"     Densify limit: {self.densify_memory_limit_percentage*100:.1f}%")
+            print(f"     Removal margin: {self.camera_removal_margin*100:.1f}%")
+            print(f"     Removal threshold: {camera_removal_threshold*100:.1f}%")
+            print(f"     Current peak usage: {peak_usage_ratio*100:.1f}%")
 
-        skip_removal = peak_usage_ratio < camera_removal_threshold
+            memory_exceeded = peak_usage_ratio >= camera_removal_threshold
+
+        # Check max_window_size
+        max_window_size = getattr(self, 'max_window_size', None)
+        window_size_exceeded = False
+        if max_window_size is not None:
+            current_window_size = len(D_cam_ids)
+            print(f"\n  📊 Window Size Check:")
+            print(f"     Max window size: {max_window_size}")
+            print(f"     Current window size: {current_window_size}")
+            window_size_exceeded = current_window_size >= max_window_size
+            if window_size_exceeded:
+                print(f"     ⚠️  Window size limit reached!")
+        else:
+            print(f"\n  📊 Window Size Check:")
+            print(f"     Max window size: Not set (unlimited)")
+
+        # Make removal decision (remove if EITHER condition is met)
+        skip_removal = not (memory_exceeded or window_size_exceeded)
 
         if skip_removal:
-            print(f"\n  💡 Memory sufficient ({peak_usage_ratio*100:.1f}% < {camera_removal_threshold*100:.1f}%)")
-            print(f"     Skipping camera removal - window will grow")
-            print(f"     Next window will have {len(D_cam_ids)} cameras: {D_cam_ids}")
+            print(f"\n  💡 Removal not needed:")
+            if not memory_exceeded:
+                if self.densify_memory_limit_percentage is None:
+                    print(f"     ✓ Memory limit not set")
+                else:
+                    print(f"     ✓ Memory OK: {peak_usage_ratio*100:.1f}% < {camera_removal_threshold*100:.1f}%")
+            if max_window_size is None or not window_size_exceeded:
+                print(f"     ✓ Window size OK: {len(D_cam_ids)} < {max_window_size if max_window_size else 'unlimited'}")
+            print(f"     → Window will grow to {len(D_cam_ids)} cameras: {D_cam_ids}")
             G_cam_id = None
         else:
-            print(f"\n  ⚠️  Memory threshold reached ({peak_usage_ratio*100:.1f}% >= {camera_removal_threshold*100:.1f}%)")
-            print(f"     Camera removal required")
+            print(f"\n  ⚠️  Camera removal required:")
+            if memory_exceeded:
+                print(f"     - Memory threshold reached ({peak_usage_ratio*100:.1f}% >= {camera_removal_threshold*100:.1f}%)")
+            if window_size_exceeded:
+                print(f"     - Window size limit reached ({len(D_cam_ids)} >= {max_window_size})")
 
         print(f"\n  ✅ Memory decision completed")
         print("  " + "="*80)
@@ -3142,21 +3197,28 @@ class ProgressiveTrainer:
             print("  MEMORY-BASED REMOVAL DECISION")
             print("  " + "="*80)
 
-            camera_removal_threshold = self.densify_memory_limit_percentage - self.camera_removal_margin
-            print(f"\n     Densify limit: {self.densify_memory_limit_percentage*100:.1f}%")
-            print(f"     Removal margin: {self.camera_removal_margin*100:.1f}%")
-            print(f"     Removal threshold: {camera_removal_threshold*100:.1f}%")
-            print(f"     Current peak usage: {peak_usage_ratio*100:.1f}%")
-
-            skip_removal = peak_usage_ratio < camera_removal_threshold
-
-            if skip_removal:
-                print(f"\n     💡 Memory sufficient ({peak_usage_ratio*100:.1f}% < {camera_removal_threshold*100:.1f}%)")
-                print(f"        Skipping camera removal - window will grow")
+            # Handle None densify_memory_limit_percentage (commit 9384129 compatibility)
+            if self.densify_memory_limit_percentage is None:
+                print(f"\n     ⚠️  Warning: densify_memory_limit_percentage is None")
+                print(f"        Assuming no memory limit, will not remove camera")
+                skip_removal = True
                 next_G_cam_id = None
             else:
-                print(f"\n     ⚠️  Memory threshold reached ({peak_usage_ratio*100:.1f}% >= {camera_removal_threshold*100:.1f}%)")
-                print(f"        Camera removal required")
+                camera_removal_threshold = self.densify_memory_limit_percentage - self.camera_removal_margin
+                print(f"\n     Densify limit: {self.densify_memory_limit_percentage*100:.1f}%")
+                print(f"     Removal margin: {self.camera_removal_margin*100:.1f}%")
+                print(f"     Removal threshold: {camera_removal_threshold*100:.1f}%")
+                print(f"     Current peak usage: {peak_usage_ratio*100:.1f}%")
+
+                skip_removal = peak_usage_ratio < camera_removal_threshold
+
+                if skip_removal:
+                    print(f"\n     💡 Memory sufficient ({peak_usage_ratio*100:.1f}% < {camera_removal_threshold*100:.1f}%)")
+                    print(f"        Skipping camera removal - window will grow")
+                    next_G_cam_id = None
+                else:
+                    print(f"\n     ⚠️  Memory threshold reached ({peak_usage_ratio*100:.1f}% >= {camera_removal_threshold*100:.1f}%)")
+                    print(f"        Camera removal required")
 
             print(f"\n  ✅ Memory decision completed")
             print("  " + "="*80)
