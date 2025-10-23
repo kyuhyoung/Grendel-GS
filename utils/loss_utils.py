@@ -63,14 +63,16 @@ def pixelwise_ssim_with_mask_improved_chunked(img1, img2, pixel_mask, chunk_size
             result_w_start = w_start + inner_w_start  
             result_w_end = w_start + inner_w_end
             
+            # Use detach() to avoid gradient accumulation memory
             result[:, result_h_start:result_h_end, result_w_start:result_w_end] += \
-                chunk_result[:, inner_h_start:inner_h_end, inner_w_start:inner_w_end]
+                chunk_result[:, inner_h_start:inner_h_end, inner_w_start:inner_w_end].detach()
 
             overlap_count[result_h_start:result_h_end, result_w_start:result_w_end] += 1
 
             # Free memory after each chunk to prevent accumulation
             del chunk1, chunk2, chunk_mask, chunk_result
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # Ensure memory is actually freed
     
     # 겹치는 영역 평균화
     overlap_count = torch.clamp(overlap_count, min=1)
