@@ -42,7 +42,7 @@ ITERATIONS=30000                          # Training iterations
 ITERATIONS_PER_WINDOW=12                # Iterations per sliding window
 DENSIFICATION_INTERVAL=10               # Densification every 20 iterations
 DENSIFY_FROM_ITER=5                    # Start densification from iteration 10
-CAMERA_REMOVAL_MARGIN=0.25                # Margin below densify_memory_limit for camera removal (0.99 - 0.25 = 0.74 = 74%)
+CAMERA_REMOVAL_MARGIN=0.26                # Margin below densify_memory_limit for camera removal (0.99 - 0.25 = 0.74 = 74%)
 ###
 
 DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.99    # GPU memory limit for densification (0.99 = 99%)

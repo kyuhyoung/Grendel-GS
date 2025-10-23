@@ -423,12 +423,12 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
         utils.print_rank_0(f"🧠 [MEMORY BEFORE TRAINING LOOP] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB")
 
     for iteration in range(start_from_this_iteration, opt_args.iterations + 1, args.bsz):
-        # Log memory every 3 iterations
-        if iteration % 3 == 0 and torch.cuda.is_available():
+        # Log memory at iteration start
+        if torch.cuda.is_available():
             mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
             mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
-            mem_peak = torch.cuda.max_memory_allocated(0) / 1024**3
-            utils.print_rank_0(f"🧠 [ITER {iteration}] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Peak={mem_peak:.2f}GB")
+            mem_free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1024**3
+            utils.print_rank_0(f"🧠 [ITER {iteration} START] Alloc={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Free={mem_free:.2f}GB")
 
         ema_loss_for_log = _process_iteration(iteration, gaussians, scene, args, timers, strategy_history, train_dataset, background, pipe_args, progress_bar, ema_loss_for_log, debug_info_printed, end2end_timers, log_file, n_g_max)
 

@@ -2881,8 +2881,8 @@ class ProgressiveTrainer:
                 print(f"   - After adding cameras: reached max size")
                 print(f"   - After removal: {len(D_cam_ids)} cameras (max enforced)")
                 print("\n" + "="*80)
-                import sys
-                sys.exit(0)
+                #import sys
+                #sys.exit(0)
         else:
             print("\n  " + "="*80)
             print("  ALGORITHM STEP 14: SKIPPED (No G to remove)")
