@@ -267,6 +267,13 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
                     n_added = n_gaussians_after_addition - n_gaussians_after_removal
 
                     # Log gaussian removal/addition
+                    utils.print_rank_0("=" * 80)
+                    utils.print_rank_0(f"📊 [GAUSSIAN COUNT SUMMARY]")
+                    utils.print_rank_0(f"   Restored from checkpoint: {n_gaussians_restored}")
+                    utils.print_rank_0(f"   After removal: {n_gaussians_after_removal} (removed: {n_removed})")
+                    utils.print_rank_0(f"   After addition: {n_gaussians_after_addition} (added: {n_added})")
+                    utils.print_rank_0(f"   Net change: {n_gaussians_after_addition - n_gaussians_restored:+d}")
+                    utils.print_rank_0("=" * 80)
                     utils.print_rank_0(f"📊 Progressive checkpoint loaded: {n_gaussians_restored} gaussians")
                     utils.print_rank_0(f"   Gaussians removed: {n_removed}")
                     utils.print_rank_0(f"   Gaussians added: {n_added}")

@@ -525,6 +525,16 @@ def pixelwise_ssim_with_mask_original(img1, img2, pixel_mask):
     
     C1 = 0.01**2
     C2 = 0.03**2
+
+    # Log memory before SSIM computation
+    import torch
+    if torch.cuda.is_available():
+        mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+        mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+        mem_free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1024**3
+        import utils.general_utils as utils
+        utils.print_rank_0(f"🧠 [SSIM BEFORE] Alloc={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Free={mem_free:.2f}GB, img_shape={img1.shape}")
+
     pixelwise_ssim_loss = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
         (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
     )
