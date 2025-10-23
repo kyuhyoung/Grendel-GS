@@ -65,10 +65,10 @@ def pixelwise_ssim_with_mask_improved_chunked(img1, img2, pixel_mask, chunk_size
             
             result[:, result_h_start:result_h_end, result_w_start:result_w_end] += \
                 chunk_result[:, inner_h_start:inner_h_end, inner_w_start:inner_w_end]
-            
+
             overlap_count[result_h_start:result_h_end, result_w_start:result_w_end] += 1
-            
-            # 메모리 정리
+
+            # Free memory after each chunk to prevent accumulation
             del chunk1, chunk2, chunk_mask, chunk_result
             torch.cuda.empty_cache()
     
