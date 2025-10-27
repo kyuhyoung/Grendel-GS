@@ -922,15 +922,11 @@ def start_strategy_final(batched_cameras, strategy_history):
         # Check tile distribution mode
         if args.tile_distribution_mode == "uniform":
             # Uniform distribution: divide tiles equally among GPUs
-            start_time = time.time()
             tiles_per_gpu = total_tiles // utils.DEFAULT_GROUP.size()
             division_pos = [i * tiles_per_gpu for i in range(utils.DEFAULT_GROUP.size() + 1)]
             division_pos[-1] = total_tiles  # Ensure last position is exactly total_tiles
-            elapsed_time = time.time() - start_time
-            record_tile_distribution_time('uniform', elapsed_time)
         else:
             # Heuristic-based distribution (default)
-            start_time = time.time()
             batched_accum_heuristic = [
                 strategy_history.accum_heuristic[camera.uid] for camera in batched_cameras
             ]  # batch_size * tile_y
@@ -941,8 +937,6 @@ def start_strategy_final(batched_cameras, strategy_history):
             division_pos = division_pos_heuristic(
                 catted_accum_heuristic, total_tiles, utils.DEFAULT_GROUP.size(), right=True
             )
-            elapsed_time = time.time() - start_time
-            record_tile_distribution_time('heuristic', elapsed_time)
 
         # slightly adjust the division_pos to avoid redundant kernel launch overheads.
         # Skip adjustment and assertion for uniform mode to maintain equal distribution
