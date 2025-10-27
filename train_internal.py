@@ -491,16 +491,47 @@ def _process_iteration(iteration, gaussians, scene, args, timers, strategy_histo
     if hasattr(args, 'enable_tile_distribution_stats') and args.enable_tile_distribution_stats:
         # Measure rendering time with GPU synchronization
         import time
+        import torch.distributed as dist
+
         start_time = time.time()
         batched_image, batched_compute_locally, batch_statistic_collector, batched_screenspace_pkg = _execute_rendering(
             batched_cameras, gaussians, pipe_args, background, batched_strategies, args)
-        torch.cuda.synchronize()  # Wait for all GPUs to finish
-        elapsed_time = time.time() - start_time
 
-        # Record tile distribution time
-        from gaussian_renderer.workload_division import record_tile_distribution_time
-        mode = getattr(args, 'tile_distribution_mode', 'heuristic')
-        record_tile_distribution_time(mode, elapsed_time)
+        # Measure local GPU time (before sync)
+        local_elapsed = time.time() - start_time
+
+        # Wait for all GPUs to finish
+        torch.cuda.synchronize()
+        total_elapsed = time.time() - start_time
+
+        # Gather timing from all GPUs
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        if world_size > 1:
+            # Collect times from all ranks
+            all_local_times = [None] * world_size
+            dist.all_gather_object(all_local_times, local_elapsed)
+
+            if rank == 0:
+                min_time = min(all_local_times)
+                max_time = max(all_local_times)
+                waiting_time = max_time - min_time
+
+                # Store detailed timing info
+                from gaussian_renderer.workload_division import record_tile_distribution_time
+                mode = getattr(args, 'tile_distribution_mode', 'heuristic')
+
+                # Record total time (max GPU time)
+                record_tile_distribution_time(mode, total_elapsed)
+
+                # Also record GPU timing details (store in different structure if needed)
+                # For now, we'll just use total_elapsed which includes waiting
+        else:
+            # Single GPU - no waiting time
+            from gaussian_renderer.workload_division import record_tile_distribution_time
+            mode = getattr(args, 'tile_distribution_mode', 'heuristic')
+            record_tile_distribution_time(mode, total_elapsed)
     else:
         # Normal execution without measurement overhead
         batched_image, batched_compute_locally, batch_statistic_collector, batched_screenspace_pkg = _execute_rendering(
