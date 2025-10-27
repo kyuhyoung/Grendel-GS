@@ -1174,6 +1174,14 @@ class ProgressiveTrainer:
         if hasattr(self, 'visibility_prune_margin'):
             cmd.extend(["--visibility_prune_margin", str(self.visibility_prune_margin)])
 
+        # Add tile_distribution_mode if set
+        if hasattr(self, 'tile_distribution_mode'):
+            cmd.extend(["--tile_distribution_mode", str(self.tile_distribution_mode)])
+
+        # Add enable_tile_distribution_stats if set
+        if hasattr(self, 'enable_tile_distribution_stats') and self.enable_tile_distribution_stats:
+            cmd.append("--enable_tile_distribution_stats")
+
         # Force checkpoint save at final iteration for progressive training continuity
         final_iter = total_iterations if total_iterations else self.iterations
         cmd.extend(["--checkpoint_iterations", str(final_iter)])
@@ -3044,6 +3052,21 @@ class ProgressiveTrainer:
             # Calculate and store window mean
             self.current_window_mean = self._calculate_window_mean(D_cam_ids)
 
+            # Log Gaussian spatial distribution statistics
+            if hasattr(self, 'gaussians') and self.gaussians is not None:
+                xyz = self.gaussians.get_xyz.detach().cpu()
+                gaussian_count = xyz.shape[0]
+                xyz_mean = xyz.mean(dim=0)
+                xyz_std = xyz.std(dim=0)
+                xyz_min = xyz.min(dim=0)[0]
+                xyz_max = xyz.max(dim=0)[0]
+                xyz_range = xyz_max - xyz_min
+                print(f"   📊 [GAUSSIAN SPATIAL STATS] Window_{Q:03d}:")
+                print(f"      Count: {gaussian_count}")
+                print(f"      Mean: [{xyz_mean[0]:.2f}, {xyz_mean[1]:.2f}, {xyz_mean[2]:.2f}]")
+                print(f"      Std:  [{xyz_std[0]:.2f}, {xyz_std[1]:.2f}, {xyz_std[2]:.2f}]")
+                print(f"      Range: [{xyz_range[0]:.2f}, {xyz_range[1]:.2f}, {xyz_range[2]:.2f}]")
+
             # Create visualization if debug mode
             if self.debug:
                 print(f"   Creating visualization for window_{Q:03d}...")
@@ -3888,76 +3911,177 @@ class ProgressiveTrainer:
         print("✅ PROGRESSIVE TRAINING COMPLETED SUCCESSFULLY!")
         print("="*80)
 
+        # Print tile distribution statistics summary if enabled
+        print(f"\n🔍 DEBUG: hasattr enable_tile_distribution_stats = {hasattr(self, 'enable_tile_distribution_stats')}")
+        if hasattr(self, 'enable_tile_distribution_stats'):
+            print(f"🔍 DEBUG: enable_tile_distribution_stats value = {self.enable_tile_distribution_stats}")
+
+        if hasattr(self, 'enable_tile_distribution_stats') and self.enable_tile_distribution_stats:
+            print("🔍 DEBUG: Calling _print_tile_distribution_summary()...")
+            self._print_tile_distribution_summary()
+        else:
+            print("🔍 DEBUG: Tile distribution stats NOT enabled, skipping summary")
+
         return  # Exit progressive training method
 
-        #sys.exit(1)
-        window_num = 1
-        self.current_window_cameras = set(window_cameras)  # Track current window cameras
+    def _print_tile_distribution_summary(self):
+        """
+        Aggregate and save tile distribution statistics from all windows to console and log file
+        """
+        # Prepare log file path
+        log_file_path = self.output_path / "tile_distribution_stats.log"
 
-        # Slide through remaining cameras
-        while camera_index < len(remaining_cameras):
-            # STEP 1: Add new camera first (mean-based selection with gaussian cleanup)
-            added, window_cameras = self._add_camera_to_window(window_cameras, window_num)
-            if added is None:
-                break  # No more unprocessed cameras
-            # STEP 2: Remove camera farthest from newly added camera
-            removed = self._remove_camera_from_window(window_cameras, added)
-            '''
-            # Update points: move points covered by new camera from unprocessed to processed
-            if added in self.points_in_view:
-                new_points = set(self.points_in_view[added]) & self.unprocessed_points
-                self.unprocessed_points -= new_points  # Remove from unprocessed
-                # Note: processed_points doesn't exist, only processed_gaussians
-            print(f"   New points processed: {len(new_points) if added in self.points_in_view else 0}")
-            print(f"   Unprocessed points: {len(self.unprocessed_points)}")
-            '''
-            camera_index += 1
+        # Collect statistics from all window directories
+        all_heuristic_times = []
+        all_uniform_times = []
 
-            print(f"📊 Updated sliding window state:")
-            print(f"   Removed camera {removed} -> processed_cameras: {len(self.processed_cameras)} cameras")
-            print(f"   Added camera {added} -> unprocessed_cameras: {len(self.unprocessed_cameras)} cameras remaining")
-            print(f"   Total processed gaussians: {len(self.processed_gaussians) if hasattr(self, 'processed_gaussians') else 0}")
+        # Find all model directories
+        model_dirs = []
+        if (self.output_path / "model_initial").exists():
+            model_dirs.append(self.output_path / "model_initial")
 
-            print("\n" + "="*80)
-            print(f"🔄 STARTING WINDOW {window_num}")
-            print(f"➖ Removed camera: {removed}")
-            print(f"➕ Added camera: {added}")
-            print(f"📷 Current window: {window_cameras}")
-            print(f"📊 Progress: {len(self.current_window_cameras)} / {len(all_camera_ids)} cameras processed")
-            print(f"⏳ Remaining: {len(remaining_cameras) - camera_index} cameras to add")
-            print(f"🔄 Iterations: {iterations_per_window}")
-            print("="*80)
+        window_idx = 1
+        while (self.output_path / f"model_window_{window_idx:03d}").exists():
+            model_dirs.append(self.output_path / f"model_window_{window_idx:03d}")
+            window_idx += 1
 
-            # Create dataset for current window
-            dataset = self.create_sliding_dataset(window_cameras)
+        # Load statistics from each window
+        for model_dir in model_dirs:
+            stats_file = model_dir / "tile_distribution_stats.json"
+            if stats_file.exists():
+                try:
+                    with open(stats_file, 'r') as f:
+                        stats = json.load(f)
+                    all_heuristic_times.extend(stats.get('heuristic_times', []))
+                    all_uniform_times.extend(stats.get('uniform_times', []))
+                except Exception as e:
+                    print(f"⚠️  Warning: Could not load statistics from {stats_file}: {e}")
 
-            # Calculate and store updated window mean
-            self.current_window_mean = self._calculate_window_mean(window_cameras)
-            #exit(1)
-            # Create visualization for current window coverage
-            if self.debug:
-                print(f"Creating visualization for window {window_num}...")
-                self._visualize_sliding_window_coverage(dataset, window_cameras, window_num, removed, added)
+        # Calculate summary statistics
+        if not all_heuristic_times and not all_uniform_times:
+            msg = "⚠️  No tile distribution statistics collected."
+            print(msg)
+            with open(log_file_path, 'w') as f:
+                f.write(msg + "\n")
+            return
 
-            # Train with checkpoint from previous window
-            self.train_grendel_gs(dataset, removed, added, iterations_per_window, f"window_{window_num}", sliding_window=True)
+        import numpy as np
 
-            print("="*80)
-            print(f"✅ WINDOW {window_num} COMPLETED")
-            print("="*80)
+        def calc_stats(times):
+            if not times:
+                return {
+                    'count': 0,
+                    'mean': 0.0,
+                    'median': 0.0,
+                    'std': 0.0,
+                    'min': 0.0,
+                    'max': 0.0,
+                    'total': 0.0
+                }
+            times_ms = [t * 1000 for t in times]  # Convert to milliseconds
+            return {
+                'count': len(times_ms),
+                'mean': np.mean(times_ms),
+                'median': np.median(times_ms),
+                'std': np.std(times_ms),
+                'min': np.min(times_ms),
+                'max': np.max(times_ms),
+                'total': np.sum(times_ms)
+            }
 
-            # Update previous window cameras for next iteration
-            self.prev_window_cameras = list(window_cameras)
+        heuristic_stats = calc_stats(all_heuristic_times)
+        uniform_stats = calc_stats(all_uniform_times)
 
-            window_num += 1
+        # Build output lines
+        lines = []
+        lines.append("\n" + "="*80)
+        lines.append("TILE DISTRIBUTION PERFORMANCE SUMMARY")
+        lines.append("="*80)
+        lines.append("")
+        lines.append(f"{'Metric':<25} {'Heuristic':>18} {'Uniform':>18} {'Difference':>18}")
+        lines.append("-"*80)
 
-        print("\n" + "="*80)
-        print("🎉 PROGRESSIVE TRAINING COMPLETED SUCCESSFULLY! 🎉")
-        print(f"📊 Total cameras processed: {len(self.current_window_cameras)} / {len(all_camera_ids)}")
-        print(f"🪟 Total windows completed: {window_num}")
-        print(f"💾 Output saved to: {self.output_path}")
-        print("="*80)
+        # Count
+        lines.append(f"{'Call Count':<25} {heuristic_stats['count']:>18,} {uniform_stats['count']:>18,} "
+              f"{abs(heuristic_stats['count'] - uniform_stats['count']):>18,}")
 
+        # Mean
+        h_mean = heuristic_stats['mean']
+        u_mean = uniform_stats['mean']
+        diff_mean = h_mean - u_mean
+        lines.append(f"{'Mean Time (ms)':<25} {h_mean:>18.4f} {u_mean:>18.4f} {diff_mean:>+18.4f}")
+
+        # Median
+        h_median = heuristic_stats['median']
+        u_median = uniform_stats['median']
+        diff_median = h_median - u_median
+        lines.append(f"{'Median Time (ms)':<25} {h_median:>18.4f} {u_median:>18.4f} {diff_median:>+18.4f}")
+
+        # Std dev
+        lines.append(f"{'Std Dev (ms)':<25} {heuristic_stats['std']:>18.4f} {uniform_stats['std']:>18.4f} "
+              f"{'─':>18}")
+
+        # Min
+        h_min = heuristic_stats['min']
+        u_min = uniform_stats['min']
+        diff_min = h_min - u_min
+        lines.append(f"{'Min Time (ms)':<25} {h_min:>18.4f} {u_min:>18.4f} {diff_min:>+18.4f}")
+
+        # Max
+        h_max = heuristic_stats['max']
+        u_max = uniform_stats['max']
+        diff_max = h_max - u_max
+        lines.append(f"{'Max Time (ms)':<25} {h_max:>18.4f} {u_max:>18.4f} {diff_max:>+18.4f}")
+
+        # Total
+        h_total = heuristic_stats['total']
+        u_total = uniform_stats['total']
+        diff_total = h_total - u_total
+        lines.append(f"{'Total Time (ms)':<25} {h_total:>18.2f} {u_total:>18.2f} {diff_total:>+18.2f}")
+
+        lines.append("-"*80)
+
+        # Performance comparison
+        if heuristic_stats['count'] > 0 and uniform_stats['count'] > 0:
+            if h_mean > 0:
+                speedup = u_mean / h_mean
+                if speedup > 1.01:
+                    lines.append(f"⚡ Heuristic is {speedup:.2f}x FASTER than Uniform (on average)")
+                elif speedup < 0.99:
+                    lines.append(f"⚠️  Uniform is {1/speedup:.2f}x FASTER than Heuristic (on average)")
+                else:
+                    lines.append(f"➡️  Both modes have similar performance (difference < 1%)")
+        elif heuristic_stats['count'] > 0:
+            lines.append(f"📊 Only Heuristic mode was used ({heuristic_stats['count']} calls)")
+        elif uniform_stats['count'] > 0:
+            lines.append(f"📊 Only Uniform mode was used ({uniform_stats['count']} calls)")
+
+        lines.append("="*80 + "\n")
+
+        # Print to console
+        for line in lines:
+            print(line)
+
+        # Save to log file
+        with open(log_file_path, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+
+        print(f"💾 Saved tile distribution summary to: {log_file_path}\n")
+
+        # Save aggregated summary
+        summary_file = self.output_path / "tile_distribution_stats_summary.json"
+        summary_data = {
+            'heuristic': heuristic_stats,
+            'uniform': uniform_stats,
+            'all_heuristic_times': all_heuristic_times,
+            'all_uniform_times': all_uniform_times
+        }
+        try:
+            with open(summary_file, 'w') as f:
+                json.dump(summary_data, f, indent=2)
+            print(f"💾 Saved aggregated statistics to: {summary_file}\n")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not save summary statistics: {e}\n")
 
 
 # Example usage
