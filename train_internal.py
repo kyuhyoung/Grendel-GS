@@ -522,16 +522,23 @@ def _process_iteration(iteration, gaussians, scene, args, timers, strategy_histo
                 from gaussian_renderer.workload_division import record_tile_distribution_time
                 mode = getattr(args, 'tile_distribution_mode', 'heuristic')
 
-                # Record total time (max GPU time)
-                record_tile_distribution_time(mode, total_elapsed)
-
-                # Also record GPU timing details (store in different structure if needed)
-                # For now, we'll just use total_elapsed which includes waiting
+                # Record total time and GPU details
+                gpu_details = {
+                    'min': min_time,
+                    'max': max_time,
+                    'waiting': waiting_time
+                }
+                record_tile_distribution_time(mode, total_elapsed, gpu_details)
         else:
             # Single GPU - no waiting time
             from gaussian_renderer.workload_division import record_tile_distribution_time
             mode = getattr(args, 'tile_distribution_mode', 'heuristic')
-            record_tile_distribution_time(mode, total_elapsed)
+            gpu_details = {
+                'min': total_elapsed,
+                'max': total_elapsed,
+                'waiting': 0.0
+            }
+            record_tile_distribution_time(mode, total_elapsed, gpu_details)
     else:
         # Normal execution without measurement overhead
         batched_image, batched_compute_locally, batch_statistic_collector, batched_screenspace_pkg = _execute_rendering(
@@ -901,15 +908,18 @@ def _finalize_training(args, opt_args, gaussians, log_file):
 
     # Save tile distribution statistics if enabled
     if hasattr(args, 'enable_tile_distribution_stats') and args.enable_tile_distribution_stats:
-        from gaussian_renderer.workload_division import get_tile_distribution_stats
+        from gaussian_renderer.workload_division import get_tile_distribution_stats, get_tile_distribution_gpu_details
         stats = get_tile_distribution_stats()
+        gpu_details = get_tile_distribution_gpu_details()
 
         # Only rank 0 saves the statistics
         if utils.GLOBAL_RANK == 0:
             stats_file = os.path.join(args.model_path, "tile_distribution_stats.json")
             stats_data = {
                 'heuristic_times': stats['heuristic'],
-                'uniform_times': stats['uniform']
+                'uniform_times': stats['uniform'],
+                'heuristic_gpu_details': gpu_details['heuristic'],
+                'uniform_gpu_details': gpu_details['uniform']
             }
             with open(stats_file, 'w') as f:
                 json.dump(stats_data, f, indent=2)

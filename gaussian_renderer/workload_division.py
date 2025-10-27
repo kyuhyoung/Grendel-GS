@@ -13,13 +13,20 @@ _tile_distribution_stats = {
     'uniform': []
 }
 
-def record_tile_distribution_time(mode, elapsed_time):
+# GPU-level detailed statistics
+_tile_distribution_gpu_details = {
+    'heuristic': [],
+    'uniform': []
+}
+
+def record_tile_distribution_time(mode, elapsed_time, gpu_details=None):
     """
     Record tile distribution time if statistics collection is enabled
 
     Args:
         mode: 'heuristic' or 'uniform'
         elapsed_time: Time in seconds
+        gpu_details: Optional dict with {'min': float, 'max': float, 'waiting': float}
     """
     args = utils.get_args()
     if not hasattr(args, 'enable_tile_distribution_stats') or not args.enable_tile_distribution_stats:
@@ -28,14 +35,25 @@ def record_tile_distribution_time(mode, elapsed_time):
     if mode in _tile_distribution_stats:
         _tile_distribution_stats[mode].append(elapsed_time)
 
+    if gpu_details and mode in _tile_distribution_gpu_details:
+        _tile_distribution_gpu_details[mode].append(gpu_details)
+
 def get_tile_distribution_stats():
     """Get current tile distribution statistics"""
     return _tile_distribution_stats
 
+def get_tile_distribution_gpu_details():
+    """Get GPU-level detailed statistics"""
+    return _tile_distribution_gpu_details
+
 def reset_tile_distribution_stats():
     """Reset statistics (called at start of each window)"""
-    global _tile_distribution_stats
+    global _tile_distribution_stats, _tile_distribution_gpu_details
     _tile_distribution_stats = {
+        'heuristic': [],
+        'uniform': []
+    }
+    _tile_distribution_gpu_details = {
         'heuristic': [],
         'uniform': []
     }
