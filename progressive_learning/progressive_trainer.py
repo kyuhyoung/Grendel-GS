@@ -3928,9 +3928,6 @@ class ProgressiveTrainer:
         """
         Aggregate and save tile distribution statistics from all windows to console and log file
         """
-        # Prepare log file path
-        log_file_path = self.output_path / "tile_distribution_stats.log"
-
         # Collect statistics from all window directories
         all_heuristic_times = []
         all_uniform_times = []
@@ -3961,6 +3958,7 @@ class ProgressiveTrainer:
         if not all_heuristic_times and not all_uniform_times:
             msg = "⚠️  No tile distribution statistics collected."
             print(msg)
+            log_file_path = self.output_path / "tile_distribution_stats.log"
             with open(log_file_path, 'w') as f:
                 f.write(msg + "\n")
             return
@@ -3995,6 +3993,16 @@ class ProgressiveTrainer:
         # Determine which mode was actually used
         heuristic_used = heuristic_stats['count'] > 0
         uniform_used = uniform_stats['count'] > 0
+
+        # Determine log file name based on mode
+        if heuristic_used and not uniform_used:
+            mode_name = "heuristic"
+        elif uniform_used and not heuristic_used:
+            mode_name = "uniform"
+        else:
+            mode_name = "both"
+
+        log_file_path = self.output_path / f"tile_distribution_stats_{mode_name}.log"
 
         # Build output lines
         lines = []
@@ -4090,8 +4098,9 @@ class ProgressiveTrainer:
         print(f"💾 Saved tile distribution summary to: {log_file_path}\n")
 
         # Save aggregated summary
-        summary_file = self.output_path / "tile_distribution_stats_summary.json"
+        summary_file = self.output_path / f"tile_distribution_stats_summary_{mode_name}.json"
         summary_data = {
+            'mode': mode_name,
             'heuristic': heuristic_stats,
             'uniform': uniform_stats,
             'all_heuristic_times': all_heuristic_times,
