@@ -2548,7 +2548,20 @@ def final_system_loss_computation(
         strategy.division_pos[rank + 1],
     )
     coverage_min_y, coverage_max_y = get_coverage_y_min_max(tile_ids_l, tile_ids_r)
-    #print(f'coverage_min_y : {coverage_min_y}, coverage_max_y : {coverage_max_y}');
+
+    # Log coverage and tile info
+    coverage_height = coverage_max_y - coverage_min_y
+    utils.print_rank_0(f"📐 [COVERAGE] tile_ids=[{tile_ids_l},{tile_ids_r}], coverage_y=[{coverage_min_y},{coverage_max_y}], height={coverage_height}")
+
+    # Log tile distribution per GPU
+    camera_uid = viewpoint_cam.uid if hasattr(viewpoint_cam, 'uid') else 'unknown'
+    utils.print_rank_0(f"📊 [TILE DISTRIBUTION] Camera {camera_uid}:")
+    for i in range(len(strategy.division_pos) - 1):
+        tile_l = strategy.division_pos[i]
+        tile_r = strategy.division_pos[i + 1]
+        tile_count = tile_r - tile_l
+        utils.print_rank_0(f"  GPU {strategy.gpu_ids[i]}: tiles [{tile_l}, {tile_r}], count={tile_count}")
+
     local_image_rect = image[:, coverage_min_y:coverage_max_y, :].contiguous()
     local_image_rect_pixels_compute_locally = torch.ones(
         (coverage_max_y - coverage_min_y, utils.IMG_W), dtype=torch.bool, device="cuda"

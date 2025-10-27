@@ -439,6 +439,13 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
 
         ema_loss_for_log = _process_iteration(iteration, gaussians, scene, args, timers, strategy_history, train_dataset, background, pipe_args, progress_bar, ema_loss_for_log, debug_info_printed, end2end_timers, log_file, n_g_max)
 
+        # Log memory at iteration end
+        if torch.cuda.is_available():
+            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+            mem_free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1024**3
+            utils.print_rank_0(f"🧠 [ITER {iteration} END] Alloc={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Free={mem_free:.2f}GB")
+
     '''
     if previous_state:
         if 1 == current_window:
@@ -478,7 +485,7 @@ def _process_iteration(iteration, gaussians, scene, args, timers, strategy_histo
 
     # Prepare camera data and strategies
     batched_cameras, batched_strategies, gpuid2tasks = _prepare_camera_data(
-        train_dataset, strategy_history, args, timers)
+        train_dataset, strategy_history, args, timers, gaussians, iteration)
 
     # Execute rendering pipeline
     batched_image, batched_compute_locally, batch_statistic_collector, batched_screenspace_pkg = _execute_rendering(
@@ -529,8 +536,11 @@ def _setup_iteration(iteration, gaussians, args, progress_bar, ema_loss_for_log,
         gaussians.oneupSHdegree()
 
 
-def _prepare_camera_data(train_dataset, strategy_history, args, timers):
+def _prepare_camera_data(train_dataset, strategy_history, args, timers, gaussians, iteration):
     """Prepare camera data and workload division strategies"""
+    # Log number of cameras in dataset
+    utils.print_rank_0(f"📷 [CAMERA COUNT] Total cameras in dataset: {train_dataset.camera_size}")
+
     # Prepare data: Pick random Cameras for training
     if args.local_sampling:
         assert args.bsz % utils.WORLD_SIZE == 0, "Batch size should be divisible by the number of GPUs."
@@ -542,6 +552,17 @@ def _prepare_camera_data(train_dataset, strategy_history, args, timers):
         batched_cameras = train_dataset.get_batched_cameras_from_idx(batched_all_cameras_idx)
     else:
         batched_cameras = train_dataset.get_batched_cameras(args.bsz)
+
+    # Log selected camera UIDs and image sizes
+    camera_info = []
+    for cam in batched_cameras:
+        camera_info.append(f"UID={cam.uid}, size={cam.image_height}x{cam.image_width}")
+    utils.print_rank_0(f"📷 [SELECTED CAMERAS] {', '.join(camera_info)}")
+
+    # Log Gaussian count and memory before rendering
+    gaussian_count = gaussians.get_xyz.shape[0]
+    allocated = torch.cuda.memory_allocated(0) / (1024**3)
+    utils.print_rank_0(f"📊 [PRE-RENDER] Iter {iteration}, Gaussians: {gaussian_count}, GPU0 Memory: {allocated:.2f}GB")
 
     with torch.no_grad():
         # Prepare Workload division strategy
@@ -659,6 +680,13 @@ def _compute_loss_and_backward(batched_image, batched_cameras, batched_compute_l
     timers.stop("backward")
     utils.check_initial_gpu_memory_usage("after backward")
 
+    # Log memory after backward
+    if torch.cuda.is_available():
+        mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+        mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+        mem_free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1024**3
+        utils.print_rank_0(f"🧠 [ITER {iteration} AFTER BACKWARD] Alloc={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Free={mem_free:.2f}GB")
+
     with torch.no_grad():
         # Adjust workload division strategy
         globally_sync_for_timer()
@@ -708,10 +736,14 @@ def _handle_iteration_tasks(iteration, scene, gaussians, args, batched_cameras, 
             _handle_saving(iteration, scene, batched_cameras, batched_image, args, end2end_timers, log_file, strategy_history, ema_loss_for_log)
 
         # Densification AFTER saving
+        gaussians_before = gaussians.get_xyz.shape[0]
         if args.backend == "gsplat":
             gsplat_densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
         else:
             densification(iteration, scene, gaussians, n_g_max, batched_screenspace_pkg)
+        gaussians_after = gaussians.get_xyz.shape[0]
+        if gaussians_after != gaussians_before:
+            utils.print_rank_0(f"🔬 [DENSIFICATION] Iter {iteration}: Gaussians {gaussians_before} → {gaussians_after} (Δ{gaussians_after - gaussians_before:+d})")
 
         # Save Checkpoints
         checkpoint_condition = any([iteration <= checkpoint_iteration < iteration + args.bsz for checkpoint_iteration in args.checkpoint_iterations])
@@ -735,6 +767,13 @@ def _optimize_and_cleanup(iteration, gaussians, args, batched_cameras, timers, l
         gaussians.optimizer.zero_grad(set_to_none=True)
         timers.stop("optimizer_step")
         utils.check_initial_gpu_memory_usage("after optimizer step")
+
+        # Log memory after optimizer step
+        if torch.cuda.is_available():
+            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+            mem_free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1024**3
+            utils.print_rank_0(f"🧠 [ITER {iteration} AFTER OPTIMIZER] Alloc={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Free={mem_free:.2f}GB")
 
     # Cleanup
     torch.cuda.synchronize()
@@ -814,6 +853,21 @@ def _finalize_training(args, opt_args, gaussians, log_file):
     """Finalize training and print summary"""
     previous_state = getattr(args, 'previous_state_data', None)
 
+    # Save tile distribution statistics if enabled
+    if hasattr(args, 'enable_tile_distribution_stats') and args.enable_tile_distribution_stats:
+        from gaussian_renderer.workload_division import get_tile_distribution_stats
+        stats = get_tile_distribution_stats()
+
+        # Only rank 0 saves the statistics
+        if utils.GLOBAL_RANK == 0:
+            stats_file = os.path.join(args.model_path, "tile_distribution_stats.json")
+            stats_data = {
+                'heuristic_times': stats['heuristic'],
+                'uniform_times': stats['uniform']
+            }
+            with open(stats_file, 'w') as f:
+                json.dump(stats_data, f, indent=2)
+            utils.print_rank_0(f"📊 Saved tile distribution statistics to: {stats_file}")
 
     # Save checkpoint directory for progressive training (temporary file)
     if getattr(args, 'is_progressive_training', False):

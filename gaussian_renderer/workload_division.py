@@ -5,6 +5,41 @@ import time
 import utils.general_utils as utils
 import diff_gaussian_rasterization
 
+########################## Tile Distribution Statistics ##########################
+
+# Module-level statistics storage
+_tile_distribution_stats = {
+    'heuristic': [],
+    'uniform': []
+}
+
+def record_tile_distribution_time(mode, elapsed_time):
+    """
+    Record tile distribution time if statistics collection is enabled
+
+    Args:
+        mode: 'heuristic' or 'uniform'
+        elapsed_time: Time in seconds
+    """
+    args = utils.get_args()
+    if not hasattr(args, 'enable_tile_distribution_stats') or not args.enable_tile_distribution_stats:
+        return
+
+    if mode in _tile_distribution_stats:
+        _tile_distribution_stats[mode].append(elapsed_time)
+
+def get_tile_distribution_stats():
+    """Get current tile distribution statistics"""
+    return _tile_distribution_stats
+
+def reset_tile_distribution_stats():
+    """Reset statistics (called at start of each window)"""
+    global _tile_distribution_stats
+    _tile_distribution_stats = {
+        'heuristic': [],
+        'uniform': []
+    }
+
 ########################## Utility Functions ##########################
 
 
@@ -884,34 +919,51 @@ def start_strategy_final(batched_cameras, strategy_history):
             )
             batched_strategies.append(strategy)
     else:
-        batched_accum_heuristic = [
-            strategy_history.accum_heuristic[camera.uid] for camera in batched_cameras
-        ]  # batch_size * tile_y
-        catted_accum_heuristic = torch.cat(
-            batched_accum_heuristic, dim=0
-        )  # batch_size * tile_y
+        # Check tile distribution mode
+        if args.tile_distribution_mode == "uniform":
+            # Uniform distribution: divide tiles equally among GPUs
+            start_time = time.time()
+            tiles_per_gpu = total_tiles // utils.DEFAULT_GROUP.size()
+            division_pos = [i * tiles_per_gpu for i in range(utils.DEFAULT_GROUP.size() + 1)]
+            division_pos[-1] = total_tiles  # Ensure last position is exactly total_tiles
+            elapsed_time = time.time() - start_time
+            record_tile_distribution_time('uniform', elapsed_time)
+        else:
+            # Heuristic-based distribution (default)
+            start_time = time.time()
+            batched_accum_heuristic = [
+                strategy_history.accum_heuristic[camera.uid] for camera in batched_cameras
+            ]  # batch_size * tile_y
+            catted_accum_heuristic = torch.cat(
+                batched_accum_heuristic, dim=0
+            )  # batch_size * tile_y
 
-        division_pos = division_pos_heuristic(
-            catted_accum_heuristic, total_tiles, utils.DEFAULT_GROUP.size(), right=True
-        )
+            division_pos = division_pos_heuristic(
+                catted_accum_heuristic, total_tiles, utils.DEFAULT_GROUP.size(), right=True
+            )
+            elapsed_time = time.time() - start_time
+            record_tile_distribution_time('heuristic', elapsed_time)
+
         # slightly adjust the division_pos to avoid redundant kernel launch overheads.
-        for i in range(1, len(division_pos) - 1):
-            if (
-                division_pos[i] % n_tiles_per_image + args.border_divpos_coeff
-                >= n_tiles_per_image
-            ):
-                division_pos[i] = (
-                    division_pos[i] // n_tiles_per_image * n_tiles_per_image
-                    + n_tiles_per_image
-                )
-            elif division_pos[i] % n_tiles_per_image - args.border_divpos_coeff <= 0:
-                division_pos[i] = (
-                    division_pos[i] // n_tiles_per_image * n_tiles_per_image
-                )
-        for i in range(0, len(division_pos) - 1):
-            assert (
-                division_pos[i] + args.border_divpos_coeff < division_pos[i + 1]
-            ), "Each part between division_pos must be large enough."
+        # Skip adjustment and assertion for uniform mode to maintain equal distribution
+        if args.tile_distribution_mode != "uniform":
+            for i in range(1, len(division_pos) - 1):
+                if (
+                    division_pos[i] % n_tiles_per_image + args.border_divpos_coeff
+                    >= n_tiles_per_image
+                ):
+                    division_pos[i] = (
+                        division_pos[i] // n_tiles_per_image * n_tiles_per_image
+                        + n_tiles_per_image
+                    )
+                elif division_pos[i] % n_tiles_per_image - args.border_divpos_coeff <= 0:
+                    division_pos[i] = (
+                        division_pos[i] // n_tiles_per_image * n_tiles_per_image
+                    )
+            for i in range(0, len(division_pos) - 1):
+                assert (
+                    division_pos[i] + args.border_divpos_coeff < division_pos[i + 1]
+                ), "Each part between division_pos must be large enough."
 
         batched_strategies = []
         gpuid2tasks = [

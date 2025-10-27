@@ -156,6 +156,8 @@ class OptimizationParams(ParamGroup):
         self.prune_by_visibility = False  # Prune gaussians outside all camera frustums
         self.visibility_prune_margin = 20  # Margin in pixels for visibility-based pruning
         self.use_chunk = False
+        self.tile_distribution_mode = "heuristic"  # Tile distribution strategy: "heuristic" or "uniform"
+        self.enable_tile_distribution_stats = False  # Enable tile distribution performance statistics
         self.opacity_reset_until_iter = 14000
         self.random_background = False
         self.min_opacity = 0.005

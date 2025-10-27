@@ -243,6 +243,14 @@ while [[ $# -gt 0 ]]; do
             USE_ALL_PROCESSED_CAMERAS=true
             shift
             ;;
+        --tile_distribution_mode)
+            TILE_DISTRIBUTION_MODE="$2"
+            shift 2
+            ;;
+        --enable_tile_distribution_stats)
+            ENABLE_TILE_DISTRIBUTION_STATS="--enable_tile_distribution_stats"
+            shift
+            ;;
         --deterministic)
             DETERMINISTIC="--deterministic"
             shift
@@ -494,6 +502,14 @@ fi
 
 if [[ "$USE_ALL_PROCESSED_CAMERAS" == true ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --use_all_processed_cameras"
+fi
+
+if [[ -n "$TILE_DISTRIBUTION_MODE" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --tile_distribution_mode=$TILE_DISTRIBUTION_MODE"
+fi
+
+if [[ -n "$ENABLE_TILE_DISTRIBUTION_STATS" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS $ENABLE_TILE_DISTRIBUTION_STATS"
 fi
 
 if [[ "$DEBUG" == true ]]; then

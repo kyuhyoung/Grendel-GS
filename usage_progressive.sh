@@ -54,8 +54,8 @@ BACKEND="gsplat"                         # Rendering backend: default or gsplat
 # Flags (set to "true" to enable, "false" to disable)
 DETERMINISTIC=false                      # Enable deterministic training
 DEBUG=true                               # Enable debug output
-EXIT_AFTER_FIRST_REMOVAL=true            # Exit after first camera removal (for testing)
-#EXIT_AFTER_FIRST_REMOVAL=false            # Exit after first camera removal (for testing)
+#EXIT_AFTER_FIRST_REMOVAL=true            # Exit after first camera removal (for testing)
+EXIT_AFTER_FIRST_REMOVAL=false            # Exit after first camera removal (for testing)
 SHOW_MEMORY_DEBUG_INFO=false          # Show detailed memory debug info (memory, tensor stats)
 USE_CHUNK=true                           # Enable chunked SSIM for memory efficiency
 #USE_CHUNK=false                           # Enable chunked SSIM for memory efficiency
@@ -107,6 +107,14 @@ ENABLE_DIRECTION_FILTERING=false        # Disable filtering, allow all cameras i
 # Camera removal and processing options
 USE_ALL_PROCESSED_CAMERAS=true         # Use all ever-processed cameras when checking for gaussian addition (recommended)
 #USE_ALL_PROCESSED_CAMERAS=false         # Use only prev window cameras (may add duplicate gaussians)
+
+# Tile distribution strategy
+#TILE_DISTRIBUTION_MODE="heuristic"      # Use heuristic-based tile distribution (default, workload-balanced)
+TILE_DISTRIBUTION_MODE="uniform"        # Use uniform tile distribution (simpler, safer for OOM issues)
+
+# Tile distribution performance statistics
+#ENABLE_TILE_DISTRIBUTION_STATS=false   # Enable performance statistics collection for tile distribution modes
+ENABLE_TILE_DISTRIBUTION_STATS=true    # Enable to compare heuristic vs uniform performance
 
 # Advanced options (leave empty if not needed)
 DTM_MODULE=""                            # Path to external DTM module
@@ -169,6 +177,8 @@ echo "  F Mode: $F_MODE"
 echo "  Enable Direction Filtering: $ENABLE_DIRECTION_FILTERING"
 echo "  Footprint Intersection Threshold: $FOOTPRINT_INTERSECTION_THRESHOLD"
 echo "  Use All Processed Cameras: $USE_ALL_PROCESSED_CAMERAS"
+echo "  Tile Distribution Mode: $TILE_DISTRIBUTION_MODE"
+echo "  Enable Tile Distribution Stats: $ENABLE_TILE_DISTRIBUTION_STATS"
 echo "  E Selection Strategy: $E_SELECTION_STRATEGY"
 if [[ "$E_SELECTION_STRATEGY" == "weighted" ]]; then
     echo "    - Alpha (R weight): $E_WEIGHTED_ALPHA"
@@ -369,6 +379,14 @@ fi
 
 if [[ "$USE_ALL_PROCESSED_CAMERAS" == "true" ]]; then
     CMD="$CMD --use_all_processed_cameras"
+fi
+
+if [[ -n "$TILE_DISTRIBUTION_MODE" ]]; then
+    CMD="$CMD --tile_distribution_mode $TILE_DISTRIBUTION_MODE"
+fi
+
+if [[ "$ENABLE_TILE_DISTRIBUTION_STATS" == "true" ]]; then
+    CMD="$CMD --enable_tile_distribution_stats"
 fi
 
 if [[ "$EXIT_AFTER_FIRST_REMOVAL" == "true" ]]; then

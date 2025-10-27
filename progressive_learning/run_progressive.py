@@ -68,6 +68,8 @@ def main():
     parser.add_argument('--exit_after_first_removal', action='store_true', help='Exit after first camera removal for testing')
     parser.add_argument('--use_all_processed_cameras', action='store_true', help='Check all processed cameras (not just prev window) when adding gaussians')
     parser.add_argument('--camera_removal_margin', type=float, default=0.15, help='Margin below densify_memory_limit for camera removal (default: 0.15)')
+    parser.add_argument('--tile_distribution_mode', type=str, default='heuristic', choices=['heuristic', 'uniform'], help='Tile distribution strategy: heuristic (workload-balanced) or uniform (safer for OOM)')
+    parser.add_argument('--enable_tile_distribution_stats', action='store_true', help='Enable tile distribution performance statistics collection and reporting')
 
     args = parser.parse_args()
 
@@ -133,6 +135,8 @@ def main():
     trainer.track_by_projection = args.track_by_projection
     trainer.prune_by_visibility = args.prune_by_visibility
     trainer.visibility_prune_margin = args.visibility_prune_margin
+    trainer.tile_distribution_mode = args.tile_distribution_mode
+    trainer.enable_tile_distribution_stats = args.enable_tile_distribution_stats
 
     # Run the progressive training pipeline with sliding window
     try:
