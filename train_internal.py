@@ -488,18 +488,23 @@ def _process_iteration(iteration, gaussians, scene, args, timers, strategy_histo
         train_dataset, strategy_history, args, timers, gaussians, iteration)
 
     # Execute rendering pipeline
-    import time
-    start_time = time.time()
-    batched_image, batched_compute_locally, batch_statistic_collector, batched_screenspace_pkg = _execute_rendering(
-        batched_cameras, gaussians, pipe_args, background, batched_strategies, args)
-    torch.cuda.synchronize()  # Wait for all GPUs to finish
-    elapsed_time = time.time() - start_time
-
-    # Record tile distribution time if enabled
     if hasattr(args, 'enable_tile_distribution_stats') and args.enable_tile_distribution_stats:
+        # Measure rendering time with GPU synchronization
+        import time
+        start_time = time.time()
+        batched_image, batched_compute_locally, batch_statistic_collector, batched_screenspace_pkg = _execute_rendering(
+            batched_cameras, gaussians, pipe_args, background, batched_strategies, args)
+        torch.cuda.synchronize()  # Wait for all GPUs to finish
+        elapsed_time = time.time() - start_time
+
+        # Record tile distribution time
         from gaussian_renderer.workload_division import record_tile_distribution_time
         mode = getattr(args, 'tile_distribution_mode', 'heuristic')
         record_tile_distribution_time(mode, elapsed_time)
+    else:
+        # Normal execution without measurement overhead
+        batched_image, batched_compute_locally, batch_statistic_collector, batched_screenspace_pkg = _execute_rendering(
+            batched_cameras, gaussians, pipe_args, background, batched_strategies, args)
 
     # Debug: Check Gaussian projection and colors for first iteration
     '''
