@@ -91,6 +91,15 @@ def compare_tile_stats(heuristic_log, uniform_log, output_log="compare_tile_stat
     lines.append(f"Uniform log:   {uniform_log}")
     lines.append("")
 
+    # Check for call count difference
+    if heuristic['count'] != uniform['count']:
+        lines.append(f"⚠️  WARNING: Different call counts detected!")
+        lines.append(f"   Heuristic: {heuristic['count']} calls")
+        lines.append(f"   Uniform:   {uniform['count']} calls")
+        lines.append(f"   This may indicate incomplete training (OOM, interruption, etc.)")
+        lines.append(f"   Using per-iteration metrics (mean/median) for fair comparison.")
+        lines.append("")
+
     # Display comparison table
     lines.append("-"*80)
     lines.append(f"{'Metric':<25} {'Heuristic':>18} {'Uniform':>18} {'Overhead':>18}")
@@ -166,13 +175,25 @@ def compare_tile_stats(heuristic_log, uniform_log, output_log="compare_tile_stat
     lines.append("")
 
     lines.append("2. Total Training Time Impact")
-    lines.append(f"   Total overhead: {overhead_total:.2f} ms = {overhead_total/1000:.3f} seconds")
 
-    if heuristic['count'] > 0:
-        avg_iterations_per_window = heuristic['count'] / 10  # Assume ~10 windows
-        estimated_total_iterations = avg_iterations_per_window * 15  # Assume 15 windows total
-        estimated_total_overhead = overhead_mean * estimated_total_iterations
-        lines.append(f"   Estimated overhead for full training: {estimated_total_overhead:.2f} ms = {estimated_total_overhead/1000:.3f} seconds")
+    if heuristic['count'] == uniform['count']:
+        # Same number of calls - direct comparison is valid
+        lines.append(f"   Total overhead: {overhead_total:.2f} ms = {overhead_total/1000:.3f} seconds")
+    else:
+        # Different call counts - normalize to per-call basis
+        lines.append(f"   ⚠️  Call counts differ - comparing per-iteration averages:")
+        lines.append(f"   Heuristic total: {h_total:.2f} ms over {heuristic['count']} calls")
+        lines.append(f"   Uniform total:   {u_total:.2f} ms over {uniform['count']} calls")
+        lines.append(f"   Per-iteration overhead: {overhead_mean:.4f} ms")
+
+        # Estimate what total would be if both had same number of iterations
+        if uniform['count'] > 0:
+            normalized_h_total = h_mean * uniform['count']
+            normalized_overhead = normalized_h_total - u_total
+            lines.append(f"   If heuristic ran {uniform['count']} iterations:")
+            lines.append(f"      Estimated total: {normalized_h_total:.2f} ms")
+            lines.append(f"      Total overhead: {normalized_overhead:.2f} ms = {normalized_overhead/1000:.3f} seconds")
+
     lines.append("")
 
     lines.append("3. Workload Balance Analysis")
