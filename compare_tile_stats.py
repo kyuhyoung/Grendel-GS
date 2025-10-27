@@ -47,6 +47,8 @@ def parse_log_file(log_path):
         'min': r'Min Time \(ms\)\s+([\d.]+)',
         'max': r'Max Time \(ms\)\s+([\d.]+)',
         'total': r'Total Time \(ms\)\s+([\d.]+)',
+        'avg_waiting': r'Avg GPU Waiting Time \(ms\)\s+([\d.]+)',
+        'max_waiting': r'Max GPU Waiting Time \(ms\)\s+([\d.]+)',
     }
 
     for key, pattern in patterns.items():
@@ -57,7 +59,9 @@ def parse_log_file(log_path):
             else:
                 stats[key] = float(match.group(1))
         else:
-            print(f"Warning: Could not extract {key} from {log_path}")
+            # GPU waiting times are optional
+            if key not in ['avg_waiting', 'max_waiting']:
+                print(f"Warning: Could not extract {key} from {log_path}")
             stats[key] = 0
 
     return stats
@@ -151,6 +155,17 @@ def compare_tile_stats(heuristic_log, uniform_log, output_log="compare_tile_stat
           f"{overhead_total:>+17.2f}")
 
     lines.append("-"*80)
+
+    # GPU Waiting Time comparison
+    h_avg_waiting = heuristic.get('avg_waiting', 0)
+    u_avg_waiting = uniform.get('avg_waiting', 0)
+    if h_avg_waiting > 0 or u_avg_waiting > 0:
+        lines.append("")
+        lines.append("GPU Workload Imbalance:")
+        diff_waiting = u_avg_waiting - h_avg_waiting
+        lines.append(f"{'Avg GPU Waiting (ms)':<25} {h_avg_waiting:>18.4f} {u_avg_waiting:>18.4f} "
+              f"{diff_waiting:>+17.4f}")
+
     lines.append("")
 
     # Analysis
@@ -210,6 +225,24 @@ def compare_tile_stats(heuristic_log, uniform_log, output_log="compare_tile_stat
         lines.append(f"   (Unexpected - check if data is correct)")
     else:
         lines.append(f"   ➡️  Both modes have similar variance")
+
+    # GPU Waiting Time Analysis
+    if h_avg_waiting > 0 or u_avg_waiting > 0:
+        lines.append("")
+        lines.append("   GPU Imbalance (Waiting Time):")
+        lines.append(f"   Heuristic avg waiting: {h_avg_waiting:.4f} ms")
+        lines.append(f"   Uniform avg waiting:   {u_avg_waiting:.4f} ms")
+        if u_avg_waiting > h_avg_waiting * 1.1:
+            reduction = ((u_avg_waiting - h_avg_waiting) / u_avg_waiting) * 100
+            lines.append(f"   ⚡ Heuristic reduces GPU waiting time by {reduction:.1f}%")
+            lines.append(f"   This shows effective workload balancing")
+        elif h_avg_waiting > u_avg_waiting * 1.1:
+            increase = ((h_avg_waiting - u_avg_waiting) / u_avg_waiting) * 100
+            lines.append(f"   ⚠️  Heuristic increases GPU waiting time by {increase:.1f}%")
+            lines.append(f"   (Unexpected - heuristic should reduce waiting)")
+        else:
+            lines.append(f"   ➡️  Similar GPU waiting times (< 10% difference)")
+
     lines.append("")
 
     lines.append("4. Summary")
