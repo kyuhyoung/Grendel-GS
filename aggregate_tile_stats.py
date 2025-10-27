@@ -53,6 +53,8 @@ def aggregate_tile_stats(output_dir):
     # Collect statistics from all window directories
     all_heuristic_times = []
     all_uniform_times = []
+    all_heuristic_gpu_details = []
+    all_uniform_gpu_details = []
 
     # Find all model directories
     model_dirs = []
@@ -79,8 +81,12 @@ def aggregate_tile_stats(output_dir):
                     stats = json.load(f)
                 heuristic_times = stats.get('heuristic_times', [])
                 uniform_times = stats.get('uniform_times', [])
+                heuristic_gpu_details = stats.get('heuristic_gpu_details', [])
+                uniform_gpu_details = stats.get('uniform_gpu_details', [])
                 all_heuristic_times.extend(heuristic_times)
                 all_uniform_times.extend(uniform_times)
+                all_heuristic_gpu_details.extend(heuristic_gpu_details)
+                all_uniform_gpu_details.extend(uniform_gpu_details)
                 print(f"  ✓ {model_dir.name}: {len(heuristic_times)} heuristic, {len(uniform_times)} uniform")
             except Exception as e:
                 print(f"  ✗ Warning: Could not load {stats_file}: {e}")
@@ -131,6 +137,18 @@ def aggregate_tile_stats(output_dir):
         lines.append(f"{'Min Time (ms)':<30} {heuristic_stats['min']:>20.4f}")
         lines.append(f"{'Max Time (ms)':<30} {heuristic_stats['max']:>20.4f}")
         lines.append(f"{'Total Time (ms)':<30} {heuristic_stats['total']:>20.2f}")
+
+        # Add GPU imbalance statistics
+        if all_heuristic_gpu_details:
+            lines.append("")
+            lines.append("GPU Workload Balance:")
+            lines.append("-"*80)
+            waiting_times = [d['waiting'] * 1000 for d in all_heuristic_gpu_details if 'waiting' in d]
+            if waiting_times:
+                avg_waiting = np.mean(waiting_times)
+                max_waiting = np.max(waiting_times)
+                lines.append(f"{'Avg GPU Waiting Time (ms)':<30} {avg_waiting:>20.4f}")
+                lines.append(f"{'Max GPU Waiting Time (ms)':<30} {max_waiting:>20.4f}")
     elif uniform_used and not heuristic_used:
         # Only uniform mode
         lines.append("Mode: UNIFORM")
@@ -144,6 +162,18 @@ def aggregate_tile_stats(output_dir):
         lines.append(f"{'Min Time (ms)':<30} {uniform_stats['min']:>20.4f}")
         lines.append(f"{'Max Time (ms)':<30} {uniform_stats['max']:>20.4f}")
         lines.append(f"{'Total Time (ms)':<30} {uniform_stats['total']:>20.2f}")
+
+        # Add GPU imbalance statistics
+        if all_uniform_gpu_details:
+            lines.append("")
+            lines.append("GPU Workload Balance:")
+            lines.append("-"*80)
+            waiting_times = [d['waiting'] * 1000 for d in all_uniform_gpu_details if 'waiting' in d]
+            if waiting_times:
+                avg_waiting = np.mean(waiting_times)
+                max_waiting = np.max(waiting_times)
+                lines.append(f"{'Avg GPU Waiting Time (ms)':<30} {avg_waiting:>20.4f}")
+                lines.append(f"{'Max GPU Waiting Time (ms)':<30} {max_waiting:>20.4f}")
     elif heuristic_used and uniform_used:
         # Both modes used - show comparison
         lines.append("Mode: BOTH (Comparison)")
@@ -210,7 +240,9 @@ def aggregate_tile_stats(output_dir):
         'heuristic': heuristic_stats,
         'uniform': uniform_stats,
         'all_heuristic_times': all_heuristic_times,
-        'all_uniform_times': all_uniform_times
+        'all_uniform_times': all_uniform_times,
+        'all_heuristic_gpu_details': all_heuristic_gpu_details,
+        'all_uniform_gpu_details': all_uniform_gpu_details
     }
     try:
         with open(summary_file, 'w') as f:
