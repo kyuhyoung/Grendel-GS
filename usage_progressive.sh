@@ -109,8 +109,8 @@ USE_ALL_PROCESSED_CAMERAS=true         # Use all ever-processed cameras when che
 #USE_ALL_PROCESSED_CAMERAS=false         # Use only prev window cameras (may add duplicate gaussians)
 
 # Tile distribution strategy
-#TILE_DISTRIBUTION_MODE="heuristic"      # Use heuristic-based tile distribution (default, workload-balanced)
-TILE_DISTRIBUTION_MODE="uniform"        # Use uniform tile distribution (simpler, safer for OOM issues)
+TILE_DISTRIBUTION_MODE="heuristic"      # Use heuristic-based tile distribution (default, workload-balanced)
+#TILE_DISTRIBUTION_MODE="uniform"        # Use uniform tile distribution (simpler, safer for OOM issues)
 
 # Tile distribution performance statistics
 #ENABLE_TILE_DISTRIBUTION_STATS=false   # Enable performance statistics collection for tile distribution modes
