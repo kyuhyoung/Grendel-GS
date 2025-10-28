@@ -211,6 +211,21 @@ def aggregate_tile_stats(output_dir):
         lines.append(f"{'Total Time (ms)':<25} {h_total:>18.2f} {u_total:>18.2f} {diff_total:>+18.2f}")
         lines.append("-"*80)
 
+        # GPU Workload Balance comparison
+        if all_heuristic_gpu_details or all_uniform_gpu_details:
+            lines.append("")
+            lines.append("GPU Workload Balance:")
+            lines.append("-"*80)
+
+            h_waiting_times = [d['waiting'] * 1000 for d in all_heuristic_gpu_details if 'waiting' in d]
+            u_waiting_times = [d['waiting'] * 1000 for d in all_uniform_gpu_details if 'waiting' in d]
+
+            h_avg_waiting = np.mean(h_waiting_times) if h_waiting_times else 0.0
+            u_avg_waiting = np.mean(u_waiting_times) if u_waiting_times else 0.0
+            diff_waiting = h_avg_waiting - u_avg_waiting
+
+            lines.append(f"{'Avg GPU Waiting (ms)':<25} {h_avg_waiting:>18.4f} {u_avg_waiting:>18.4f} {diff_waiting:>+18.4f}")
+
         # Performance comparison
         if h_mean > 0:
             speedup = u_mean / h_mean

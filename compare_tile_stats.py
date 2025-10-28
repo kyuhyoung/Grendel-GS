@@ -233,13 +233,20 @@ def compare_tile_stats(heuristic_log, uniform_log, output_log="compare_tile_stat
         lines.append(f"   Heuristic avg waiting: {h_avg_waiting:.4f} ms")
         lines.append(f"   Uniform avg waiting:   {u_avg_waiting:.4f} ms")
         if u_avg_waiting > h_avg_waiting * 1.1:
-            reduction = ((u_avg_waiting - h_avg_waiting) / u_avg_waiting) * 100
-            lines.append(f"   ⚡ Heuristic reduces GPU waiting time by {reduction:.1f}%")
-            lines.append(f"   This shows effective workload balancing")
+            if u_avg_waiting > 0:
+                reduction = ((u_avg_waiting - h_avg_waiting) / u_avg_waiting) * 100
+                lines.append(f"   ⚡ Heuristic reduces GPU waiting time by {reduction:.1f}%")
+                lines.append(f"   This shows effective workload balancing")
+            else:
+                lines.append(f"   ⚠️  Cannot calculate reduction percentage (uniform waiting time is 0)")
         elif h_avg_waiting > u_avg_waiting * 1.1:
-            increase = ((h_avg_waiting - u_avg_waiting) / u_avg_waiting) * 100
-            lines.append(f"   ⚠️  Heuristic increases GPU waiting time by {increase:.1f}%")
-            lines.append(f"   (Unexpected - heuristic should reduce waiting)")
+            if u_avg_waiting > 0:
+                increase = ((h_avg_waiting - u_avg_waiting) / u_avg_waiting) * 100
+                lines.append(f"   ⚠️  Heuristic increases GPU waiting time by {increase:.1f}%")
+                lines.append(f"   (Unexpected - heuristic should reduce waiting)")
+            else:
+                lines.append(f"   ⚠️  Heuristic has waiting time ({h_avg_waiting:.4f} ms) but Uniform does not")
+                lines.append(f"   (Unusual - check if Uniform data is complete)")
         else:
             lines.append(f"   ➡️  Similar GPU waiting times (< 10% difference)")
 
