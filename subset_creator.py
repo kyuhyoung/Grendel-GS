@@ -105,8 +105,8 @@ class FootprintCalculator:
                             # Skip the next line (2D points data)
                             i += 2
                         except ValueError as e:
-                            logger.error(f"Error parsing image line {i+1}: {line}")
-                            logger.error(f"ValueError: {e}")
+                            # logger.error(f"Error parsing image line {i+1}: {line}")
+                            logger.error(f"Error parsing image line {i+1} - ValueError: {e}")
                             i += 1
                     else:
                         i += 1
