@@ -424,6 +424,11 @@ def greedy_subset_creation(image_footprints: Dict[int, Dict], threshold_a: int, 
         print(f"Completed subset {len(subsets)} with {len(current_subset)} images")
         print(f"  Union: {current_union['width']:.1f} x {current_union['height']:.1f}, aspect ratio: {current_union['aspect_ratio']:.3f}")
         print(f"  Total pixels: {current_union['pixels']:,}")
+        # Show image IDs (first 10 if more than 10)
+        if len(current_subset) <= 10:
+            print(f"  Image IDs: {current_subset}")
+        else:
+            print(f"  Image IDs: {current_subset[:10]}... (and {len(current_subset)-10} more)")
 
     return subsets
 
@@ -461,6 +466,10 @@ def validate_subsets(subsets: List[List[int]], image_footprints: Dict[int, Dict]
         union = calculate_union_footprint(footprints)
         pixel_counts.append(union['pixels'])
         print(f"  Subset {i+1}: {len(subset)} images, {union['pixels']:,} pixels, aspect ratio: {union['aspect_ratio']:.3f}")
+        if len(subset) <= 10:
+            print(f"    Image IDs: {subset}")
+        else:
+            print(f"    Image IDs: {subset[:10]}... (and {len(subset)-10} more)")
 
     # Check ratio constraint
     min_pixels = min(pixel_counts)
@@ -522,6 +531,16 @@ def main():
 
     print(f"\nSubsets saved to: {output_file}")
     print(f"Created {len(subsets)} subsets for {len(images)} images")
+    
+    # Print final subset summary
+    print("\n=== FINAL SUBSET SUMMARY ===")
+    for i, subset in enumerate(subsets):
+        print(f"Subset {i+1}: {len(subset)} images")
+        if len(subset) <= 20:
+            print(f"  IDs: {subset}")
+        else:
+            print(f"  IDs: {subset[:20]}... (and {len(subset)-20} more)")
+    print("============================")
 
     return 0 if valid else 1
 

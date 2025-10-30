@@ -348,6 +348,7 @@ class SubsetCreator:
             logger.info(f"Completed subset {len(subsets)}: {len(current_subset)} images, "
                        f"{final_metrics['pixel_count']:,} pixels, "
                        f"aspect ratio {final_metrics['aspect_ratio']:.3f}")
+            logger.info(f"  Image IDs: {current_subset[:10]}{'...' if len(current_subset) > 10 else ''}")
         
         # Handle remaining images (add to smallest subset or create new one)
         if unassigned:
@@ -488,6 +489,7 @@ class SubsetCreator:
             logger.info(f"  Subset {i+1}: {len(subset)} images, "
                        f"{metrics['pixel_count']:,} pixels, "
                        f"aspect ratio {metrics['aspect_ratio']:.3f}")
+            logger.info(f"    Image IDs: {subset[:10]}{'...' if len(subset) > 10 else ''}")
             
             # Constraint 2: pixel count <= A
             if metrics['pixel_count'] > pixel_threshold_a:
@@ -574,5 +576,16 @@ def create_subsets_with_footprints(source_path: Path, output_path: Path,
     
     logger.info(f"Subset creation completed. Results saved to: {results_file}")
     logger.info(f"Created {len(subsets)} subsets for {len(images)} images")
+    
+    # Print final subset summary
+    logger.info("\n=== SUBSET SUMMARY ===")
+    for i, subset in enumerate(subsets):
+        logger.info(f"Subset {i+1}: {len(subset)} images")
+        # Show first 20 image IDs for each subset
+        if len(subset) <= 20:
+            logger.info(f"  IDs: {subset}")
+        else:
+            logger.info(f"  IDs: {subset[:20]}... (and {len(subset)-20} more)")
+    logger.info("===================")
     
     return subsets
