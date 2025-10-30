@@ -79,10 +79,16 @@ class FootprintCalculator:
             # Load images
             images = {}
             with open(sparse_dir / "images.txt", 'r') as f:
-                for line_num, line in enumerate(f, 1):
-                    if line.startswith('#'):
+                lines = f.readlines()
+                i = 0
+                while i < len(lines):
+                    line = lines[i].strip()
+                    if line.startswith('#') or not line:
+                        i += 1
                         continue
-                    parts = line.strip().split()
+                    
+                    # Parse image metadata line (first line)
+                    parts = line.split()
                     if len(parts) >= 10:
                         try:
                             img_id = int(parts[0])
@@ -96,11 +102,14 @@ class FootprintCalculator:
                                 'camera_id': cam_id,
                                 'name': name
                             }
+                            # Skip the next line (2D points data)
+                            i += 2
                         except ValueError as e:
-                            logger.error(f"Error parsing image line {line_num}: {line.strip()}")
-                            # logger.error(f"Parts: {parts}")
+                            logger.error(f"Error parsing image line {i+1}: {line}")
                             logger.error(f"ValueError: {e}")
-                            continue
+                            i += 1
+                    else:
+                        i += 1
             
             logger.info(f"Loaded {len(cameras)} cameras, {len(images)} images")
             return cameras, images
