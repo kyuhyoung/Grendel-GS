@@ -336,7 +336,7 @@ def calculate_union_footprint(footprints: List[Dict]) -> Dict:
     }
 
 def greedy_subset_creation(image_footprints: Dict[int, Dict], threshold_a: int, threshold_d: float) -> List[List[int]]:
-    """Create subsets using greedy algorithm"""
+    """Create subsets using greedy algorithm with minimum 2 images per subset"""
 
     image_ids = list(image_footprints.keys())
     unassigned = set(image_ids)
@@ -345,14 +345,46 @@ def greedy_subset_creation(image_footprints: Dict[int, Dict], threshold_a: int, 
     print(f"Creating subsets for {len(image_ids)} images...")
     print(f"Threshold A (max pixels): {threshold_a:,}")
     print(f"Threshold D (min ratio): {threshold_d}")
+    print(f"Minimum images per subset: 2")
 
     while unassigned:
+        # Check if we have at least 2 images left to form a valid subset
+        if len(unassigned) < 2:
+            print(f"WARNING: Only {len(unassigned)} image(s) remaining, cannot form valid subset")
+            # Add remaining image(s) to the smallest existing subset
+            if unassigned and subsets:
+                smallest_idx = min(range(len(subsets)), key=lambda i: len(subsets[i]))
+                subsets[smallest_idx].extend(list(unassigned))
+                print(f"  Added remaining image(s) to subset {smallest_idx + 1}")
+                unassigned.clear()
+            break
+        
         # Start new subset with an unassigned image
         current_subset = [unassigned.pop()]
         current_footprints = [image_footprints[current_subset[0]]]
         current_union = calculate_union_footprint(current_footprints)
 
         print(f"\nStarting subset {len(subsets) + 1} with image {current_subset[0]}")
+        
+        # Ensure minimum 2 images - force add at least one more
+        if unassigned:
+            # Find closest image to ensure minimum subset size
+            best_candidate = None
+            best_distance = float('inf')
+            for candidate_id in unassigned:
+                # Simple distance metric based on footprint centers
+                dist = ((image_footprints[candidate_id]['center_x'] - image_footprints[current_subset[0]]['center_x'])**2 +
+                       (image_footprints[candidate_id]['center_y'] - image_footprints[current_subset[0]]['center_y'])**2)**0.5
+                if dist < best_distance:
+                    best_distance = dist
+                    best_candidate = candidate_id
+            
+            if best_candidate is not None:
+                current_subset.append(best_candidate)
+                current_footprints.append(image_footprints[best_candidate])
+                current_union = calculate_union_footprint(current_footprints)
+                unassigned.remove(best_candidate)
+                print(f"  Added image {best_candidate} to meet minimum size requirement")
 
         # Try to add more images to current subset
         improved = True
@@ -396,9 +428,15 @@ def greedy_subset_creation(image_footprints: Dict[int, Dict], threshold_a: int, 
     return subsets
 
 def validate_subsets(subsets: List[List[int]], image_footprints: Dict[int, Dict], threshold_d: float) -> bool:
-    """Validate subset constraints"""
+    """Validate subset constraints including minimum size"""
 
     print(f"\nValidating {len(subsets)} subsets...")
+    
+    # Check minimum size constraint (at least 2 images per subset)
+    for i, subset in enumerate(subsets):
+        if len(subset) < 2:
+            print(f"ERROR: Subset {i+1} has only {len(subset)} image(s), minimum 2 required")
+            return False
 
     # Check no image sharing
     all_images = set()

@@ -262,11 +262,17 @@ class SubsetCreator:
         logger.info(f"Pixel threshold A: {pixel_threshold_a:,}")
         logger.info(f"Min/Max ratio D: {min_max_ratio_d}")
         logger.info(f"Max subsets: {max_subsets}")
+        logger.info(f"Minimum images per subset: 2")
         
         iteration = 0
         while unassigned and len(subsets) < max_subsets:
             iteration += 1
             logger.info(f"\n--- Iteration {iteration}: {len(unassigned)} images remaining ---")
+            
+            # Check if we have at least 2 images left to form a valid subset
+            if len(unassigned) < 2:
+                logger.warning(f"Only {len(unassigned)} image(s) remaining, cannot form valid subset (min 2 required)")
+                break
             
             # Start new subset
             current_subset = []
@@ -278,7 +284,24 @@ class SubsetCreator:
             
             logger.info(f"Started subset {len(subsets) + 1} with image {best_start}")
             
-            # Greedily add images to current subset
+            # Ensure minimum 2 images per subset - try to add at least one more image
+            if len(current_subset) == 1 and unassigned:
+                # Force add closest image to ensure minimum subset size
+                closest_img = None
+                closest_dist = float('inf')
+                
+                for candidate_id in unassigned:
+                    proximity_score = self.calculate_proximity_score(current_subset, candidate_id)
+                    if proximity_score < closest_dist:
+                        closest_dist = proximity_score
+                        closest_img = candidate_id
+                
+                if closest_img is not None:
+                    current_subset.append(closest_img)
+                    unassigned.remove(closest_img)
+                    logger.info(f"  Force added image {closest_img} to meet minimum size requirement")
+            
+            # Greedily add more images to current subset
             improved = True
             while improved and unassigned:
                 improved = False
@@ -318,7 +341,9 @@ class SubsetCreator:
                               f"aspect={best_metrics['aspect_ratio']:.3f}, "
                               f"size={len(current_subset)}")
             
-            subsets.append(current_subset)
+            # Only add subset if it has at least 2 images
+            if len(current_subset) >= 2:
+                subsets.append(current_subset)
             final_metrics = self.calculate_union_metrics(current_subset)
             logger.info(f"Completed subset {len(subsets)}: {len(current_subset)} images, "
                        f"{final_metrics['pixel_count']:,} pixels, "
@@ -326,11 +351,22 @@ class SubsetCreator:
         
         # Handle remaining images (add to smallest subset or create new one)
         if unassigned:
-            if len(subsets) < max_subsets:
-                # Create final subset with remaining images
+            remaining_count = len(unassigned)
+            
+            if remaining_count >= 2 and len(subsets) < max_subsets:
+                # Create final subset with remaining images if we have at least 2
                 remaining_list = list(unassigned)
                 subsets.append(remaining_list)
                 logger.info(f"Created final subset {len(subsets)} with {len(remaining_list)} remaining images")
+            elif remaining_count == 1:
+                # Only 1 image left - add to smallest existing subset
+                logger.warning(f"1 image remaining (ID: {list(unassigned)[0]}), adding to smallest subset")
+                if subsets:
+                    smallest_idx = min(range(len(subsets)), key=lambda i: len(subsets[i]))
+                    subsets[smallest_idx].extend(list(unassigned))
+                    logger.info(f"  Added to subset {smallest_idx + 1}")
+                else:
+                    logger.error("No subsets created and only 1 image remaining - cannot satisfy minimum size constraint")
             else:
                 # Distribute remaining images to existing subsets
                 self.distribute_remaining_images(subsets, list(unassigned), pixel_threshold_a)
@@ -418,6 +454,12 @@ class SubsetCreator:
     def validate_subsets(self, subsets: List[List[int]], pixel_threshold_a: int, min_max_ratio_d: float) -> bool:
         """Validate subset constraints"""
         logger.info(f"\nValidating {len(subsets)} subsets...")
+        
+        # Check minimum size constraint (at least 2 images per subset)
+        for i, subset in enumerate(subsets):
+            if len(subset) < 2:
+                logger.error(f"Minimum size constraint violated: Subset {i+1} has only {len(subset)} image(s), minimum 2 required")
+                return False
         
         # Check constraint 4: no image sharing
         all_images = set()
