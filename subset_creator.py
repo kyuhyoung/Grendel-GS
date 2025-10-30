@@ -19,6 +19,14 @@ from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 import json
 
+# PuLP import with fallback
+try:
+    from pulp import *
+    PULP_AVAILABLE = True
+except ImportError:
+    PULP_AVAILABLE = False
+    logger.warning("PuLP library not available. Will use greedy fallback for optimization.")
+
 logger = logging.getLogger(__name__)
 
 class FootprintCalculator:
@@ -272,103 +280,98 @@ class SubsetCreator:
         """
         Stage 1: ILP를 사용한 초기 서브셋 할당 (픽셀 합 근사)
         """
-        try:
-            from pulp import *
-            logger.info("Stage 1: ILP 기반 초기 할당 시작...")
+        if not PULP_AVAILABLE:
+            raise ImportError("PuLP library is required for Two-Stage subset creation. Install with: pip install pulp")
             
-            image_ids = list(self.images.keys())
-            N = len(image_ids)
-            K = min(max_subsets, N // 2)
-            
-            # 변수 정의
-            x = {}  # x[i,j] = 이미지 i가 서브셋 j에 속하면 1
-            y = {}  # y[j] = 서브셋 j가 사용되면 1
-            
-            for i in range(N):
-                for j in range(K):
-                    x[i, j] = LpVariable(f"x_{i}_{j}", cat='Binary')
-            
+        logger.info("Stage 1: ILP 기반 초기 할당 시작...")
+        
+        image_ids = list(self.images.keys())
+        N = len(image_ids)
+        K = min(max_subsets, max(1, N // 2))  # 최대 subset 수 결정
+        
+        logger.info(f"Images: {N}, Max subsets: {K}")
+        
+        # 변수 정의
+        x = {}  # x[i,j] = 1 if image i assigned to subset j
+        y = {}  # y[j] = 1 if subset j is used
+        
+        for i in range(N):
             for j in range(K):
-                y[j] = LpVariable(f"y_{j}", cat='Binary')
-            
-            # 각 서브셋의 근사 픽셀 수 (단순 합)
-            subset_pixels = {}
-            for j in range(K):
-                subset_pixels[j] = lpSum([
-                    self.image_footprints[image_ids[i]].area * 
-                    self.cameras[self.images[image_ids[i]]['camera_id']]['width'] * 
-                    self.cameras[self.images[image_ids[i]]['camera_id']]['height'] / 
-                    self.image_footprints[image_ids[i]].area * x[i,j] 
-                    for i in range(N)
-                ])
-            
-            # 목적함수: target_a로부터의 편차 최소화 + 분산 최소화
-            prob = LpProblem("Stage1_Subset_Assignment", LpMinimize)
-            
-            # A로부터의 편차 계산
-            deviations = {}
-            for j in range(K):
-                dev_pos = LpVariable(f"dev_pos_{j}", lowBound=0)
-                dev_neg = LpVariable(f"dev_neg_{j}", lowBound=0)
-                prob += subset_pixels[j] - target_a == dev_pos - dev_neg
-                deviations[j] = dev_pos + dev_neg
-            
-            # 분산 최소화를 위한 max-min 계산
-            max_pixels = LpVariable("max_pixels", lowBound=0)
-            min_pixels = LpVariable("min_pixels", lowBound=0)
-            
-            for j in range(K):
-                prob += max_pixels >= subset_pixels[j] - (1 - y[j]) * target_a * 2
-                prob += min_pixels <= subset_pixels[j] + (1 - y[j]) * target_a * 2
-            
-            # 가중 목적함수
-            total_deviation = lpSum(deviations.values())
-            pixel_range = max_pixels - min_pixels
-            prob += 1.0 * total_deviation + 2.0 * pixel_range
-            
-            # 제약조건들
-            # 1. 각 이미지는 정확히 하나의 서브셋에만
-            for i in range(N):
-                prob += lpSum([x[i, j] for j in range(K)]) == 1
-            
-            # 2. 각 서브셋 최소 2개 이미지
-            for j in range(K):
-                prob += lpSum([x[i, j] for i in range(N)]) >= 2 * y[j]
-                prob += lpSum([x[i, j] for i in range(N)]) <= N * y[j]
-            
-            # 3. 픽셀 수 상한선 (target_a의 150%)
-            for j in range(K):
-                prob += subset_pixels[j] <= target_a * 1.5
-            
-            # 문제 해결
-            logger.info("ILP 문제 해결 중...")
-            prob.solve(PULP_CBC_CMD(msg=0))
-            
-            if prob.status != LpStatusOptimal:
-                logger.warning(f"ILP 최적해를 찾지 못함: {LpStatus[prob.status]}")
-                # Fallback to greedy method
-                return self.greedy_subset_creation_fallback(target_a, max_subsets)
-            
-            # 결과 추출
-            subsets = []
-            for j in range(K):
-                if y[j].value() > 0.5:
-                    subset = []
-                    for i in range(N):
-                        if x[i, j].value() > 0.5:
-                            subset.append(image_ids[i])
-                    if subset:
-                        subsets.append(subset)
-            
-            logger.info(f"Stage 1 완료: {len(subsets)}개 서브셋 생성")
-            return subsets
-            
-        except ImportError:
-            logger.warning("PuLP 라이브러리가 없음. Greedy 방법으로 fallback")
+                x[i,j] = LpVariable(f"x_{i}_{j}", cat='Binary')
+        
+        for j in range(K):
+            y[j] = LpVariable(f"y_{j}", cat='Binary')
+        
+        # 각 서브셋의 픽셀 수 (근사치)
+        subset_pixels = {}
+        for j in range(K):
+            subset_pixels[j] = lpSum([
+                self.cameras[self.images[image_ids[i]]['camera_id']]['width'] * 
+                self.cameras[self.images[image_ids[i]]['camera_id']]['height'] / 
+                self.image_footprints[image_ids[i]].area * x[i,j] 
+                for i in range(N)
+            ])
+        
+        # 목적함수: target_a로부터의 편차 최소화 + 분산 최소화
+        prob = LpProblem("Stage1_Subset_Assignment", LpMinimize)
+        
+        # A로부터의 편차 계산
+        deviations = {}
+        for j in range(K):
+            dev_pos = LpVariable(f"dev_pos_{j}", lowBound=0)
+            dev_neg = LpVariable(f"dev_neg_{j}", lowBound=0)
+            prob += subset_pixels[j] - target_a == dev_pos - dev_neg
+            deviations[j] = dev_pos + dev_neg
+        
+        # 분산 최소화를 위한 max-min 계산
+        max_pixels = LpVariable("max_pixels", lowBound=0)
+        min_pixels = LpVariable("min_pixels", lowBound=0)
+        
+        for j in range(K):
+            prob += max_pixels >= subset_pixels[j] - (1 - y[j]) * target_a * 2
+            prob += min_pixels <= subset_pixels[j] + (1 - y[j]) * target_a * 2
+        
+        # 가중 목적함수
+        total_deviation = lpSum(deviations.values())
+        pixel_range = max_pixels - min_pixels
+        prob += 1.0 * total_deviation + 2.0 * pixel_range
+        
+        # 제약조건들
+        # 1. 각 이미지는 정확히 하나의 서브셋에만
+        for i in range(N):
+            prob += lpSum([x[i, j] for j in range(K)]) == 1
+        
+        # 2. 각 서브셋 최소 2개 이미지
+        for j in range(K):
+            prob += lpSum([x[i, j] for i in range(N)]) >= 2 * y[j]
+            prob += lpSum([x[i, j] for i in range(N)]) <= N * y[j]
+        
+        # 3. 픽셀 수 상한선 (target_a의 150%)
+        for j in range(K):
+            prob += subset_pixels[j] <= target_a * 1.5
+        
+        # 문제 해결
+        logger.info("ILP 문제 해결 중...")
+        prob.solve(PULP_CBC_CMD(msg=0))
+        
+        if prob.status != LpStatusOptimal:
+            logger.warning(f"ILP 최적해를 찾지 못함: {LpStatus[prob.status]}")
+            # Fallback to greedy method
             return self.greedy_subset_creation_fallback(target_a, max_subsets)
-        except Exception as e:
-            logger.error(f"Stage 1 ILP 실행 중 오류: {e}")
-            return self.greedy_subset_creation_fallback(target_a, max_subsets)
+        
+        # 결과 추출
+        subsets = []
+        for j in range(K):
+            if y[j].value() > 0.5:
+                subset = []
+                for i in range(N):
+                    if x[i, j].value() > 0.5:
+                        subset.append(image_ids[i])
+                if subset:
+                    subsets.append(subset)
+        
+        logger.info(f"Stage 1 완료: {len(subsets)}개 서브셋 생성")
+        return subsets
     
     def stage2_union_optimization(self, initial_subsets: List[List[int]], target_a: int, max_iterations: int = 100) -> List[List[int]]:
         """
