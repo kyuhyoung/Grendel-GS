@@ -72,7 +72,7 @@ class FootprintCalculator:
                             }
                         except ValueError as e:
                             logger.error(f"Error parsing camera line {line_num}: {line.strip()}")
-                            logger.error(f"Parts: {parts}")
+                            # logger.error(f"Parts: {parts}")
                             logger.error(f"ValueError: {e}")
                             continue
             
@@ -98,7 +98,7 @@ class FootprintCalculator:
                             }
                         except ValueError as e:
                             logger.error(f"Error parsing image line {line_num}: {line.strip()}")
-                            logger.error(f"Parts: {parts}")
+                            # logger.error(f"Parts: {parts}")
                             logger.error(f"ValueError: {e}")
                             continue
             
