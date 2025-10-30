@@ -8,9 +8,9 @@ set -e
 
 # Set up logging - redirect all output to both console and log file
 LOG_FILE="usage_dnq.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+exec > >(tee "$LOG_FILE") 2>&1
 
-echo "=== DNQ Script Started: $(date) ===" | tee -a "$LOG_FILE"
+echo "=== DNQ Script Started: $(date) ==="
 
 # Required parameters
 # Check if dataset name is provided as first argument
