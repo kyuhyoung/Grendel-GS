@@ -234,7 +234,11 @@ class DNQRunner:
                 if len(parts) >= 10:
                     img_id = int(parts[0])
                     if img_id in image_ids:
-                        f_out.write(line)
+                        # Remove folder path from image name (e.g., 'images/800886.tif' -> '800886.tif')
+                        if '/' in parts[9]:
+                            parts[9] = parts[9].split('/')[-1]
+                        modified_line = ' '.join(parts) + '\n'
+                        f_out.write(modified_line)
     
     def train_subsets_parallel(self, subsets: List[List[int]]) -> bool:
         """Train all subsets in parallel"""
