@@ -225,13 +225,21 @@ class DNQRunner:
     def filter_images_txt(self, input_file: Path, output_file: Path, image_ids: List[int]):
         """Filter images.txt to include only specified image IDs"""
         with open(input_file, 'r') as f_in, open(output_file, 'w') as f_out:
+            skip_next_line = False
+            
             for line in f_in:
                 if line.startswith('#'):
                     f_out.write(line)
                     continue
                 
+                # Skip this line if it's a continuation line for a filtered out image
+                if skip_next_line:
+                    skip_next_line = False
+                    continue
+                
                 parts = line.strip().split()
                 if len(parts) >= 10:
+                    # This is an image metadata line
                     img_id = int(parts[0])
                     if img_id in image_ids:
                         # Remove folder path from image name (e.g., 'images/800886.tif' -> '800886.tif')
@@ -239,6 +247,16 @@ class DNQRunner:
                             parts[9] = parts[9].split('/')[-1]
                         modified_line = ' '.join(parts) + '\n'
                         f_out.write(modified_line)
+                        # Write the next line (2D points) as well
+                        next_line = next(f_in, '')
+                        f_out.write(next_line)
+                    else:
+                        # Skip this image and its 2D points line
+                        skip_next_line = True
+                elif len(parts) > 0:
+                    # This might be a 2D points line that wasn't handled properly
+                    # Skip it as it should have been handled with its parent image line
+                    continue
     
     def train_subsets_parallel(self, subsets: List[List[int]]) -> bool:
         """Train all subsets in parallel"""
