@@ -46,6 +46,9 @@ def main():
     parser.add_argument('--track_by_projection', action='store_true', help='Generate tracks by projection instead of using COLMAP tracks')
     parser.add_argument('--prune_by_visibility', action='store_true', help='Prune gaussians outside all camera frustums')
     parser.add_argument('--visibility_prune_margin', type=int, default=20, help='Margin in pixels for visibility-based pruning')
+    parser.add_argument('--opacity_reset_interval', type=int, default=3000, help='Opacity reset interval in iterations')
+    parser.add_argument('--opacity_reset_until_iter', type=int, default=14000, help='Continue opacity reset until this iteration')
+    parser.add_argument('--resume_from_window', help='Resume from specific window (0=initial, 1+=window_XXX, "auto"=auto-detect)')
     parser.add_argument('--f_mode', type=str, default='global', choices=['global', 'remaining'], help='F (global center) calculation mode: global (all cameras) or remaining (only cameras in A)')
     parser.add_argument('--enable_direction_filtering', action='store_true', help='Enable direction filtering (Step 16.6): only cameras in forward hemisphere (angle <= 90°)')
     parser.add_argument('--e_selection_strategy', type=str, default='default', choices=['default', 'momentum', 'weighted', 'tangential', 'polar', 'outward_spiral_compact', 'balanced_smooth_trajectory'], help='E camera selection strategy')
@@ -68,6 +71,23 @@ def main():
     parser.add_argument('--exit_after_first_removal', action='store_true', help='Exit after first camera removal for testing')
     parser.add_argument('--use_all_processed_cameras', action='store_true', help='Check all processed cameras (not just prev window) when adding gaussians')
     parser.add_argument('--camera_removal_margin', type=float, default=0.15, help='Margin below densify_memory_limit for camera removal (default: 0.15)')
+    parser.add_argument('--point_cloud_format', type=str, default='auto', choices=['auto', 'ply', 'txt', 'bin'],
+                       help='Point cloud format to load: auto (default), ply, txt, or bin')
+
+    # Adaptive training parameters
+    parser.add_argument('--enable_adaptive_training', action='store_true', help='Enable adaptive training with convergence detection')
+    parser.add_argument('--min_iterations_per_window', type=int, default=5, help='Minimum iterations per window for adaptive training')
+    parser.add_argument('--convergence_start_iter', type=int, default=100, help='Start convergence checking from this iteration')
+    parser.add_argument('--convergence_loss_threshold', type=float, default=1e-4, help='Loss threshold for convergence detection')
+
+    # Exponential fitting parameters for dynamic patience
+    parser.add_argument('--min_camera_count', type=int, default=2, help='Minimum camera count for exponential fitting')
+    parser.add_argument('--max_patience_for_min_cam', type=int, default=50, help='Patience when camera count is min_camera_count')
+    parser.add_argument('--max_camera_count', type=int, default=30, help='Maximum camera count for exponential fitting')
+    parser.add_argument('--min_patience_for_max_cam', type=int, default=15, help='Patience when camera count is max_camera_count')
+
+    # Visualization control
+    parser.add_argument('--skip_heavy_visualization', action='store_true', help='Skip heavy visualization files (3d_scene, ortho, nadir) to save time')
 
     args = parser.parse_args()
 
@@ -84,6 +104,18 @@ def main():
             print(f"Warning: Could not load DTM module: {e}")
             print("Continuing with simplified footprint computation")
 
+    # Parse resume_from_window parameter
+    resume_from_window = None
+    if args.resume_from_window:
+        if args.resume_from_window == "auto":
+            resume_from_window = "auto"
+        else:
+            try:
+                resume_from_window = int(args.resume_from_window)
+            except ValueError:
+                print(f"Error: resume_from_window must be a number or 'auto', got: {args.resume_from_window}")
+                sys.exit(1)
+
     # Create and run progressive trainer
     trainer = ProgressiveTrainer(
         colmap_path=args.source_path,
@@ -93,7 +125,10 @@ def main():
         gpu_memory_threshold=args.gpu_threshold,
         camera_removal_margin=args.camera_removal_margin,
         debug=args.debug,
-        only_actually_visible=args.only_actually_visible
+        only_actually_visible=args.only_actually_visible,
+        skip_heavy_visualization=args.skip_heavy_visualization,
+        resume_from_window=resume_from_window,
+        dataset_path=args.source_path
     )
 
     # Store additional training parameters for integration with Grendel-GS
@@ -102,6 +137,7 @@ def main():
     trainer.resolution = args.resolution
     trainer.backend = args.backend
     trainer.deterministic = args.deterministic
+    trainer.point_cloud_format = args.point_cloud_format
     trainer.use_chunk = args.use_chunk
     trainer.densification_interval = args.densification_interval
     trainer.densify_from_iter = args.densify_from_iter
@@ -133,6 +169,30 @@ def main():
     trainer.track_by_projection = args.track_by_projection
     trainer.prune_by_visibility = args.prune_by_visibility
     trainer.visibility_prune_margin = args.visibility_prune_margin
+
+    # Opacity reset parameters
+    trainer.opacity_reset_interval = args.opacity_reset_interval
+    trainer.opacity_reset_until_iter = args.opacity_reset_until_iter
+
+    # Visualization control
+    trainer.skip_heavy_visualization = args.skip_heavy_visualization
+    print(f"🔍 [DEBUG] Setting trainer.skip_heavy_visualization = {args.skip_heavy_visualization}")
+
+    # Adaptive training parameters
+    trainer.enable_adaptive_training = args.enable_adaptive_training
+    trainer.min_iterations_per_window = args.min_iterations_per_window
+    trainer.convergence_start_iter = args.convergence_start_iter
+
+    # Only set convergence parameters if config file doesn't exist
+    # (If config file exists, it was already loaded in __init__)
+    import os
+    if not os.path.exists(os.path.join(os.getcwd(), "convergence_config.txt")):
+        trainer.convergence_loss_threshold = args.convergence_loss_threshold
+        # Set exponential fitting parameters
+        trainer.min_camera_count = args.min_camera_count
+        trainer.max_patience_for_min_cam = args.max_patience_for_min_cam
+        trainer.max_camera_count = args.max_camera_count
+        trainer.min_patience_for_max_cam = args.min_patience_for_max_cam
 
     # Run the progressive training pipeline with sliding window
     try:

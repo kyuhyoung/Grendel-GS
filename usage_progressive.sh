@@ -10,19 +10,56 @@ export NCCL_DEBUG=ERROR
 export TORCH_CPP_LOG_LEVEL=ERROR
 export PYTHONWARNINGS="ignore"
 
+# Additional NCCL timeout settings for stability
+export NCCL_TIMEOUT=1800000  # 30 minutes timeout (in milliseconds)
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_BLOCKING_WAIT=1
+
+# PyTorch memory optimization
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# GPU selection - set which GPUs to use (comment out to use all GPUs)
+#export CUDA_VISIBLE_DEVICES=0
+
 # ====================================================
 # USER CONFIGURATION - EDIT THESE PARAMETERS
 # ====================================================
 
 # Required parameters
-#SOURCE_PATH="/data/samsung_dong_mini_5"  # Path to COLMAP reconstruction
-SOURCE_PATH="/data/sillim_ew_mini_100024_20"  # Path to COLMAP reconstruction
+# Check if dataset name is provided as first argument
+echo "DEBUG: First argument \$1 = '$1'"
+echo "DEBUG: All arguments: $@"
+if [ -n "$1" ]; then
+    SOURCE_PATH="/data/$1"  # Use provided dataset name
+    echo "DEBUG: Set SOURCE_PATH to: $SOURCE_PATH"
+    shift  # Remove dataset name from arguments
+else
+    SOURCE_PATH="/data/samsung_dong_mini_5"  # Path to COLMAP reconstruction
+    #SOURCE_PATH="/data/sillim_ew_mini_100024_20"  # Path to COLMAP reconstruction
+    #SOURCE_PATH="/data/Samsung_SN_30"  # Default path to COLMAP reconstruction
+    echo "DEBUG: Using default SOURCE_PATH: $SOURCE_PATH"
+fi
 OUTPUT_PATH="./output/progressive_test"   # Output directory
+
+# Process remaining arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --point_cloud_format)
+            POINT_CLOUD_FORMAT="$2"
+            shift 2
+            ;;
+        *)
+            # Unknown argument, add to EXTRA_ARGS
+            EXTRA_ARGS="$EXTRA_ARGS $1"
+            shift
+            ;;
+    esac
+done
 
 # Optional parameters
 INITIAL_CAMERAS=2                         # Number of initial cameras
 #CAMERA_REMOVAL_MARGIN=0.19                # Margin below densify_memory_limit for camera removal (0.99 - 0.19 = 0.80 = 80%)
-ITERATIONS=30000                          # Training iterations
+ITERATIONS=50                          # Training iterations
 ###
 #ITERATIONS_PER_WINDOW=600                # Iterations per sliding window
 #DENSIFICATION_INTERVAL=150               # Densification every 20 iterations
@@ -40,31 +77,58 @@ ITERATIONS=30000                          # Training iterations
 #CAMERA_REMOVAL_MARGIN=0.25                # Margin below densify_memory_limit for camera removal (0.99 - 0.19 = 0.80 = 80%)
 ###
 ITERATIONS_PER_WINDOW=12                # Iterations per sliding window
-DENSIFICATION_INTERVAL=10               # Densification every 20 iterations
-DENSIFY_FROM_ITER=5                    # Start densification from iteration 10
-CAMERA_REMOVAL_MARGIN=0.25                # Margin below densify_memory_limit for camera removal (0.99 - 0.25 = 0.74 = 74%)
+DENSIFICATION_INTERVAL=100              # Densification every 100 iterations
+DENSIFY_FROM_ITER=100                  # Start densification from iteration 300
+CAMERA_REMOVAL_MARGIN=0.25                 # Margin below densify_memory_limit for camera removal (0.99 - 0.25 = 0.74 = 74%)
+#CAMERA_REMOVAL_MARGIN=0.45                 # Margin below densify_memory_limit for camera removal (0.99 - 0.25 = 0.74 = 74%)
 ###
 
 DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.99    # GPU memory limit for densification (0.99 = 99%)
-#MAX_WINDOW_SIZE=""                       # Maximum window size (number of cameras). Empty = unlimited
-MAX_WINDOW_SIZE=3                       # Maximum window size (number of cameras). Empty = unlimited
-SH_DEGREE=0                              # Spherical harmonics degree (0 for testing, less memory)
+MAX_WINDOW_SIZE=""                       # Maximum window size (number of cameras). Empty = unlimited
+#MAX_WINDOW_SIZE=3                       # Maximum window size (number of cameras). Empty = unlimited
+
+# ====================================================
+# ADAPTIVE TRAINING CONFIGURATION
+# ====================================================
+# Enable adaptive training (auto-stop when converged)
+#ENABLE_ADAPTIVE_TRAINING=false           # Enable adaptive training
+ENABLE_ADAPTIVE_TRAINING=true           # Enable adaptive training
+MIN_ITERATIONS_PER_WINDOW=3             # Minimum iterations before convergence check
+
+#CONVERGENCE_START_ITER=100              # Start convergence checking from this iteration
+#CONVERGENCE_LOSS_THRESHOLD=1e-4         # Loss improvement threshold
+
+CONVERGENCE_START_ITER=50              # Start convergence checking from this iteration
+CONVERGENCE_LOSS_THRESHOLD=1e-4         # Loss improvement threshold
+
+# Exponential fitting parameters for dynamic patience
+MIN_CAMERA_COUNT=2                      # Minimum camera count for exponential fitting
+MAX_PATIENCE_FOR_MIN_CAM=50             # Patience when camera count is MIN_CAMERA_COUNT
+MAX_CAMERA_COUNT=30                     # Maximum camera count for exponential fitting
+MIN_PATIENCE_FOR_MAX_CAM=15             # Patience when camera count is MAX_CAMERA_COUNT
+
+SH_DEGREE=3                              # Spherical harmonics degree (0 for testing, less memory)
 BACKEND="gsplat"                         # Rendering backend: default or gsplat
 
 # Flags (set to "true" to enable, "false" to disable)
 DETERMINISTIC=false                      # Enable deterministic training
 DEBUG=true                               # Enable debug output
-EXIT_AFTER_FIRST_REMOVAL=true            # Exit after first camera removal (for testing)
-#EXIT_AFTER_FIRST_REMOVAL=false            # Exit after first camera removal (for testing)
+#EXIT_AFTER_FIRST_REMOVAL=true            # Exit after first camera removal (for testing)
+EXIT_AFTER_FIRST_REMOVAL=false            # Exit after first camera removal (for testing)
 SHOW_MEMORY_DEBUG_INFO=false          # Show detailed memory debug info (memory, tensor stats)
-USE_CHUNK=true                           # Enable chunked SSIM for memory efficiency
-#USE_CHUNK=false                           # Enable chunked SSIM for memory efficiency
+#USE_CHUNK=true                           # Enable chunked SSIM for memory efficiency
+USE_CHUNK=false                           # Enable chunked SSIM for memory efficiency
 #ONLY_ACTUALLY_VISIBLE=false             # Only keep points visible in camera frames
 ONLY_ACTUALLY_VISIBLE=true             # Only keep points visible in camera frames
 TRACK_BY_PROJECTION=true               # Generate tracks by projection instead of using COLMAP tracks
 #TRACK_BY_PROJECTION=false               # Generate tracks by projection instead of using COLMAP tracks
 PRUNE_BY_VISIBILITY=true                # Prune gaussians outside all camera frustums
 VISIBILITY_MARGIN=0                     # Margin in pixels for visibility-based pruning (larger = stricter)
+NO_OPACITY_RESET=true                  # Disable opacity reset (true to disable, false for vanilla 3DGS behavior)
+#NO_OPACITY_RESET=false                  # Disable opacity reset (true to disable, false for vanilla 3DGS behavior)
+OPACITY_RESET_INTERVAL=300             # Opacity reset interval in iterations (only used when NO_OPACITY_RESET=false)
+#SKIP_HEAVY_VISUALIZATION=false          # Skip heavy visualization files (3d_scene, ortho, nadir) to save time
+SKIP_HEAVY_VISUALIZATION=true          # Skip heavy visualization files (3d_scene, ortho, nadir) to save time
 
 # Camera removal strategy
 REMOVAL_STRATEGY="fifo"                 # Remove oldest camera first (predictable sliding window)
@@ -105,8 +169,20 @@ FOOTPRINT_INTERSECTION_THRESHOLD=0.62    # Minimum intersection area ratio (inte
 ENABLE_DIRECTION_FILTERING=false        # Disable filtering, allow all cameras in S (footprint intersection only)
 
 # Camera removal and processing options
-USE_ALL_PROCESSED_CAMERAS=true         # Use all ever-processed cameras when checking for gaussian addition (recommended)
-#USE_ALL_PROCESSED_CAMERAS=false         # Use only prev window cameras (may add duplicate gaussians)
+#USE_ALL_PROCESSED_CAMERAS=true         # Use all ever-processed cameras when checking for gaussian addition (recommended)
+USE_ALL_PROCESSED_CAMERAS=false         # Use only prev window cameras (may add duplicate gaussians)
+
+# Point cloud loading format
+POINT_CLOUD_FORMAT="auto"               # Point cloud format: auto, ply, txt, bin
+                                        # auto: try bin -> txt (default behavior)
+                                        # ply: load points3D.ply directly
+                                        # txt: load points3D.txt directly
+                                        # bin: load points3D.bin directly
+
+# Resume options
+RESUME_FROM_WINDOW=""                   # Resume from specific window (0=initial, 1+=window_XXX, "auto"=auto-detect, ""=disabled)
+#RESUME_FROM_WINDOW="auto"                   # Disabled by default - set to "auto" or window number to enable resume
+#RESUME_FROM_WINDOW="2"                   # Disabled by default - set to "auto" or window number to enable resume
 
 # Advanced options (leave empty if not needed)
 DTM_MODULE=""                            # Path to external DTM module
@@ -141,6 +217,15 @@ print_colored $CYAN "Progressive Training for Grendel-GS"
 print_colored $CYAN "======================================"
 echo ""
 
+# Auto-configure parameters for adaptive training
+if [[ "$ENABLE_ADAPTIVE_TRAINING" == "true" ]]; then
+    ITERATIONS_PER_WINDOW=999999999  # Set to very high number for adaptive training
+    # Disable save_iterations for adaptive training (only keep camera removal PLY saving)
+    SAVE_ITERATIONS=""
+    echo "🔄 Adaptive training enabled - setting iterations per window to infinite (999999999)"
+    echo "🔄 Adaptive training enabled - disabling save_iterations (only camera removal PLY saving)"
+fi
+
 # Display configuration
 print_colored $GREEN "Current Configuration:"
 echo "  Source Path: $SOURCE_PATH"
@@ -156,6 +241,11 @@ echo "  Max Window Size: ${MAX_WINDOW_SIZE:-unlimited}"
 echo "  SH Degree: $SH_DEGREE"
 echo "  Backend: $BACKEND"
 echo "  Deterministic: $DETERMINISTIC"
+echo ""
+print_colored $GREEN "Adaptive Training Configuration:"
+echo "  Enable Adaptive Training: $ENABLE_ADAPTIVE_TRAINING"
+echo "  Min Iterations Per Window: $MIN_ITERATIONS_PER_WINDOW"
+echo "  Convergence Loss Threshold: $CONVERGENCE_LOSS_THRESHOLD"
 echo "  Debug: $DEBUG"
 echo "  Show Memory Debug Info: $SHOW_MEMORY_DEBUG_INFO"
 echo "  Use Chunk: $USE_CHUNK"
@@ -163,12 +253,17 @@ echo "  Only Actually Visible: $ONLY_ACTUALLY_VISIBLE"
 echo "  Track By Projection: $TRACK_BY_PROJECTION"
 echo "  Prune By Visibility: $PRUNE_BY_VISIBILITY"
 echo "  Visibility Margin: $VISIBILITY_MARGIN"
+echo "  No Opacity Reset: $NO_OPACITY_RESET"
+if [[ "$NO_OPACITY_RESET" == "false" ]]; then
+    echo "  Opacity Reset Interval: $OPACITY_RESET_INTERVAL"
+fi
 echo "  Removal Strategy: $REMOVAL_STRATEGY"
 echo "  Camera Removal Margin: $CAMERA_REMOVAL_MARGIN"
 echo "  F Mode: $F_MODE"
 echo "  Enable Direction Filtering: $ENABLE_DIRECTION_FILTERING"
 echo "  Footprint Intersection Threshold: $FOOTPRINT_INTERSECTION_THRESHOLD"
 echo "  Use All Processed Cameras: $USE_ALL_PROCESSED_CAMERAS"
+echo "  Point Cloud Format: $POINT_CLOUD_FORMAT"
 echo "  E Selection Strategy: $E_SELECTION_STRATEGY"
 if [[ "$E_SELECTION_STRATEGY" == "weighted" ]]; then
     echo "    - Alpha (R weight): $E_WEIGHTED_ALPHA"
@@ -251,7 +346,7 @@ if [[ -n "$MAX_WINDOW_SIZE" ]]; then
     CMD="$CMD --max_window_size $MAX_WINDOW_SIZE"
 fi
 
-CMD="$CMD --sh-degree $SH_DEGREE"
+CMD="$CMD --sh_degree $SH_DEGREE"
 CMD="$CMD --backend $BACKEND"
 
 # Add flags
@@ -277,6 +372,18 @@ fi
 
 if [[ "$TRACK_BY_PROJECTION" == "true" ]]; then
     CMD="$CMD --track_by_projection"
+fi
+
+# Add adaptive training parameters
+if [[ "$ENABLE_ADAPTIVE_TRAINING" == "true" ]]; then
+    CMD="$CMD --enable_adaptive_training"
+    CMD="$CMD --min_iterations_per_window $MIN_ITERATIONS_PER_WINDOW"
+    CMD="$CMD --convergence_start_iter $CONVERGENCE_START_ITER"
+    CMD="$CMD --convergence_loss_threshold $CONVERGENCE_LOSS_THRESHOLD"
+    CMD="$CMD --min_camera_count $MIN_CAMERA_COUNT"
+    CMD="$CMD --max_patience_for_min_cam $MAX_PATIENCE_FOR_MIN_CAM"
+    CMD="$CMD --max_camera_count $MAX_CAMERA_COUNT"
+    CMD="$CMD --min_patience_for_max_cam $MIN_PATIENCE_FOR_MAX_CAM"
 fi
 
 if [[ "$PRUNE_BY_VISIBILITY" == "true" ]]; then
@@ -375,9 +482,32 @@ if [[ "$EXIT_AFTER_FIRST_REMOVAL" == "true" ]]; then
     CMD="$CMD --exit_after_first_removal"
 fi
 
+# Add point cloud format if specified
+if [[ -n "$POINT_CLOUD_FORMAT" ]] && [[ "$POINT_CLOUD_FORMAT" != "auto" ]]; then
+    CMD="$CMD --point_cloud_format $POINT_CLOUD_FORMAT"
+fi
+
 # Add DTM module if specified
 if [[ -n "$DTM_MODULE" ]]; then
     CMD="$CMD --dtm-module \"$DTM_MODULE\""
+fi
+
+# Add resume functionality if specified
+if [[ -n "$RESUME_FROM_WINDOW" ]]; then
+    CMD="$CMD --resume_from_window \"$RESUME_FROM_WINDOW\""
+fi
+
+# Add opacity reset control
+if [[ "$NO_OPACITY_RESET" == "true" ]]; then
+    CMD="$CMD --opacity_reset_until_iter 0"
+else
+    # When opacity reset is enabled, set the interval
+    CMD="$CMD --opacity_reset_interval $OPACITY_RESET_INTERVAL"
+fi
+
+# Add skip heavy visualization flag
+if [[ "$SKIP_HEAVY_VISUALIZATION" == "true" ]]; then
+    CMD="$CMD --skip_heavy_visualization"
 fi
 
 # Add extra arguments

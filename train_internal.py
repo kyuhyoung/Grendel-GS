@@ -1,6 +1,7 @@
 import os
 import torch
 import json
+import math
 from utils.loss_utils import l1_loss
 from gaussian_renderer import (
     distributed_preprocess3dgs_and_all2all_final,
@@ -31,6 +32,137 @@ from densification import densification, gsplat_densification
 import torchvision.transforms.functional as tvf
 
 
+class ConvergenceDetector:
+    """Adaptive training convergence detector using loss-based early stopping"""
+
+    def __init__(self, loss_threshold=1e-4, patience=10, min_iterations=5, check_interval=5, max_iterations=100, start_iter=100):
+        self.loss_threshold = loss_threshold
+        self.patience = patience
+        self.min_iterations = min_iterations
+        self.check_interval = check_interval
+        self.max_iterations = max_iterations
+        self.start_iter = start_iter
+
+        self.loss_history = []
+        self.best_loss = float('inf')
+        self.best_loss_iteration = 0
+        self.no_improvement_count = 0
+        self.enabled = False
+
+        # Moving average for batch size 1 stability
+        self.moving_avg_window = 10  # Window size for moving average
+        self.recent_losses = []  # Keep recent losses for moving average
+        self.best_moving_avg = float('inf')
+        self.best_moving_avg_iteration = 0
+
+    def enable(self, enabled=True):
+        """Enable or disable convergence detection"""
+        self.enabled = enabled
+
+    def reset(self):
+        """Reset convergence state for new window"""
+        self.loss_history.clear()
+        self.best_loss = float('inf')
+        self.best_loss_iteration = 0
+        self.no_improvement_count = 0
+
+        # Reset moving average state
+        self.recent_losses.clear()
+        self.best_moving_avg = float('inf')
+        self.best_moving_avg_iteration = 0
+
+    def update(self, current_loss, iteration):
+        """Update convergence state with current loss"""
+        if not self.enabled or iteration < self.start_iter:
+            return
+
+        self.loss_history.append(current_loss)
+
+        # Update moving average for batch size 1 stability
+        self.recent_losses.append(current_loss)
+        if len(self.recent_losses) > self.moving_avg_window:
+            self.recent_losses.pop(0)  # Remove oldest loss
+
+        # Calculate moving average
+        moving_avg = sum(self.recent_losses) / len(self.recent_losses)
+
+        # Use moving average for convergence detection instead of single loss
+        if moving_avg < self.best_moving_avg - self.loss_threshold:
+            self.best_moving_avg = moving_avg
+            self.best_moving_avg_iteration = iteration
+            self.no_improvement_count = 0
+            utils.print_rank_0(f"🎯 [CONVERGENCE] New best moving avg: {moving_avg:.6f} (window={len(self.recent_losses)}) at iteration {iteration}")
+        elif iteration % self.check_interval == 0:
+            # Only increment count when we're at a check interval
+            self.no_improvement_count += 1
+
+        # Keep old best_loss for compatibility
+        if current_loss < self.best_loss - self.loss_threshold:
+            self.best_loss = current_loss
+            self.best_loss_iteration = iteration
+
+    def should_check_convergence(self, iteration):
+        """Check if we should evaluate convergence at this iteration"""
+        return (self.enabled and
+                iteration >= self.start_iter and
+                iteration >= self.min_iterations and
+                iteration % self.check_interval == 0)
+
+    def is_converged(self, iteration):
+        """Check if training has converged"""
+        if not self.enabled:
+            return False
+
+        if iteration < self.min_iterations:
+            return False
+
+        if iteration >= self.max_iterations:
+            utils.print_rank_0(f"🛑 [CONVERGENCE] Max iterations ({self.max_iterations}) reached")
+            return True
+
+        if self.no_improvement_count >= self.patience:
+            utils.print_rank_0(f"🛑 [CONVERGENCE] No improvement for {self.patience} checks (best moving avg: {self.best_moving_avg:.6f})")
+            return True
+
+        return False
+
+    def get_stats(self):
+        """Get current convergence statistics"""
+        return {
+            'best_loss': self.best_loss,
+            'best_moving_avg': self.best_moving_avg,
+            'current_moving_avg': sum(self.recent_losses) / len(self.recent_losses) if self.recent_losses else float('inf'),
+            'moving_avg_window_size': len(self.recent_losses),
+            'no_improvement_count': self.no_improvement_count,
+            'total_checks': len(self.loss_history),
+            'enabled': self.enabled
+        }
+
+    def print_config(self):
+        """Print all configuration parameters"""
+        print("\n" + "="*60)
+        print("ConvergenceDetector Configuration:")
+        print("-"*60)
+        print(f"  loss_threshold: {self.loss_threshold}")
+        print(f"  patience: {self.patience}")
+        print(f"  min_iterations: {self.min_iterations}")
+        print(f"  check_interval: {self.check_interval}")
+        print(f"  max_iterations: {self.max_iterations}")
+        print(f"  start_iter: {self.start_iter}")
+        print(f"  moving_avg_window: {self.moving_avg_window}")
+        print(f"  enabled: {self.enabled}")
+        print("-"*60)
+        print(f"  Current State:")
+        print(f"    best_loss: {self.best_loss:.6f}")
+        print(f"    best_loss_iteration: {self.best_loss_iteration}")
+        print(f"    best_moving_avg: {self.best_moving_avg:.6f}")
+        print(f"    best_moving_avg_iteration: {self.best_moving_avg_iteration}")
+        print(f"    no_improvement_count: {self.no_improvement_count}")
+        print(f"    loss_history_length: {len(self.loss_history)}")
+        print(f"    moving_avg_window_size: {len(self.recent_losses)}")
+        print("="*60)
+
+
 def training_refactored_main(dataset_args, opt_args, pipe_args, args, log_file):
     # Refactored training function
     gaussians, timers, background = _initialize_training_components(dataset_args, opt_args, pipe_args, args, log_file)
@@ -58,12 +190,23 @@ def _initialize_training_components(dataset_args, opt_args, pipe_args, args, log
     else:
         utils.print_rank_0(f"🚀 Standard Training Mode")
 
+    # Print loss configuration
+    utils.print_rank_0(f"📊 Loss Configuration:")
+    utils.print_rank_0(f"   Lambda DSSIM: {opt_args.lambda_dssim}")
+    utils.print_rank_0(f"   Use Chunked SSIM: {getattr(args, 'use_chunk', False)}")
+    utils.print_rank_0(f"   Random Background: {getattr(opt_args, 'random_background', False)}")
+    utils.print_rank_0(f"   Loss Scale Mode: {getattr(opt_args, 'lr_scale_mode', 'sqrt')}")
+
     # Debug: Check progressive training status
     checkpoint_available = False
-    if previous_state:
+    start_checkpoint_path = getattr(args, 'start_checkpoint', '')
+
+    if start_checkpoint_path:
+        # If start_checkpoint is provided, verify it exists
+        import os
+        checkpoint_available = os.path.exists(start_checkpoint_path)
+    elif previous_state:
         checkpoint_available = ('all_checkpoint_paths' in previous_state and previous_state['all_checkpoint_paths'])
-    else:
-        checkpoint_available = getattr(args, 'start_checkpoint', '') != ''
 
     utils.print_rank_0(f"🔍 DEBUG: previous_state exists: {previous_state is not None}")
     utils.print_rank_0(f"🔍 DEBUG: args.start_checkpoint: '{getattr(args, 'start_checkpoint', 'NOT_SET')}'")
@@ -118,8 +261,12 @@ def _setup_training_scene(args, gaussians, opt_args, log_file):
             #i_pre = previous_state['window_number']
             utils.print_rank_0("🔄 PROGRESSIVE TRAINING: Using progressive state")
 
-            # Check for checkpoint directory from JSON
+            # Check for checkpoint directory from JSON or args
             checkpoint_dir = previous_state.get('checkpoint_dir', None) if previous_state else None
+
+            # If no checkpoint in JSON, check args.start_checkpoint
+            if not checkpoint_dir:
+                checkpoint_dir = getattr(args, 'start_checkpoint', '') or None
 
             # Skip checkpoint loading only if we're running the initial window itself
             # For window 1+, we should load checkpoints from previous windows
@@ -378,6 +525,32 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
     """Main training loop"""
     n_g_max = args.n_g_per_proc
 
+    # Initialize convergence detector for adaptive training
+    convergence_detector = ConvergenceDetector(
+        loss_threshold=getattr(args, 'convergence_loss_threshold', 1e-4),
+        patience=getattr(args, 'convergence_patience', 10),
+        min_iterations=getattr(args, 'min_iterations_per_window', 5),
+        check_interval=getattr(args, 'convergence_check_interval', 5),
+        max_iterations=getattr(args, 'iterations_per_window', opt_args.iterations),
+        start_iter=getattr(args, 'convergence_start_iter', 100)
+    )
+
+    # Print convergence detector configuration
+    if getattr(args, 'enable_adaptive_training', False):
+        convergence_detector.print_config()
+    #exit(1)
+    # Enable adaptive training if requested
+    enable_adaptive = getattr(args, 'enable_adaptive_training', False)
+    convergence_detector.enable(enable_adaptive)
+
+    if enable_adaptive:
+        utils.print_rank_0(f"🎯 [ADAPTIVE TRAINING] Enabled with parameters:")
+        utils.print_rank_0(f"   Loss threshold: {convergence_detector.loss_threshold}")
+        utils.print_rank_0(f"   Patience: {convergence_detector.patience}")
+        utils.print_rank_0(f"   Min iterations: {convergence_detector.min_iterations}")
+        utils.print_rank_0(f"   Check interval: {convergence_detector.check_interval}")
+        utils.print_rank_0(f"   Max iterations: {convergence_detector.max_iterations}")
+
     # Init dataset
     train_dataset = SceneDataset(scene.getTrainCameras())
     if args.adjust_strategy_warmp_iterations == -1:
@@ -431,6 +604,58 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
             utils.print_rank_0(f"🧠 [ITER {iteration}] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Peak={mem_peak:.2f}GB")
 
         ema_loss_for_log = _process_iteration(iteration, gaussians, scene, args, timers, strategy_history, train_dataset, background, pipe_args, progress_bar, ema_loss_for_log, debug_info_printed, end2end_timers, log_file, n_g_max)
+
+        # Check for convergence if adaptive training is enabled
+        if convergence_detector.enabled:
+            convergence_detector.update(ema_loss_for_log, iteration)
+
+            if convergence_detector.should_check_convergence(iteration):
+                if convergence_detector.is_converged(iteration):
+                    utils.print_rank_0(f"🎯 [ADAPTIVE TRAINING] Convergence detected at iteration {iteration}")
+                    utils.print_rank_0(f"🎯 [ADAPTIVE TRAINING] Early stopping - saving checkpoint and finalizing...")
+
+                    # Save final checkpoint before exit
+                    utils.print_rank_0(f"💾 [EARLY EXIT] Saving final checkpoint at iteration {iteration}")
+
+                    # Force save checkpoint at convergence iteration
+                    utils.print_rank_0(f"\n[EARLY EXIT] Saving Convergence Checkpoint")
+                    log_file.write(f"[EARLY EXIT] Saving Convergence Checkpoint at iteration {iteration}\n")
+                    save_folder = scene.model_path + "/checkpoints/"
+                    if utils.DEFAULT_GROUP.rank() == 0:
+                        os.makedirs(save_folder, exist_ok=True)
+                        if utils.DEFAULT_GROUP.size() > 1:
+                            torch.distributed.barrier(group=utils.DEFAULT_GROUP)
+                    elif utils.DEFAULT_GROUP.size() > 1:
+                        torch.distributed.barrier(group=utils.DEFAULT_GROUP)
+                    path_ckpt = save_folder + f"/chkpnt_ws={utils.WORLD_SIZE}_rk={utils.GLOBAL_RANK}.pth"
+                    torch.save((gaussians.capture(), iteration + args.bsz), path_ckpt)
+
+                    # Store actual checkpoint paths for progressive training
+                    if not hasattr(args, 'actual_checkpoint_paths'):
+                        args.actual_checkpoint_paths = []
+                    args.actual_checkpoint_paths.append(path_ckpt)
+
+                    # Note: With simplified structure, no need for latest_checkpoint.txt
+
+                    end2end_timers.print_time(log_file, iteration)
+
+                    # Report final memory usage
+                    if torch.cuda.is_available():
+                        peak_memory_bytes = torch.cuda.max_memory_allocated()
+                        total_memory_bytes = torch.cuda.get_device_properties(0).total_memory
+                        peak_memory_gb = peak_memory_bytes / (1024 ** 3)
+                        total_memory_gb = total_memory_bytes / (1024 ** 3)
+                        peak_usage_ratio = peak_memory_bytes / total_memory_bytes
+
+                        utils.print_rank_0(f"🧠 [FINAL MEMORY] Peak: {peak_memory_gb:.2f}GB/{total_memory_gb:.2f}GB ({peak_usage_ratio:.1%})")
+
+                    # Test completed - break from training loop
+                    utils.print_rank_0(f"🔥 [ADAPTIVE TRAINING] Convergence training completed successfully!")
+                    utils.print_rank_0(f"📄 Final checkpoint saved at iteration {iteration}")
+                    break
+                else:
+                    stats = convergence_detector.get_stats()
+                    utils.print_rank_0(f"🎯 [CONVERGENCE CHECK] Iter {iteration}: Loss={ema_loss_for_log:.6f}, MovingAvg={stats['current_moving_avg']:.6f}(w{stats['moving_avg_window_size']}), Best={stats['best_moving_avg']:.6f}@{convergence_detector.best_moving_avg_iteration}, No improvement: {stats['no_improvement_count']}/{convergence_detector.patience}")
 
     '''
     if previous_state:
@@ -779,7 +1004,7 @@ def _handle_checkpoints(iteration, scene, gaussians, args, end2end_timers, log_f
     end2end_timers.stop()
     utils.print_rank_0(f"\n[ITER {iteration}] Saving Checkpoint")
     log_file.write(f"[ITER {iteration}] Saving Checkpoint\n")
-    save_folder = scene.model_path + "/checkpoints/" + str(iteration) + "/"
+    save_folder = scene.model_path + "/checkpoints/"
     if utils.DEFAULT_GROUP.rank() == 0:
         os.makedirs(save_folder, exist_ok=True)
         if utils.DEFAULT_GROUP.size() > 1:
@@ -794,10 +1019,7 @@ def _handle_checkpoints(iteration, scene, gaussians, args, end2end_timers, log_f
         args.actual_checkpoint_paths = []
     args.actual_checkpoint_paths.append(path_ckpt)
 
-    # Save latest checkpoint directory to file for progressive trainer
-    latest_checkpoint_file = os.path.join(scene.model_path, "latest_checkpoint.txt")
-    with open(latest_checkpoint_file, 'w') as f:
-        f.write(save_folder)
+    # Note: latest_checkpoint.txt only created during early exit, not for regular checkpoints
     end2end_timers.start()
 
     return save_folder
