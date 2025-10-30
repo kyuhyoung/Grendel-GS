@@ -19,13 +19,8 @@ from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 import json
 
-# PuLP import with fallback
-try:
-    from pulp import *
-    PULP_AVAILABLE = True
-except ImportError:
-    PULP_AVAILABLE = False
-    logger.warning("PuLP library not available. Will use greedy fallback for optimization.")
+# PuLP import - required dependency
+from pulp import *
 
 logger = logging.getLogger(__name__)
 
@@ -280,8 +275,6 @@ class SubsetCreator:
         """
         Stage 1: ILP를 사용한 초기 서브셋 할당 (픽셀 합 근사)
         """
-        if not PULP_AVAILABLE:
-            raise ImportError("PuLP library is required for Two-Stage subset creation. Install with: pip install pulp")
             
         logger.info("Stage 1: ILP 기반 초기 할당 시작...")
         
