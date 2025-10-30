@@ -6,6 +6,12 @@
 
 set -e
 
+# Set up logging - redirect all output to both console and log file
+LOG_FILE="usage_dnq.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "=== DNQ Script Started: $(date) ===" | tee -a "$LOG_FILE"
+
 # Required parameters
 # Check if dataset name is provided as first argument
 echo "DEBUG: First argument \$1 = '$1'"
@@ -185,8 +191,42 @@ function create_subsets() {
 
     log_info "Creating subset division..."
 
-    # Create Python script for subset division
-    cat > "${output_path}/create_subsets.py" << 'EOF'
+    # Use existing dnq_runner.py instead of creating inline script
+    log_info "Using dnq_runner.py for subset creation and training..."
+    
+    # Build dnq_runner.py command
+    local cmd="python3 dnq_runner.py"
+    cmd="$cmd --source_path $source_path"
+    cmd="$cmd --output_path $output_path"
+    cmd="$cmd --pixel_threshold_a $THRESHOLD_A"
+    cmd="$cmd --min_max_ratio_d $THRESHOLD_D"
+    cmd="$cmd --max_subsets 8"
+    cmd="$cmd --parallel_jobs 4"
+    cmd="$cmd --iterations $ITERATIONS"
+    cmd="$cmd --sh_degree $SH_DEGREE"
+    cmd="$cmd --backend $BACKEND"
+    cmd="$cmd --densification_interval $DENSIFICATION_INTERVAL"
+    cmd="$cmd --densify_from_iter $DENSIFY_FROM_ITER"
+    
+    if [[ "$DEBUG" == "true" ]]; then
+        cmd="$cmd --debug"
+    fi
+    
+    log_info "Running DNQ command: $cmd"
+    
+    # Execute dnq_runner.py which will handle everything
+    if eval "$cmd"; then
+        log_success "DNQ runner completed successfully"
+        return 0
+    else
+        log_error "DNQ runner failed"
+        return 1
+    fi
+    
+    # Old inline script creation - keeping as backup but not used
+    return 0
+    
+    cat > "${output_path}/create_subsets_backup.py" << 'EOF'
 #!/usr/bin/env python3
 """
 Divide and Conquer Subset Creation for 3D Gaussian Splatting
@@ -733,53 +773,23 @@ function main() {
         fi
     fi
 
-    # Step 1: Create subset division
-    log_info "Step 1: Creating subset division"
+    # Use dnq_runner.py to handle the entire workflow
+    log_info "Starting DNQ workflow using dnq_runner.py"
     if ! create_subsets "$SOURCE_PATH" "$OUTPUT_PATH"; then
-        log_error "Subset creation failed"
+        log_error "DNQ workflow failed"
         exit 1
     fi
 
-    # Load subsets
-    local subsets_file="${OUTPUT_PATH}/subsets.json"
-    if [[ ! -f "$subsets_file" ]]; then
-        log_error "Subsets file not found: $subsets_file"
-        exit 1
-    fi
-
-    # Extract subset information (this is simplified - would need proper JSON parsing)
-    local num_subsets=$(python3 -c "import json; data=json.load(open('$subsets_file')); print(len(data['subsets']))")
-    log_info "Created $num_subsets subsets"
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "Dry run completed - subset division created"
-        exit 0
-    fi
-
-    # Step 2: Train each subset
-    log_info "Step 2: Training individual subsets"
-
-    # This is a simplified version - real implementation would need proper JSON parsing
-    # and parallel processing of subsets
-    for ((i=1; i<=num_subsets; i++)); do
-        # Extract image IDs for subset (simplified)
-        local image_ids="1,2,3"  # This should be extracted from JSON
-
-        if ! train_subset "$i" "$SOURCE_PATH" "$OUTPUT_PATH" "$image_ids"; then
-            log_error "Training failed for subset $i"
-            exit 1
-        fi
-    done
-
-    # Step 3: Merge all results
-    log_info "Step 3: Merging subset results"
-    if ! merge_subsets "$OUTPUT_PATH"; then
-        log_error "Merging failed"
-        exit 1
+    # Copy dnq_runner.log contents to our main log
+    if [[ -f "dnq_runner.log" ]]; then
+        echo "=== DNQ Runner Log Contents ===" >> "$LOG_FILE"
+        cat "dnq_runner.log" >> "$LOG_FILE"
+        echo "=== End DNQ Runner Log ===" >> "$LOG_FILE"
     fi
 
     log_success "Divide and Conquer 3DGS completed successfully!"
-    log_info "Final result: ${OUTPUT_PATH}/final_merged.ply"
+    log_info "Check ${OUTPUT_PATH}/final_merged.ply for results"
+    echo "=== DNQ Script Completed: $(date) ===" >> "$LOG_FILE"
 }
 
 # Execute main function
