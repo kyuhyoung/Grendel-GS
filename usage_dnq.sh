@@ -6,9 +6,21 @@
 
 set -e
 
-# Default parameters
-SOURCE_PATH=""
-OUTPUT_PATH="./output/dnq_test"
+# Required parameters
+# Check if dataset name is provided as first argument
+echo "DEBUG: First argument \$1 = '$1'"
+echo "DEBUG: All arguments: $@"
+if [ -n "$1" ]; then
+    SOURCE_PATH="/data/$1"  # Use provided dataset name
+    echo "DEBUG: Set SOURCE_PATH to: $SOURCE_PATH"
+    shift  # Remove dataset name from arguments
+else
+    SOURCE_PATH="/data/Samsung_SN_30"  # Default path to COLMAP reconstruction
+    echo "DEBUG: Using default SOURCE_PATH: $SOURCE_PATH"
+fi
+OUTPUT_PATH="./output/dnq_test"   # Output directory
+
+# DNQ parameters
 THRESHOLD_A=50000000  # Maximum pixel count for subset footprint union (50M pixels)
 THRESHOLD_D=0.7       # Minimum ratio between min(C) and max(C)
 DEBUG=false
@@ -32,12 +44,12 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 function print_usage() {
-    echo "Usage: $0 [source_path] [options]"
+    echo "Usage: $0 [dataset_name] [options]"
     echo ""
     echo "Divide and Conquer 3D Gaussian Splatting"
     echo ""
     echo "Arguments:"
-    echo "  source_path                 Path to COLMAP reconstruction directory"
+    echo "  dataset_name                Dataset name in /data/ directory (default: Samsung_SN_30)"
     echo ""
     echo "Options:"
     echo "  -o, --output_path PATH      Output directory (default: ./output/dnq_test)"
@@ -52,7 +64,9 @@ function print_usage() {
     echo "  -h, --help                  Show this help message"
     echo ""
     echo "Example:"
-    echo "  $0 /data/my_colmap_data -o ./output/my_dnq_result -a 30000000 -d 0.8"
+    echo "  $0 Samsung_SN_30                  # Use Samsung_SN_30 dataset"
+    echo "  $0 my_dataset -o ./output/result   # Use custom dataset with custom output"
+    echo "  $0                                 # Use default Samsung_SN_30"
 }
 
 function log_info() {
@@ -77,7 +91,7 @@ function log_debug() {
     fi
 }
 
-# Parse command line arguments
+# Process remaining arguments after dataset name
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help)
@@ -120,35 +134,25 @@ while [[ $# -gt 0 ]]; do
             MERGE_ONLY=true
             shift
             ;;
-        -*)
-            log_error "Unknown option: $1"
-            print_usage
-            exit 1
-            ;;
         *)
-            if [[ -z "$SOURCE_PATH" ]]; then
-                SOURCE_PATH="$1"
-            else
-                log_error "Multiple source paths specified"
-                print_usage
-                exit 1
-            fi
+            # Unknown argument, add to EXTRA_ARGS
+            EXTRA_ARGS="$EXTRA_ARGS $1"
             shift
             ;;
     esac
 done
 
-# Validate required arguments
-if [[ -z "$SOURCE_PATH" ]] && [[ "$MERGE_ONLY" != "true" ]]; then
-    log_error "Source path is required (unless using --merge_only)"
-    print_usage
-    exit 1
-fi
-
-# Validate source path exists
-if [[ "$MERGE_ONLY" != "true" ]] && [[ ! -d "$SOURCE_PATH" ]]; then
-    log_error "Source path does not exist: $SOURCE_PATH"
-    exit 1
+# Validate source path
+if [[ "$MERGE_ONLY" != "true" ]]; then
+    if [[ ! -d "$SOURCE_PATH" ]]; then
+        log_error "Source path does not exist: $SOURCE_PATH"
+        exit 1
+    fi
+    if [[ ! -d "$SOURCE_PATH/sparse" ]] && [[ ! -f "$SOURCE_PATH/cameras.txt" ]]; then
+        log_error "No COLMAP data found in: $SOURCE_PATH"
+        log_warning "Expected: sparse/ directory or cameras.txt file"
+        exit 1
+    fi
 fi
 
 # Create output directory
