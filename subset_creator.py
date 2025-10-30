@@ -49,48 +49,68 @@ class FootprintCalculator:
         
         logger.info(f"Loading COLMAP data from: {sparse_dir}")
         
-        # Load cameras
-        cameras = {}
-        with open(sparse_dir / "cameras.txt", 'r') as f:
-            for line in f:
-                if line.startswith('#'):
-                    continue
-                parts = line.strip().split()
-                if len(parts) >= 5:
-                    cam_id = int(parts[0])
-                    model = parts[1]
-                    width = int(parts[2])
-                    height = int(parts[3])
-                    params = [float(x) for x in parts[4:]]
-                    cameras[cam_id] = {
-                        'model': model,
-                        'width': width,
-                        'height': height,
-                        'params': params
-                    }
-        
-        # Load images
-        images = {}
-        with open(sparse_dir / "images.txt", 'r') as f:
-            for line in f:
-                if line.startswith('#'):
-                    continue
-                parts = line.strip().split()
-                if len(parts) >= 10:
-                    img_id = int(parts[0])
-                    qw, qx, qy, qz = map(float, parts[1:5])
-                    tx, ty, tz = map(float, parts[5:8])
-                    cam_id = int(parts[8])
-                    name = parts[9]
-                    images[img_id] = {
-                        'quat': [qw, qx, qy, qz],
-                        'trans': [tx, ty, tz],
-                        'camera_id': cam_id,
-                        'name': name
-                    }
-        
-        logger.info(f"Loaded {len(cameras)} cameras, {len(images)} images")
-        return cameras, images
+        try:
+            # Load cameras
+            cameras = {}
+            with open(sparse_dir / "cameras.txt", 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    if line.startswith('#'):
+                        continue
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        try:
+                            cam_id = int(parts[0])
+                            model = parts[1]
+                            width = int(parts[2])
+                            height = int(parts[3])
+                            params = [float(x) for x in parts[4:]]
+                            cameras[cam_id] = {
+                                'model': model,
+                                'width': width,
+                                'height': height,
+                                'params': params
+                            }
+                        except ValueError as e:
+                            logger.error(f"Error parsing camera line {line_num}: {line.strip()}")
+                            logger.error(f"Parts: {parts}")
+                            logger.error(f"ValueError: {e}")
+                            continue
+            
+            # Load images
+            images = {}
+            with open(sparse_dir / "images.txt", 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    if line.startswith('#'):
+                        continue
+                    parts = line.strip().split()
+                    if len(parts) >= 10:
+                        try:
+                            img_id = int(parts[0])
+                            qw, qx, qy, qz = map(float, parts[1:5])
+                            tx, ty, tz = map(float, parts[5:8])
+                            cam_id = int(parts[8])
+                            name = parts[9]
+                            images[img_id] = {
+                                'quat': [qw, qx, qy, qz],
+                                'trans': [tx, ty, tz],
+                                'camera_id': cam_id,
+                                'name': name
+                            }
+                        except ValueError as e:
+                            logger.error(f"Error parsing image line {line_num}: {line.strip()}")
+                            logger.error(f"Parts: {parts}")
+                            logger.error(f"ValueError: {e}")
+                            continue
+            
+            logger.info(f"Loaded {len(cameras)} cameras, {len(images)} images")
+            return cameras, images
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"Fatal error loading COLMAP data: {e}")
+            logger.error("Full traceback:")
+            logger.error(traceback.format_exc())
+            raise
     
     @staticmethod
     def quaternion_to_rotation_matrix(q):

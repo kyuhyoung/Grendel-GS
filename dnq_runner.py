@@ -348,7 +348,11 @@ class DNQRunner:
             return 0
             
         except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
             logger.error(f"Fatal error: {e}")
+            logger.error("Full traceback:")
+            logger.error(error_details)
             return 1
 
 def main():
