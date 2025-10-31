@@ -211,8 +211,16 @@ class FootprintCalculator:
                 )
             
             # COLMAPVisualizer에 points3D 데이터 설정
-            # COLMAPVisualizer는 points3d를 xyz 배열로 기대하므로 변환
-            self.visualizer.points3d = points3d_data['xyzs']
+            # COLMAPVisualizer는 points3d를 dictionary 형태로 기대함 (colmap_visualizer.py:572에서 .values() 호출)
+            # dictionary 형태로 변환: {point_id: {'xyz': [x,y,z], 'rgb': [r,g,b]}}
+            self.visualizer.points3d = {}
+            xyzs = points3d_data['xyzs']
+            rgbs = points3d_data['rgbs']
+            for i, (xyz, rgb) in enumerate(zip(xyzs, rgbs)):
+                self.visualizer.points3d[i] = {
+                    'xyz': xyz,
+                    'rgb': rgb
+                }
                 
             # DTM 생성
             logger.info("Creating DTM with 2m resolution...")
