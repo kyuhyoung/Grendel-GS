@@ -259,4 +259,5 @@ dependencies:
     - ultralytics-thop==2.0.14
     - yacs==0.1.8
     - yarl==1.18.3
+    - pulp
 prefix: /home/beemap/anaconda3/envs/SEG_Env

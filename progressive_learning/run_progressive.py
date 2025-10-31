@@ -86,6 +86,10 @@ def main():
     parser.add_argument('--max_camera_count', type=int, default=30, help='Maximum camera count for exponential fitting')
     parser.add_argument('--min_patience_for_max_cam', type=int, default=15, help='Patience when camera count is max_camera_count')
 
+    # Additional convergence parameters
+    parser.add_argument('--convergence_patience', type=int, default=10, help='Convergence patience (for compatibility)')
+    parser.add_argument('--convergence_check_interval', type=int, default=5, help='Convergence check interval (for compatibility)')
+
     # Visualization control
     parser.add_argument('--skip_heavy_visualization', action='store_true', help='Skip heavy visualization files (3d_scene, ortho, nadir) to save time')
 
@@ -181,13 +185,13 @@ def main():
     # Adaptive training parameters
     trainer.enable_adaptive_training = args.enable_adaptive_training
     trainer.min_iterations_per_window = args.min_iterations_per_window
-    trainer.convergence_start_iter = args.convergence_start_iter
 
     # Only set convergence parameters if config file doesn't exist
     # (If config file exists, it was already loaded in __init__)
     import os
     if not os.path.exists(os.path.join(os.getcwd(), "convergence_config.txt")):
         trainer.convergence_loss_threshold = args.convergence_loss_threshold
+        trainer.convergence_start_iter = args.convergence_start_iter
         # Set exponential fitting parameters
         trainer.min_camera_count = args.min_camera_count
         trainer.max_patience_for_min_cam = args.max_patience_for_min_cam

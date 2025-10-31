@@ -35,81 +35,180 @@ import torchvision.transforms.functional as tvf
 class ConvergenceDetector:
     """Adaptive training convergence detector using loss-based early stopping"""
 
-    def __init__(self, loss_threshold=1e-4, patience=10, min_iterations=5, check_interval=5, max_iterations=100, start_iter=100):
+    def __init__(self, loss_threshold=1e-4, min_iterations=5, max_iterations=100, start_iter=100):
         self.loss_threshold = loss_threshold
-        self.patience = patience
         self.min_iterations = min_iterations
-        self.check_interval = check_interval
         self.max_iterations = max_iterations
         self.start_iter = start_iter
 
         self.loss_history = []
         self.best_loss = float('inf')
         self.best_loss_iteration = 0
-        self.no_improvement_count = 0
-        self.enabled = False
+        self.enabled = True  # Enable by default for adaptive training
 
-        # Moving average for batch size 1 stability
-        self.moving_avg_window = 10  # Window size for moving average
-        self.recent_losses = []  # Keep recent losses for moving average
-        self.best_moving_avg = float('inf')
-        self.best_moving_avg_iteration = 0
+        # Epoch-based convergence tracking for batch size 1
+        self.current_epoch_losses = []  # Losses within current epoch
+        self.epoch_count = 0  # Number of completed epochs
+        self.cameras_per_epoch = None  # Will be set from scene
+        self.best_epoch_avg = float('inf')  # Best epoch average loss
+        self.best_epoch_avg_number = 0  # Epoch number of best average
+        self.epochs_since_improvement = 0  # Epochs since last significant improvement
+        self.last_completed_epoch_avg = float('inf')  # Track last completed epoch average
+
+        # Exponential fitting parameters (default values)
+        self.min_camera_count = 2
+        self.max_patience_for_min_cam = 50
+        self.max_camera_count = 30
+        self.min_patience_for_max_cam = 15
 
     def enable(self, enabled=True):
         """Enable or disable convergence detection"""
         self.enabled = enabled
+
+    def set_cameras_per_epoch(self, camera_count):
+        """Set the number of cameras per epoch"""
+        self.cameras_per_epoch = camera_count
+
+    def get_effective_patience(self):
+        """Calculate effective patience based on camera count (power function fitting)"""
+        if self.cameras_per_epoch is None or self.cameras_per_epoch <= 0:
+            print(f"[DEBUG] cameras_per_epoch is None or <= 0, using default fallback: 15")
+            return 15  # Default fallback value
+
+        import math
+
+        # 두 지점으로 power function fitting: y = a * x^b
+        # Config에서 설정된 값 사용
+        x1, y1 = self.min_camera_count, self.max_patience_for_min_cam
+        x2, y2 = self.max_camera_count, self.min_patience_for_max_cam
+
+        # 계산: b = ln(y2/y1) / ln(x2/x1), a = y1 / (x1^b)
+        b = math.log(y2 / y1) / math.log(x2 / x1)
+        a = y1 / (x1**b)
+
+        # Power function으로 dynamic patience 계산
+        # print(f"[POWER CONFIRM] Using power function: {a:.2f} * {self.cameras_per_epoch}^{b:.4f}")
+        dynamic_patience = int(a * (self.cameras_per_epoch**b))
+        # print(f"[POWER CONFIRM] Result: {dynamic_patience}")
+
+        # print(f"[DEBUG POWER] cameras={self.cameras_per_epoch}, config=({x1},{y1})-({x2},{y2}), a={a:.2f}, b={b:.4f}, patience={dynamic_patience}")
+        # Power function fitting 결과를 그대로 사용
+        effective_patience = dynamic_patience
+
+        return effective_patience
+
+    def add_loss_to_epoch(self, current_loss):
+        """Add loss to current epoch and check if epoch is complete"""
+        # print(f"[DEBUG ADD_LOSS] add_loss_to_epoch called: enabled={self.enabled}, cameras_per_epoch={self.cameras_per_epoch}")
+        # print(f"[DEBUG ADD_LOSS] current_loss={current_loss}")
+        # print(f"[DEBUG ADD_LOSS] current_epoch_losses before append: {len(self.current_epoch_losses)}")
+
+        if not self.enabled or self.cameras_per_epoch is None:
+            # print(f"[DEBUG ADD_LOSS] Returning False: enabled={self.enabled}, cameras_per_epoch={self.cameras_per_epoch}")
+            return False
+
+        self.current_epoch_losses.append(current_loss)
+        # print(f"[DEBUG ADD_LOSS] current_epoch_losses after append: {len(self.current_epoch_losses)}")
+        # print(f"[DEBUG ADD_LOSS] cameras_per_epoch: {self.cameras_per_epoch}")
+        # print(f"[DEBUG ADD_LOSS] Check condition: {len(self.current_epoch_losses)} >= {self.cameras_per_epoch} = {len(self.current_epoch_losses) >= self.cameras_per_epoch}")
+
+        # Check if epoch is complete
+        if len(self.current_epoch_losses) >= self.cameras_per_epoch:
+            # print(f"[DEBUG ADD_LOSS] EPOCH COMPLETE! Calling _complete_epoch()")
+            result = self._complete_epoch()
+            # print(f"[DEBUG ADD_LOSS] _complete_epoch() returned: {result}")
+            return result
+        else:
+            # print(f"[DEBUG ADD_LOSS] Epoch NOT complete yet, returning False")
+            return False
+
+    def _complete_epoch(self):
+        """Complete current epoch and check for convergence"""
+        # print(f"[DEBUG EPOCH] _complete_epoch called, current_epoch_losses length: {len(self.current_epoch_losses)}")
+
+        if len(self.current_epoch_losses) == 0:
+            # print(f"[DEBUG EPOCH] No losses in current epoch, returning False")
+            return False
+
+        # Calculate epoch average
+        epoch_avg = sum(self.current_epoch_losses) / len(self.current_epoch_losses)
+        utils.print_rank_0(f"📊 [DEBUG] Epoch {self.epoch_count} 평균: {epoch_avg:.6f} (losses : {self.current_epoch_losses})")
+
+        self.epoch_count += 1
+
+        # Store last completed epoch average
+        self.last_completed_epoch_avg = epoch_avg
+
+        # Check for improvement
+        improved = False
+
+        # print(f"[DEBUG EPOCH] Detailed comparison:")
+        # print(f"  current_avg: {epoch_avg:.6f}")
+        # print(f"  best_avg: {self.best_epoch_avg:.6f}")
+        # print(f"  threshold: {self.loss_threshold}")
+        # print(f"  best_avg - threshold: {self.best_epoch_avg - self.loss_threshold:.6f}")
+        # print(f"  improvement_needed: {epoch_avg} < {self.best_epoch_avg - self.loss_threshold:.6f}")
+        # print(f"  actual_improvement: {self.best_epoch_avg - epoch_avg:.6f}")
+
+        if epoch_avg < self.best_epoch_avg - self.loss_threshold:
+            self.best_epoch_avg = epoch_avg
+            self.best_epoch_avg_number = self.epoch_count
+            self.epochs_since_improvement = 0  # Reset counter on significant improvement
+            improved = True
+            utils.print_rank_0(f"🎯 [EPOCH CONVERGENCE] New best epoch avg: {epoch_avg:.6f} (epoch {self.epoch_count})")
+            # print(f"[DEBUG EPOCH] SIGNIFICANT IMPROVEMENT: epoch_avg({epoch_avg:.6f}) < best_avg({self.best_epoch_avg:.6f}) - threshold({self.loss_threshold})")
+        else:
+            self.epochs_since_improvement += 1  # Increment counter on no significant improvement
+            # print(f"[DEBUG EPOCH] No significant improvement: epoch_avg({epoch_avg:.6f}) >= best_avg({self.best_epoch_avg:.6f}) - threshold({self.loss_threshold})")
+            # print(f"[DEBUG EPOCH] epochs_since_improvement: {self.epochs_since_improvement}")
+
+        # print(f"[DEBUG EPOCH] Epoch completed. improved={improved}, epoch_count={self.epoch_count}")
+
+        # Clear current epoch losses for next epoch
+        self.current_epoch_losses.clear()
+
+        # FIXED: Return True when epoch is completed, regardless of improvement
+        return True
 
     def reset(self):
         """Reset convergence state for new window"""
         self.loss_history.clear()
         self.best_loss = float('inf')
         self.best_loss_iteration = 0
-        self.no_improvement_count = 0
 
-        # Reset moving average state
-        self.recent_losses.clear()
-        self.best_moving_avg = float('inf')
-        self.best_moving_avg_iteration = 0
+        # Reset epoch tracking state
+        self.current_epoch_losses.clear()
+        self.epoch_count = 0
+        self.best_epoch_avg = float('inf')
+        self.best_epoch_avg_number = 0
+        self.epochs_since_improvement = 0
+        self.last_completed_epoch_avg = float('inf')  # Track last completed epoch average
 
     def update(self, current_loss, iteration):
-        """Update convergence state with current loss"""
+        """Update convergence state with current loss (epoch-based)"""
         if not self.enabled or iteration < self.start_iter:
-            return
+            return False
 
         self.loss_history.append(current_loss)
 
-        # Update moving average for batch size 1 stability
-        self.recent_losses.append(current_loss)
-        if len(self.recent_losses) > self.moving_avg_window:
-            self.recent_losses.pop(0)  # Remove oldest loss
-
-        # Calculate moving average
-        moving_avg = sum(self.recent_losses) / len(self.recent_losses)
-
-        # Use moving average for convergence detection instead of single loss
-        if moving_avg < self.best_moving_avg - self.loss_threshold:
-            self.best_moving_avg = moving_avg
-            self.best_moving_avg_iteration = iteration
-            self.no_improvement_count = 0
-            utils.print_rank_0(f"🎯 [CONVERGENCE] New best moving avg: {moving_avg:.6f} (window={len(self.recent_losses)}) at iteration {iteration}")
-        elif iteration % self.check_interval == 0:
-            # Only increment count when we're at a check interval
-            self.no_improvement_count += 1
+        # Add loss to current epoch and check if epoch is complete
+        epoch_completed = self.add_loss_to_epoch(current_loss)
 
         # Keep old best_loss for compatibility
         if current_loss < self.best_loss - self.loss_threshold:
             self.best_loss = current_loss
             self.best_loss_iteration = iteration
 
-    def should_check_convergence(self, iteration):
-        """Check if we should evaluate convergence at this iteration"""
-        return (self.enabled and
-                iteration >= self.start_iter and
-                iteration >= self.min_iterations and
-                iteration % self.check_interval == 0)
+        return epoch_completed
+
+    def should_check_convergence(self):
+        """Check if we should evaluate convergence (epoch-based)"""
+        # Check every epoch after minimum epochs
+        min_epochs = max(1, self.min_iterations // (self.cameras_per_epoch or 1))
+        return (self.enabled and self.epoch_count >= min_epochs)
 
     def is_converged(self, iteration):
-        """Check if training has converged"""
+        """Check if training has converged (epoch-based)"""
         if not self.enabled:
             return False
 
@@ -120,20 +219,38 @@ class ConvergenceDetector:
             utils.print_rank_0(f"🛑 [CONVERGENCE] Max iterations ({self.max_iterations}) reached")
             return True
 
-        if self.no_improvement_count >= self.patience:
-            utils.print_rank_0(f"🛑 [CONVERGENCE] No improvement for {self.patience} checks (best moving avg: {self.best_moving_avg:.6f})")
+        # For epoch-based convergence, check if we haven't improved for effective patience epochs
+        # Use self.epochs_since_improvement which is properly maintained in _complete_epoch
+        effective_patience = self.get_effective_patience()
+
+        if self.epochs_since_improvement >= effective_patience:
+            utils.print_rank_0(f"🛑 [EPOCH CONVERGENCE] No improvement for {self.epochs_since_improvement} epochs (effective patience: {effective_patience}, cameras: {self.cameras_per_epoch}) (best epoch avg: {self.best_epoch_avg:.6f} at epoch {self.best_epoch_avg_number})")
             return True
 
         return False
 
     def get_stats(self):
         """Get current convergence statistics"""
+        # For convergence check display: show current epoch progress or last completed epoch avg
+        if self.current_epoch_losses:
+            # Epoch in progress - show current average
+            current_epoch_avg = sum(self.current_epoch_losses) / len(self.current_epoch_losses)
+        else:
+            # Epoch completed (losses cleared) - show the last completed epoch avg
+            current_epoch_avg = getattr(self, 'last_completed_epoch_avg', self.best_epoch_avg)
+
+        # Use self.epochs_since_improvement which is properly maintained
+        effective_patience = self.get_effective_patience()
         return {
             'best_loss': self.best_loss,
-            'best_moving_avg': self.best_moving_avg,
-            'current_moving_avg': sum(self.recent_losses) / len(self.recent_losses) if self.recent_losses else float('inf'),
-            'moving_avg_window_size': len(self.recent_losses),
-            'no_improvement_count': self.no_improvement_count,
+            'best_epoch_avg': self.best_epoch_avg,
+            'best_epoch_avg_number': self.best_epoch_avg_number,
+            'current_epoch_avg': current_epoch_avg,
+            'current_epoch_losses_count': len(self.current_epoch_losses),
+            'epoch_count': self.epoch_count,
+            'cameras_per_epoch': self.cameras_per_epoch,
+            'epochs_since_improvement': self.epochs_since_improvement,
+            'effective_patience': effective_patience,
             'total_checks': len(self.loss_history),
             'enabled': self.enabled
         }
@@ -141,25 +258,26 @@ class ConvergenceDetector:
     def print_config(self):
         """Print all configuration parameters"""
         print("\n" + "="*60)
-        print("ConvergenceDetector Configuration:")
+        print("Epoch-based ConvergenceDetector Configuration:")
         print("-"*60)
         print(f"  loss_threshold: {self.loss_threshold}")
-        print(f"  patience: {self.patience}")
+        print(f"  effective_patience: {self.get_effective_patience()} epochs (power function fitting: 2cam→90ep, 30cam→20ep)")
         print(f"  min_iterations: {self.min_iterations}")
-        print(f"  check_interval: {self.check_interval}")
         print(f"  max_iterations: {self.max_iterations}")
         print(f"  start_iter: {self.start_iter}")
-        print(f"  moving_avg_window: {self.moving_avg_window}")
+        print(f"  cameras_per_epoch: {self.cameras_per_epoch}")
         print(f"  enabled: {self.enabled}")
         print("-"*60)
         print(f"  Current State:")
         print(f"    best_loss: {self.best_loss:.6f}")
         print(f"    best_loss_iteration: {self.best_loss_iteration}")
-        print(f"    best_moving_avg: {self.best_moving_avg:.6f}")
-        print(f"    best_moving_avg_iteration: {self.best_moving_avg_iteration}")
-        print(f"    no_improvement_count: {self.no_improvement_count}")
+        print(f"    best_epoch_avg: {self.best_epoch_avg:.6f}")
+        print(f"    best_epoch_avg_number: {self.best_epoch_avg_number}")
+        print(f"    epoch_count: {self.epoch_count}")
+        print(f"    current_epoch_losses_count: {len(self.current_epoch_losses)}")
+        epochs_since_improvement = self.epoch_count - self.best_epoch_avg_number if self.best_epoch_avg_number > 0 else 0
+        print(f"    epochs_since_improvement: {epochs_since_improvement}")
         print(f"    loss_history_length: {len(self.loss_history)}")
-        print(f"    moving_avg_window_size: {len(self.recent_losses)}")
         print("="*60)
 
 
@@ -526,29 +644,51 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
     n_g_max = args.n_g_per_proc
 
     # Initialize convergence detector for adaptive training
+    conv_loss_threshold = getattr(args, 'convergence_loss_threshold', 1e-4)
+    conv_start_iter = getattr(args, 'convergence_start_iter', 100)
+    conv_min_iter = getattr(args, 'min_iterations_per_window', 5)
+    conv_max_iter = getattr(args, 'iterations_per_window', opt_args.iterations)
+
+    print(f"🔍 [CONVERGENCE INIT] loss_threshold={conv_loss_threshold}, start_iter={conv_start_iter}, min_iterations={conv_min_iter}, max_iterations={conv_max_iter}")
+
     convergence_detector = ConvergenceDetector(
-        loss_threshold=getattr(args, 'convergence_loss_threshold', 1e-4),
-        patience=getattr(args, 'convergence_patience', 10),
-        min_iterations=getattr(args, 'min_iterations_per_window', 5),
-        check_interval=getattr(args, 'convergence_check_interval', 5),
-        max_iterations=getattr(args, 'iterations_per_window', opt_args.iterations),
-        start_iter=getattr(args, 'convergence_start_iter', 100)
+        loss_threshold=conv_loss_threshold,
+        min_iterations=conv_min_iter,
+        max_iterations=conv_max_iter,
+        start_iter=conv_start_iter
     )
 
-    # Print convergence detector configuration
-    if getattr(args, 'enable_adaptive_training', False):
-        convergence_detector.print_config()
-    #exit(1)
     # Enable adaptive training if requested
     enable_adaptive = getattr(args, 'enable_adaptive_training', False)
-    convergence_detector.enable(enable_adaptive)
+
+    # Always enable convergence detector FIRST
+    convergence_detector.enable(True)
+    print(f"🔍 [CONVERGENCE DEBUG] Forced convergence_detector.enable(True)")
+
+    # Print convergence detector configuration AFTER enabling
+    if getattr(args, 'enable_adaptive_training', False):
+        convergence_detector.print_config()
+
+    # Set cameras per epoch for epoch-based convergence detection
+    # Always set this for convergence tracking, regardless of adaptive training setting
+    convergence_detector.set_cameras_per_epoch(len(scene.train_cameras))
+    print(f"🎯 [EPOCH CONVERGENCE] Set cameras per epoch: {len(scene.train_cameras)}")
+
+    # Set power function fitting parameters from args (if available from progressive_trainer)
+    if hasattr(args, 'min_camera_count'):
+        convergence_detector.min_camera_count = args.min_camera_count
+    if hasattr(args, 'max_patience_for_min_cam'):
+        convergence_detector.max_patience_for_min_cam = args.max_patience_for_min_cam
+    if hasattr(args, 'max_camera_count'):
+        convergence_detector.max_camera_count = args.max_camera_count
+    if hasattr(args, 'min_patience_for_max_cam'):
+        convergence_detector.min_patience_for_max_cam = args.min_patience_for_max_cam
 
     if enable_adaptive:
         utils.print_rank_0(f"🎯 [ADAPTIVE TRAINING] Enabled with parameters:")
         utils.print_rank_0(f"   Loss threshold: {convergence_detector.loss_threshold}")
-        utils.print_rank_0(f"   Patience: {convergence_detector.patience}")
+        utils.print_rank_0(f"   Effective patience: {convergence_detector.get_effective_patience()} epochs (power function fitting)")
         utils.print_rank_0(f"   Min iterations: {convergence_detector.min_iterations}")
-        utils.print_rank_0(f"   Check interval: {convergence_detector.check_interval}")
         utils.print_rank_0(f"   Max iterations: {convergence_detector.max_iterations}")
 
     # Init dataset
@@ -597,65 +737,96 @@ def _training_loop(gaussians, scene, opt_args, pipe_args, args, timers, backgrou
 
     for iteration in range(start_from_this_iteration, opt_args.iterations + 1, args.bsz):
         # Log memory every 3 iterations
-        if iteration % 3 == 0 and torch.cuda.is_available():
-            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
-            mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
-            mem_peak = torch.cuda.max_memory_allocated(0) / 1024**3
-            utils.print_rank_0(f"🧠 [ITER {iteration}] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Peak={mem_peak:.2f}GB")
+        # if iteration % 3 == 0 and torch.cuda.is_available():
+        #     mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+        #     mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+        #     mem_peak = torch.cuda.max_memory_allocated(0) / 1024**3
+        #     utils.print_rank_0(f"🧠 [ITER {iteration}] GPU 0: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB, Peak={mem_peak:.2f}GB")
 
         ema_loss_for_log = _process_iteration(iteration, gaussians, scene, args, timers, strategy_history, train_dataset, background, pipe_args, progress_bar, ema_loss_for_log, debug_info_printed, end2end_timers, log_file, n_g_max)
 
         # Check for convergence if adaptive training is enabled
-        if convergence_detector.enabled:
-            convergence_detector.update(ema_loss_for_log, iteration)
+        # print(f"[DEBUG FULL] BEFORE convergence check: iter={iteration}, convergence_detector.enabled={convergence_detector.enabled}")
+        is_converged_flag = False
+        if convergence_detector.enabled and utils.DEFAULT_GROUP.rank() == 0:
+            # print(f"[DEBUG FULL] INSIDE convergence_detector.enabled block (rank 0 only)")
+            epoch_completed = convergence_detector.update(ema_loss_for_log, iteration)
+            # print(f"[DEBUG FULL] After update: iter={iteration}, enabled={convergence_detector.enabled}, epoch_completed={epoch_completed}, ema_loss_for_log={ema_loss_for_log}")
 
-            if convergence_detector.should_check_convergence(iteration):
-                if convergence_detector.is_converged(iteration):
-                    utils.print_rank_0(f"🎯 [ADAPTIVE TRAINING] Convergence detected at iteration {iteration}")
-                    utils.print_rank_0(f"🎯 [ADAPTIVE TRAINING] Early stopping - saving checkpoint and finalizing...")
+            if epoch_completed:
+                # print(f"[DEBUG FULL] EPOCH COMPLETED! Checking convergence conditions...")
+                should_check = convergence_detector.should_check_convergence()
+                # print(f"[DEBUG FULL] should_check_convergence={should_check}")
+                # print(f"[DEBUG FULL] start_iter={convergence_detector.start_iter}, current_iter={iteration}")
+                # print(f"[DEBUG FULL] epoch_count={convergence_detector.epoch_count}")
+                # print(f"[DEBUG FULL] min_iterations={convergence_detector.min_iterations}")
+                # print(f"[DEBUG FULL] cameras_per_epoch={convergence_detector.cameras_per_epoch}")
 
-                    # Save final checkpoint before exit
-                    utils.print_rank_0(f"💾 [EARLY EXIT] Saving final checkpoint at iteration {iteration}")
+                min_epochs = max(1, convergence_detector.min_iterations // (convergence_detector.cameras_per_epoch or 1))
+                # print(f"[DEBUG FULL] calculated min_epochs={min_epochs}")
+                # print(f"[DEBUG FULL] condition check: enabled={convergence_detector.enabled} and epoch_count({convergence_detector.epoch_count}) >= min_epochs({min_epochs}) = {convergence_detector.epoch_count >= min_epochs}")
+            else:
+                # print(f"[DEBUG FULL] Epoch NOT completed, skipping convergence check")
+                pass
 
-                    # Force save checkpoint at convergence iteration
-                    utils.print_rank_0(f"\n[EARLY EXIT] Saving Convergence Checkpoint")
-                    log_file.write(f"[EARLY EXIT] Saving Convergence Checkpoint at iteration {iteration}\n")
-                    save_folder = scene.model_path + "/checkpoints/"
-                    if utils.DEFAULT_GROUP.rank() == 0:
-                        os.makedirs(save_folder, exist_ok=True)
-                        if utils.DEFAULT_GROUP.size() > 1:
-                            torch.distributed.barrier(group=utils.DEFAULT_GROUP)
-                    elif utils.DEFAULT_GROUP.size() > 1:
-                        torch.distributed.barrier(group=utils.DEFAULT_GROUP)
-                    path_ckpt = save_folder + f"/chkpnt_ws={utils.WORLD_SIZE}_rk={utils.GLOBAL_RANK}.pth"
-                    torch.save((gaussians.capture(), iteration + args.bsz), path_ckpt)
+            # Only check convergence when epoch is completed and meets check interval
+            # print(f"[DEBUG FULL] Final check: epoch_completed={epoch_completed} and should_check={convergence_detector.should_check_convergence()}")
+            if epoch_completed and convergence_detector.should_check_convergence():
+                # print(f"[DEBUG FULL] ENTERING CONVERGENCE CHECK BLOCK!")
+                is_converged_result = convergence_detector.is_converged(iteration)
+                # print(f"[DEBUG FULL] is_converged result: {is_converged_result}")
 
-                    # Store actual checkpoint paths for progressive training
-                    if not hasattr(args, 'actual_checkpoint_paths'):
-                        args.actual_checkpoint_paths = []
-                    args.actual_checkpoint_paths.append(path_ckpt)
+                if is_converged_result:
+                    is_converged_flag = True
 
-                    # Note: With simplified structure, no need for latest_checkpoint.txt
+        # Broadcast convergence decision to all ranks
+        if convergence_detector.enabled and utils.DEFAULT_GROUP.size() > 1:
+            # Convert boolean to tensor for broadcasting
+            converged_tensor = torch.tensor([1 if is_converged_flag else 0], dtype=torch.int32, device="cuda")
+            torch.distributed.broadcast(converged_tensor, src=0, group=utils.DEFAULT_GROUP)
+            is_converged_flag = bool(converged_tensor.item())
 
-                    end2end_timers.print_time(log_file, iteration)
+        # All ranks handle convergence together
+        if is_converged_flag:
+            utils.print_rank_0(f"🎯 [ADAPTIVE TRAINING] Convergence detected at iteration {iteration}")
+            utils.print_rank_0(f"🎯 [ADAPTIVE TRAINING] Early stopping - saving checkpoint and finalizing...")
 
-                    # Report final memory usage
-                    if torch.cuda.is_available():
-                        peak_memory_bytes = torch.cuda.max_memory_allocated()
-                        total_memory_bytes = torch.cuda.get_device_properties(0).total_memory
-                        peak_memory_gb = peak_memory_bytes / (1024 ** 3)
-                        total_memory_gb = total_memory_bytes / (1024 ** 3)
-                        peak_usage_ratio = peak_memory_bytes / total_memory_bytes
+            # Save final checkpoint before exit
+            save_folder = scene.model_path + "/checkpoints/"
+            utils.print_rank_0(f"💾 [EARLY EXIT] Saving final checkpoint at iteration {iteration} to {save_folder}")
+            utils.print_rank_0(f"🔥 [EARLY EXIT] Saving Convergence Checkpoint to {save_folder}")
+            if utils.DEFAULT_GROUP.rank() == 0:
+                log_file.write(f"[EARLY EXIT] Saving Convergence Checkpoint at iteration {iteration}\n")
 
-                        utils.print_rank_0(f"🧠 [FINAL MEMORY] Peak: {peak_memory_gb:.2f}GB/{total_memory_gb:.2f}GB ({peak_usage_ratio:.1%})")
+            # Use existing _handle_checkpoints function for consistent behavior
+            checkpoint_dir = _handle_checkpoints(iteration, scene, gaussians, args, end2end_timers, log_file)
+            args.checkpoint_dir = checkpoint_dir
 
-                    # Test completed - break from training loop
-                    utils.print_rank_0(f"🔥 [ADAPTIVE TRAINING] Convergence training completed successfully!")
-                    utils.print_rank_0(f"📄 Final checkpoint saved at iteration {iteration}")
-                    break
-                else:
-                    stats = convergence_detector.get_stats()
-                    utils.print_rank_0(f"🎯 [CONVERGENCE CHECK] Iter {iteration}: Loss={ema_loss_for_log:.6f}, MovingAvg={stats['current_moving_avg']:.6f}(w{stats['moving_avg_window_size']}), Best={stats['best_moving_avg']:.6f}@{convergence_detector.best_moving_avg_iteration}, No improvement: {stats['no_improvement_count']}/{convergence_detector.patience}")
+            # Report final memory usage
+            if torch.cuda.is_available():
+                peak_memory_bytes = torch.cuda.max_memory_allocated()
+                total_memory_bytes = torch.cuda.get_device_properties(0).total_memory
+                peak_memory_gb = peak_memory_bytes / (1024 ** 3)
+                total_memory_gb = total_memory_bytes / (1024 ** 3)
+                peak_usage_ratio = peak_memory_bytes / total_memory_bytes
+
+                utils.print_rank_0(f"🧠 [FINAL MEMORY] Peak: {peak_memory_gb:.2f}GB/{total_memory_gb:.2f}GB ({peak_usage_ratio:.1%})")
+
+            # Test completed - break from training loop
+            utils.print_rank_0(f"🔥 [ADAPTIVE TRAINING] Convergence training completed successfully!")
+            utils.print_rank_0(f"📄 Final checkpoint saved at iteration {iteration}")
+            break
+        else:
+            # Only show convergence message if convergence checking has started
+            if convergence_detector.enabled and iteration >= convergence_detector.start_iter:
+                # print(f"[DEBUG FULL] NOT CONVERGED, showing convergence check message")
+                stats = convergence_detector.get_stats()
+                # print(f"[DEBUG FULL] Stats: {stats}")
+                utils.print_rank_0(f"🎯 [EPOCH CONVERGENCE CHECK] Iter {iteration}: Loss={ema_loss_for_log:.6f}, Epoch {stats['epoch_count']} ({stats['current_epoch_losses_count']}/{stats['cameras_per_epoch']}), EpochAvg={stats['current_epoch_avg']:.6f}, BestEpochAvg={stats['best_epoch_avg']:.6f}@E{stats['best_epoch_avg_number']}, Epochs since improvement: {stats['epochs_since_improvement']}/{stats['effective_patience']}, Threshold={convergence_detector.loss_threshold:.6f}")
+            # If before start_iter or not enabled, no convergence message
+    else:
+        # print(f"[DEBUG FULL] convergence_detector.enabled is FALSE, skipping all convergence logic")
+        pass
 
     '''
     if previous_state:
@@ -918,10 +1089,6 @@ def _handle_iteration_tasks(iteration, scene, gaussians, args, batched_cameras, 
         end2end_timers.start()
 
         # Save Gaussians BEFORE densification
-        '''
-        t0 = [iteration <= save_iteration < iteration + args.bsz for save_iteration in args.save_iterations]
-        print(f'\n\niteration : {iteration}, t0 : {t0}\n\n');
-        '''
         if any([iteration <= save_iteration < iteration + args.bsz for save_iteration in args.save_iterations]):
             _handle_saving(iteration, scene, batched_cameras, batched_image, args, end2end_timers, log_file, strategy_history, ema_loss_for_log)
 
@@ -1002,9 +1169,9 @@ def _handle_saving(iteration, scene, batched_cameras, batched_image, args, end2e
 def _handle_checkpoints(iteration, scene, gaussians, args, end2end_timers, log_file):
     """Handle saving checkpoints"""
     end2end_timers.stop()
-    utils.print_rank_0(f"\n[ITER {iteration}] Saving Checkpoint")
-    log_file.write(f"[ITER {iteration}] Saving Checkpoint\n")
     save_folder = scene.model_path + "/checkpoints/"
+    utils.print_rank_0(f"\n[ITER {iteration}] Saving Checkpoint to {save_folder}")
+    log_file.write(f"[ITER {iteration}] Saving Checkpoint to {save_folder}\n")
     if utils.DEFAULT_GROUP.rank() == 0:
         os.makedirs(save_folder, exist_ok=True)
         if utils.DEFAULT_GROUP.size() > 1:
@@ -1096,11 +1263,24 @@ def _finalize_training(args, opt_args, gaussians, log_file):
         if utils.GLOBAL_RANK == 0:
             with open(checkpoint_info_file, 'w') as f:
                 json.dump(checkpoint_info, f, indent=2)
-            utils.print_rank_0(f"💾 Saved checkpoint info to: {checkpoint_info_file}")
-            utils.print_rank_0(f"   Checkpoint directory: {checkpoint_dir}")
-            if gpu_metrics:
-                utils.print_rank_0(f"   Peak GPU memory: {gpu_metrics['peak_memory_gb']:.2f} GB / {gpu_metrics['total_memory_gb']:.2f} GB ({gpu_metrics['peak_usage_ratio']*100:.1f}%)")
 
+            # 실제로 저장된 checkpoint JSON 파일을 읽어서 확인
+            with open(checkpoint_info_file, 'r') as f:
+                saved_checkpoint = json.load(f)
+
+            utils.print_rank_0(f"💾 Saved checkpoint info to: {checkpoint_info_file}")
+            utils.print_rank_0(f"🔍 [CHECKPOINT SAVE] 실제 저장된 JSON 내용:")
+            utils.print_rank_0(f"   - checkpoint_dir: {saved_checkpoint.get('checkpoint_dir')}")
+            utils.print_rank_0(f"   - gpu_metrics: {bool(saved_checkpoint.get('gpu_metrics'))}")
+            utils.print_rank_0(f"   - gpu_metrics 내용: {saved_checkpoint.get('gpu_metrics')}")
+            if saved_checkpoint.get('gpu_metrics'):
+                gpu_info = saved_checkpoint['gpu_metrics']
+                utils.print_rank_0(f"   - peak_memory_gb: {gpu_info.get('peak_memory_gb', 'N/A')}")
+                utils.print_rank_0(f"   - total_memory_gb: {gpu_info.get('total_memory_gb', 'N/A')}")
+                utils.print_rank_0(f"   - peak_usage_ratio: {gpu_info.get('peak_usage_ratio', 'N/A')}")
+            else:
+                utils.print_rank_0(f"   - gpu_metrics가 비어있거나 False입니다")
+            #exit(1)
     #print(f'previous_state : {previous_state}');  exit(1)
     # Progressive training completion summary
     if previous_state:

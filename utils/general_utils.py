@@ -631,6 +631,100 @@ def merge_multiple_checkpoints(checkpoint_files):
     return merged_model_params, start_from_this_iteration
 
 
+def merge_ply_files(ply_files, output_path):
+    """
+    Merge multiple PLY files into a single PLY file
+
+    Args:
+        ply_files: List of PLY file paths to merge
+        output_path: Output path for merged PLY file
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        from plyfile import PlyData, PlyElement
+        import numpy as np
+        import os
+
+        if not ply_files:
+            print("Warning: No PLY files provided for merging")
+            return False
+
+        # Filter out non-existent files
+        existing_files = [f for f in ply_files if os.path.exists(f)]
+        if not existing_files:
+            print("Warning: No existing PLY files found for merging")
+            return False
+
+        print(f"Merging {len(existing_files)} PLY files into {output_path}")
+
+        all_vertices = []
+        total_points = 0
+
+        # Read all PLY files and collect vertex data
+        for i, ply_file in enumerate(existing_files):
+            print(f"  Reading {ply_file}...")
+
+            try:
+                plydata = PlyData.read(ply_file)
+                vertices = plydata['vertex']
+
+                # Convert to numpy array
+                vertex_array = np.array([list(vertex) for vertex in vertices])
+                all_vertices.append(vertex_array)
+
+                current_count = len(vertex_array)
+                total_points += current_count
+                print(f"    Added {current_count} points (total: {total_points})")
+
+            except Exception as e:
+                print(f"Warning: Failed to read {ply_file}: {e}")
+                continue
+
+        if not all_vertices:
+            print("Error: No valid PLY data found")
+            return False
+
+        # Concatenate all vertex arrays
+        print(f"Merging {total_points} total points...")
+        merged_vertices = np.concatenate(all_vertices, axis=0)
+
+        # Get the vertex properties from the first PLY file for structure reference
+        first_plydata = PlyData.read(existing_files[0])
+        vertex_element = first_plydata['vertex']
+        vertex_dtype = vertex_element.dtype()  # Call the dtype method
+        vertex_properties = vertex_dtype.names
+
+        # Create structured array with proper data types
+        merged_structured = np.zeros(len(merged_vertices), dtype=vertex_dtype)
+
+        # Copy data maintaining the original structure
+        for i, prop in enumerate(vertex_properties):
+            merged_structured[prop] = merged_vertices[:, i]
+
+        # Create PLY element and save
+        merged_element = PlyElement.describe(merged_structured, 'vertex')
+
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # Write merged PLY file
+        PlyData([merged_element]).write(output_path)
+
+        print(f"✓ Successfully merged {len(existing_files)} PLY files")
+        print(f"  Total points: {total_points}")
+        print(f"  Output: {output_path}")
+
+        return True
+
+    except Exception as e:
+        print(f"Error merging PLY files: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def get_part_of_checkpoints(checkpoint_file, num_parts, part_id):
     global LOCAL_RANK
 
@@ -775,3 +869,158 @@ def load_checkpoint(args):
         )
 
     return model_params, start_from_this_iteration
+
+
+def ply_from_checkpoint(checkpoint_dir, output_ply):
+    """
+    Export gaussians from checkpoint directory to PLY file
+
+    Args:
+        checkpoint_dir (str): Path to checkpoint directory containing chkpnt_ws=*_rk=*.pth files
+        output_ply (str): Output PLY file path
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    import torch
+    from pathlib import Path
+    from scene.gaussian_model import GaussianModel
+
+    checkpoint_dir = Path(checkpoint_dir)
+    output_path = Path(output_ply)
+
+    print(f"🔄 Exporting checkpoint to PLY...")
+    print(f"   Checkpoint dir: {checkpoint_dir}")
+    print(f"   Output PLY: {output_ply}")
+
+    # Find checkpoint files
+    checkpoint_files = list(checkpoint_dir.glob("chkpnt_ws=*_rk=*.pth"))
+    if not checkpoint_files:
+        print(f"❌ No checkpoint files found in {checkpoint_dir}")
+        return False
+
+    print(f"📋 Found {len(checkpoint_files)} checkpoint files")
+
+    # Initialize gaussian model with minimal setup
+    gaussians = GaussianModel(sh_degree=0)
+
+    # Load and merge checkpoint data
+    print("📄 Loading checkpoint data...")
+    all_xyz = []
+    all_features_dc = []
+    all_features_rest = []
+    all_scaling = []
+    all_rotation = []
+    all_opacity = []
+
+    for ckpt_file in sorted(checkpoint_files):
+        print(f"   Loading {ckpt_file.name}...")
+        try:
+            checkpoint_data = torch.load(ckpt_file, map_location='cpu', weights_only=False)
+
+            # Extract the actual gaussian data
+            # Checkpoint format: (gaussian_data_tuple, iteration)
+            if isinstance(checkpoint_data, tuple) and len(checkpoint_data) >= 2:
+                gaussian_data = checkpoint_data[0]
+                if isinstance(gaussian_data, tuple) and len(gaussian_data) >= 6:
+                    # Unpack gaussian parameters
+                    (active_sh_degree, xyz, features_dc, features_rest,
+                     scaling, rotation, opacity) = gaussian_data[:7]
+
+                    all_xyz.append(xyz.cpu())
+                    all_features_dc.append(features_dc.cpu())
+                    all_features_rest.append(features_rest.cpu())
+                    all_scaling.append(scaling.cpu())
+                    all_rotation.append(rotation.cpu())
+                    all_opacity.append(opacity.cpu())
+                else:
+                    print(f"   ⚠️  Unexpected gaussian data format in {ckpt_file.name}")
+            else:
+                print(f"   ⚠️  Unexpected checkpoint format in {ckpt_file.name}")
+
+        except Exception as e:
+            print(f"   ❌ Error loading {ckpt_file.name}: {e}")
+            continue
+
+    if not all_xyz:
+        print("❌ No valid checkpoint data found")
+        return False
+
+    # Concatenate all data
+    print("🔗 Merging data from all ranks...")
+    gaussians._xyz = torch.cat(all_xyz, dim=0)
+    gaussians._features_dc = torch.cat(all_features_dc, dim=0)
+    gaussians._features_rest = torch.cat(all_features_rest, dim=0)
+    gaussians._scaling = torch.cat(all_scaling, dim=0)
+    gaussians._rotation = torch.cat(all_rotation, dim=0)
+    gaussians._opacity = torch.cat(all_opacity, dim=0)
+
+    # Set required attributes
+    gaussians.max_radii2D = torch.zeros_like(gaussians._xyz[:, 0])
+    gaussians.xyz_gradient_accum = torch.zeros_like(gaussians._xyz)
+    gaussians.denom = torch.zeros_like(gaussians._xyz[:, 0])
+    gaussians.active_sh_degree = 0
+
+    total_gaussians = gaussians._xyz.shape[0]
+    print(f"✅ Merged {total_gaussians:,} gaussians")
+
+    # Create output directory
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Save to PLY
+    print("💾 Saving PLY file...")
+
+    try:
+        # Direct PLY creation without distributed processing
+        from plyfile import PlyData, PlyElement
+        import numpy as np
+
+        print("   Converting to numpy arrays...")
+        xyz = gaussians._xyz.detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+
+        features_dc = gaussians._features_dc.detach().cpu().numpy()
+        if features_dc.ndim == 3:
+            features_dc = features_dc.reshape(features_dc.shape[0], -1)  # Flatten last dimensions
+
+        features_extra = gaussians._features_rest.detach().cpu().numpy()
+        opacities = gaussians._opacity.detach().cpu().numpy()
+        scale = gaussians._scaling.detach().cpu().numpy()
+        rotation = gaussians._rotation.detach().cpu().numpy()
+
+        print(f"   Shapes: xyz={xyz.shape}, features_dc={features_dc.shape}, opacities={opacities.shape}, scale={scale.shape}, rotation={rotation.shape}")
+
+        print("   Creating PLY structure...")
+        # Create vertex array
+        dtype_full = [(attribute, 'f4') for attribute in [
+            'x', 'y', 'z', 'nx', 'ny', 'nz',
+            'f_dc_0', 'f_dc_1', 'f_dc_2',
+            'opacity',
+            'scale_0', 'scale_1', 'scale_2',
+            'rot_0', 'rot_1', 'rot_2', 'rot_3'
+        ]]
+
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, features_dc, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+
+        # Create PLY element
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(str(output_ply))
+
+        if output_path.exists():
+            file_size = output_path.stat().st_size / (1024 * 1024)  # MB
+            print(f"✅ PLY export successful!")
+            print(f"   📄 File: {output_ply}")
+            print(f"   📏 Size: {file_size:.2f} MB")
+            print(f"   🔢 Gaussians: {total_gaussians:,}")
+            return True
+        else:
+            print(f"❌ PLY file was not created")
+            return False
+
+    except Exception as e:
+        print(f"❌ Error saving PLY: {e}")
+        import traceback
+        traceback.print_exc()
+        return False

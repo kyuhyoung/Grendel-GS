@@ -109,6 +109,7 @@ class ModelParams(ParamGroup):
         self.normalize = False
         self.previous_state = ""  # Path to previous window's state JSON file for progressive training
         self.track_by_projection = False  # Generate tracks by projecting 3D points instead of using COLMAP tracks
+        self.point_cloud_format = "auto"  # Point cloud format: auto, ply, txt, bin
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -160,6 +161,23 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.min_opacity = 0.005
         self.lr_scale_mode = "sqrt"  # can be "linear", "sqrt", or "accumu"
+
+        # Adaptive training parameters
+        self.enable_adaptive_training = False
+        self.min_iterations_per_window = 5
+        self.convergence_loss_threshold = 1e-4
+        self.convergence_start_iter = 100
+
+        # Exponential fitting parameters for dynamic patience
+        self.min_camera_count = 2
+        self.max_patience_for_min_cam = 50
+        self.max_camera_count = 30
+        self.min_patience_for_max_cam = 15
+
+        # Additional convergence parameters
+        self.convergence_patience = 10
+        self.convergence_check_interval = 5
+
         super().__init__(parser, "Optimization Parameters")
 
 
@@ -298,10 +316,10 @@ def print_all_args(args, log_file):
 def find_latest_checkpoint(log_folder):
     checkpoint_folder = os.path.join(log_folder, "checkpoints")
     if os.path.exists(checkpoint_folder):
-        all_sub_folders = os.listdir(checkpoint_folder)
-        if len(all_sub_folders) > 0:
-            all_sub_folders.sort(key=lambda x: int(x), reverse=True)
-            return os.path.join(checkpoint_folder, all_sub_folders[0])
+        # With simplified structure, return checkpoints directory directly
+        checkpoint_files = [f for f in os.listdir(checkpoint_folder) if f.endswith('.pth')]
+        if len(checkpoint_files) > 0:
+            return checkpoint_folder
     return ""
 
 
@@ -354,10 +372,17 @@ def init_args(args):
     #print('eee')    exit(1)
     # sort test_iterations
     args.test_iterations.sort()
-    args.save_iterations.sort()
-    if args.auto_save_final_iteration and len(args.save_iterations) > 0 and args.iterations not in args.save_iterations:
-        args.save_iterations.append(args.iterations)
-    args.checkpoint_iterations.sort()
+
+    # Disable save_iterations for adaptive training (only keep camera removal PLY saving)
+    if hasattr(args, 'enable_adaptive_training') and args.enable_adaptive_training:
+        args.save_iterations = []
+        args.checkpoint_iterations = []
+        print("[INFO] Adaptive training enabled: save_iterations and checkpoint_iterations disabled (only camera removal PLY saving)")
+    else:
+        args.save_iterations.sort()
+        if args.auto_save_final_iteration and len(args.save_iterations) > 0 and args.iterations not in args.save_iterations:
+            args.save_iterations.append(args.iterations)
+        args.checkpoint_iterations.sort()
 
     # Set up global args
     utils.set_args(args)

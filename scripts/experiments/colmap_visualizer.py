@@ -171,29 +171,96 @@ class COLMAPVisualizer:
         #exit(1)
         return images
     
-    def read_points3d_txt(self):
-        """points3D.txt 파싱"""
+    def read_points3d_txt(self, point_cloud_format="auto"):
+        """points3D 파싱 - 다양한 형식 지원"""
         points_file = os.path.join(self.colmap_path, 'points3D.txt')
+
+        # Define all possible paths
+        ply_path = os.path.join(self.colmap_path, "points3D.ply")
+        bin_path = os.path.join(self.colmap_path, "points3D.bin")
+        txt_path = points_file
+
         points3d = {}
-        
-        with open(points_file, 'r') as f:
-            lines = f.readlines()
+
+        print(f"🔍 Loading points3D with format={point_cloud_format}")
+
+        if point_cloud_format == "ply":
+            # Load PLY directly
+            self._load_points_from_ply(ply_path, points3d)
+        elif point_cloud_format == "txt":
+            # Load TXT directly
+            self._load_points_from_txt(txt_path, points3d)
+        elif point_cloud_format == "bin":
+            # Load BIN directly
+            self._load_points_from_bin(bin_path, points3d)
+        else:  # auto mode - try bin -> txt -> ply (same as scene/dataset_readers.py)
+            loaded = False
+
+            # Try BIN first
+            if os.path.exists(bin_path):
+                print(f"Trying to load BIN file: {bin_path}")
+                self._load_points_from_bin(bin_path, points3d)
+                if len(points3d) > 0:
+                    loaded = True
+                    print(f"Successfully loaded {len(points3d)} points from BIN file")
+            else:
+                print(f"BIN file not found: {bin_path}")
+
+            # Try TXT if BIN failed or not found
+            if not loaded and os.path.exists(txt_path):
+                print(f"Trying to load TXT file: {txt_path}")
+                self._load_points_from_txt(txt_path, points3d)
+                if len(points3d) > 0:
+                    loaded = True
+                    print(f"Successfully loaded {len(points3d)} points from TXT file")
+            elif not loaded:
+                print(f"TXT file not found: {txt_path}")
+
+            # Try PLY as last resort
+            if not loaded and os.path.exists(ply_path):
+                print(f"Trying to load PLY file: {ply_path}")
+                self._load_points_from_ply(ply_path, points3d)
+                if len(points3d) > 0:
+                    loaded = True
+                    print(f"Successfully loaded {len(points3d)} points from PLY file")
+            elif not loaded:
+                print(f"PLY file not found: {ply_path}")
+
+            if not loaded:
+                print(f"No point cloud file found at {bin_path}, {txt_path}, or {ply_path}")
+                print("No point cloud data available")
             
+        self.points3d = points3d
+        print(f"Loaded {len(points3d)} 3D points")
+        
+        # 관찰되지 않는 포인트 분석
+        self.analyze_unobserved_points()
+
+    def _load_points_from_txt(self, txt_path, points3d):
+        """Load points from TXT file"""
+        if not os.path.exists(txt_path):
+            print(f"TXT file not found: {txt_path}")
+            return
+
+        print(f"Loading points from TXT: {txt_path}")
+        with open(txt_path, 'r') as f:
+            lines = f.readlines()
+
         for line in lines:
             if line.startswith('#') or not line.strip():
                 continue
-                
+
             parts = line.strip().split()
             point_id = int(parts[0])
             xyz = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
-            
+
             # Z값이 음수인 포인트 제외 (항공 사진의 경우)
             if xyz[2] < 0:
                 continue
-                
+
             rgb = np.array([int(parts[4]), int(parts[5]), int(parts[6])])
             error = float(parts[7])
-            
+
             # Track 정보 파싱 (이미지와 2D 포인트 ID 쌍)
             track = []
             for i in range(8, len(parts), 2):
@@ -201,7 +268,7 @@ class COLMAPVisualizer:
                     image_id = int(parts[i])
                     point2d_id = int(parts[i + 1])
                     track.append((image_id, point2d_id))
-            
+
             points3d[point_id] = {
                 'id': point_id,
                 'xyz': xyz,
@@ -209,13 +276,101 @@ class COLMAPVisualizer:
                 'error': error,
                 'track': track  # 이 포인트를 관찰한 이미지들
             }
-            
-        self.points3d = points3d
-        print(f"Loaded {len(points3d)} 3D points")
-        
-        # 관찰되지 않는 포인트 분석
-        self.analyze_unobserved_points()
-    
+
+    def _load_points_from_ply(self, ply_path, points3d):
+        """Load points from PLY file using fetchPly function"""
+        import sys
+        import os
+
+        if not os.path.exists(ply_path):
+            print(f"PLY file not found: {ply_path}")
+            return
+
+        print(f"✅ PLY 파일에서 포인트 로딩: {ply_path}")
+
+        # Import fetchPly function
+        scene_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'scene')
+        if scene_path not in sys.path:
+            sys.path.append(scene_path)
+        from dataset_readers import fetchPly
+
+        try:
+            point_cloud = fetchPly(ply_path)
+            print(f"🎯 PLY 파일에서 {len(point_cloud.points)} 개의 포인트를 성공적으로 로딩했습니다!")
+
+            # Convert BasicPointCloud to points3d format
+            for i, (xyz, rgb) in enumerate(zip(point_cloud.points, point_cloud.colors)):
+                point_id = i + 1  # PLY doesn't have point IDs, so we generate them
+
+                # Z값이 음수인 포인트 제외 (항공 사진의 경우)
+                if xyz[2] < 0:
+                    continue
+
+                # Convert RGB from [0,1] to [0,255] if needed
+                if rgb.max() <= 1.0:
+                    rgb = (rgb * 255).astype(int)
+                else:
+                    rgb = rgb.astype(int)
+
+                points3d[point_id] = {
+                    'id': point_id,
+                    'xyz': xyz,
+                    'rgb': rgb,
+                    'error': 0.0,  # PLY doesn't have error info
+                    'track': []     # PLY doesn't have track info
+                }
+
+            print(f"🚀 PLY에서 변환된 최종 포인트 수: {len(points3d)}")
+
+        except Exception as e:
+            print(f"❌ PLY 파일 로딩 실패: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _load_points_from_bin(self, bin_path, points3d):
+        """Load points from BIN file"""
+        if not os.path.exists(bin_path):
+            print(f"BIN file not found: {bin_path}")
+            return
+
+        print(f"Loading points from BIN: {bin_path}")
+
+        try:
+            # Import COLMAP binary reader
+            import sys
+            scene_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'scene')
+            if scene_path not in sys.path:
+                sys.path.append(scene_path)
+            from colmap_loader import read_points3D_binary
+
+            # Read binary points
+            points3D_data = read_points3D_binary(bin_path)
+
+            for point_id, point_data in points3D_data.items():
+                xyz = point_data.xyz
+                rgb = point_data.rgb
+                error = point_data.error
+                track = [(image_id, point2d_idx) for image_id, point2d_idx in zip(point_data.image_ids, point_data.point2D_idxs)]
+
+                # Z값이 음수인 포인트 제외 (항공 사진의 경우)
+                if xyz[2] < 0:
+                    continue
+
+                points3d[point_id] = {
+                    'id': point_id,
+                    'xyz': xyz,
+                    'rgb': rgb,
+                    'error': error,
+                    'track': track
+                }
+
+            print(f"Successfully loaded {len(points3d)} points from BIN file")
+
+        except Exception as e:
+            print(f"❌ BIN 파일 로딩 실패: {e}")
+            import traceback
+            traceback.print_exc()
+
     def analyze_unobserved_points(self):
         """3D 포인트를 실제로 카메라에 투영하여 이미지 범위 내에 들어오는지 분석"""
         if not self.points3d or not self.images or not self.cameras:
@@ -781,7 +936,7 @@ class COLMAPVisualizer:
             # print(f"DEBUG:       Error in final approximation: {e}")
             return None, 'dtm_nan'
     
-    def visualize_3d_scene(self, save_path='colmap_3d_scene.png'):
+    def visualize_3d_scene(self, save_path='colmap_3d_scene.png', create_nadir_view=False):
         """3D 장면 시각화"""
         # print("DEBUG: visualize_3d_scene() - ENTRY POINT")
         # print(f"DEBUG: save_path = {save_path}")
@@ -1141,8 +1296,9 @@ class COLMAPVisualizer:
         print(f"3D scene saved to {save_path}")
         
         # Nadir view 추가 생성
-        nadir_save_path = save_path.replace('_3d_scene_', '_nadir_view_')
-        self.create_nadir_view(nadir_save_path)
+        if create_nadir_view:
+            nadir_save_path = save_path.replace('_3d_scene_', '_nadir_view_')
+            self.create_nadir_view(nadir_save_path)
         
         # 실패 원인 통계 테이블 출력
         print("\n" + "="*50)

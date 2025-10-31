@@ -49,37 +49,47 @@ class DNQRunner:
         """Create subsets using footprint-based algorithm"""
         logger.info("Creating subsets...")
         
-        # Import and use existing subset creation logic
-        from subset_creator import create_subsets_with_footprints
-        
-        # Load COLMAP data and create subsets
-        subsets = create_subsets_with_footprints(
-            source_path=self.source_path,
-            output_path=self.output_path,
-            pixel_threshold_a=self.args.pixel_threshold_a,
-            min_max_ratio_d=self.args.min_max_ratio_d,
-            max_subsets=self.args.max_subsets
-        )
-        
-        logger.info(f"Created {len(subsets)} subsets")
-        
-        # Save subsets metadata
-        subsets_data = {
-            'subsets': subsets,
-            'metadata': {
-                'total_subsets': len(subsets),
-                'pixel_threshold_a': self.args.pixel_threshold_a,
-                'min_max_ratio_d': self.args.min_max_ratio_d,
-                'max_subsets': self.args.max_subsets
+        try:
+            # Import and use existing subset creation logic
+            from subset_creator import create_subsets_with_footprints
+            
+            # Load COLMAP data and create subsets
+            logger.info("DEBUG: Calling create_subsets_with_footprints...")
+            subsets = create_subsets_with_footprints(
+                source_path=self.source_path,
+                output_path=self.output_path,
+                pixel_threshold_a=self.args.pixel_threshold_a,
+                min_max_ratio_d=self.args.min_max_ratio_d,
+                #max_subsets=self.args.max_subsets
+            )
+            
+            logger.info(f"DEBUG: create_subsets_with_footprints returned: {type(subsets)}")
+            logger.info(f"Created {len(subsets)} subsets")
+            
+            # Save subsets metadata
+            logger.info("DEBUG: Saving subsets metadata...")
+            subsets_data = {
+                'subsets': subsets,
+                'metadata': {
+                    'total_subsets': len(subsets),
+                    'pixel_threshold_a': self.args.pixel_threshold_a,
+                    'min_max_ratio_d': self.args.min_max_ratio_d
+                }
             }
-        }
-        
-        subsets_file = self.output_path / "subsets.json"
-        with open(subsets_file, 'w') as f:
-            json.dump(subsets_data, f, indent=2)
-        
-        logger.info(f"Subsets saved to: {subsets_file}")
-        return subsets
+            
+            subsets_file = self.output_path / "subsets.json"
+            with open(subsets_file, 'w') as f:
+                json.dump(subsets_data, f, indent=2)
+            
+            logger.info(f"Subsets saved to: {subsets_file}")
+            logger.info("DEBUG: create_subsets completed successfully")
+            return subsets
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"Error in create_subsets: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
     
     def train_subset(self, subset_id: int, image_ids: List[int]) -> bool:
         """Train a single subset using torchrun"""
@@ -144,7 +154,7 @@ class DNQRunner:
                 cmd,
                 cwd=os.getcwd(),
                 env=env,
-                capture_output=True,
+                capture_output=False,  # Let output stream directly to console
                 text=True,
                 timeout=3600 * 4  # 4 hour timeout
             )
@@ -153,7 +163,7 @@ class DNQRunner:
                 logger.info(f"Subset {subset_id} training completed successfully")
                 return True
             else:
-                logger.error(f"Subset {subset_id} training failed: {result.stderr}")
+                logger.error(f"Subset {subset_id} training failed with return code: {result.returncode}")
                 return False
                 
         except subprocess.TimeoutExpired:
@@ -196,7 +206,7 @@ class DNQRunner:
         shutil.copy2(sparse_dir / "cameras.txt", subset_sparse / "cameras.txt")
         
         # Filter images.txt and points3D.txt for this subset
-        self.filter_images_txt(sparse_dir / "images.txt", subset_sparse / "images.txt", image_ids)
+        self.filter_images_txt(sparse_dir / "images.txt", subset_sparse / "images.txt", image_ids, subset_colmap_path)
         
         # Copy points3D.txt (or create empty one)
         if (sparse_dir / "points3D.txt").exists():
@@ -207,22 +217,12 @@ class DNQRunner:
                 f.write("# 3D point list with one line of data per point:\n")
                 f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
         
-        # Copy images directory (or create symlinks)
-        images_src = self.source_path / "images"
-        images_dst = subset_colmap_path / "images"
-        
-        if images_src.exists() and not images_dst.exists():
-            # Create symbolic link to save space
-            try:
-                images_dst.symlink_to(images_src.absolute())
-            except:
-                # Fallback to copying
-                shutil.copytree(images_src, images_dst)
+        # No need to copy images - use relative paths in images.txt to point to original location
         
         logger.info(f"Created subset COLMAP data: {subset_colmap_path}")
         return subset_colmap_path
     
-    def filter_images_txt(self, input_file: Path, output_file: Path, image_ids: List[int]):
+    def filter_images_txt(self, input_file: Path, output_file: Path, image_ids: List[int], subset_colmap_path: Path):
         """Filter images.txt to include only specified image IDs"""
         with open(input_file, 'r') as f_in, open(output_file, 'w') as f_out:
             skip_next_line = False
@@ -242,13 +242,14 @@ class DNQRunner:
                     # This is an image metadata line
                     img_id = int(parts[0])
                     if img_id in image_ids:
-                        # Remove folder path from image name (e.g., 'images/800886.tif' -> '800886.tif')
-                        if '/' in parts[9]:
-                            parts[9] = parts[9].split('/')[-1]
+                        # Keep original image path relative to source directory
+                        # Just keep the original relative path as-is
+                        # parts[9] already contains the correct relative path
+                        parts[9] = str(parts[9])
                         modified_line = ' '.join(parts) + '\n'
                         f_out.write(modified_line)
                         # Write the next line (2D points) as well
-                        next_line = next(f_in, '')
+                        next_line = next(f_in, '\n')  # Default to newline if no next line
                         f_out.write(next_line)
                     else:
                         # Skip this image and its 2D points line
@@ -346,9 +347,13 @@ class DNQRunner:
             logger.info("=== Step 1: Creating subsets ===")
             subsets = self.create_subsets()
             
+            logger.info(f"DEBUG: create_subsets() returned: {type(subsets)} with {len(subsets) if subsets else 'None'} subsets")
+            
             if not subsets:
                 logger.error("No subsets created")
                 return 1
+            
+            logger.info(f"DEBUG: Successfully created {len(subsets)} subsets, proceeding to Step 2")
             
             # Step 2: Train subsets in parallel
             logger.info("=== Step 2: Training subsets ===")

@@ -10,8 +10,10 @@
 #
 
 import os
-import torch
 import sys
+print("TRAIN_DEBUG: train.py started - imports beginning", file=sys.stderr, flush=True)
+import torch
+print("TRAIN_DEBUG: torch imported successfully", file=sys.stderr, flush=True)
 import json
 from utils.general_utils import safe_state, init_distributed
 import utils.general_utils as utils
@@ -30,8 +32,10 @@ from arguments import (
 import train_internal
 
 if __name__ == "__main__":
+    print("TRAIN_DEBUG: train.py main function started", file=sys.stderr, flush=True)
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
+    print("TRAIN_DEBUG: ArgumentParser created", file=sys.stderr, flush=True)
     ap = AuxiliaryParams(parser)
     lp = ModelParams(parser)
     op = OptimizationParams(parser)

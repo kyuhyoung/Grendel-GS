@@ -129,7 +129,13 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
                 False
             ), "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
-        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        # Handle both absolute and relative paths from COLMAP
+        if os.path.isabs(extr.name):
+            # Absolute path in COLMAP
+            image_path = extr.name
+        else:
+            # Relative path in COLMAP - use original path to preserve directory structure
+            image_path = os.path.join(images_folder, extr.name)
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(
             image_path
@@ -200,7 +206,7 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sparse=None, track_by_projection=False):
+def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sparse=None, track_by_projection=False, point_cloud_format="auto"):
     # Debug info - uncomment if needed for debugging
     # print(f"🚨 readColmapSceneInfo() called - COLMAP files will be read from: {path}")
     # import traceback
@@ -218,12 +224,16 @@ def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sp
     cameras_ext_bin = os.path.join(base_sparse_path, "images.bin")
     cameras_int_bin = os.path.join(base_sparse_path, "cameras.bin")
     has_binary = (os.path.exists(cameras_ext_bin) and os.path.exists(cameras_int_bin))
+    print(f"DEBUG: cameras_ext_bin={cameras_ext_bin}, exists={os.path.exists(cameras_ext_bin)}")
+    print(f"DEBUG: cameras_int_bin={cameras_int_bin}, exists={os.path.exists(cameras_int_bin)}")
+    print(f"DEBUG: has_binary={has_binary}")
 
     cameras_ext_txt = os.path.join(base_sparse_path, "images.txt")
     cameras_int_txt = os.path.join(base_sparse_path, "cameras.txt")
-
-    # 텍스트 파일 존재 여부 확인
     has_text = (os.path.exists(cameras_ext_txt) and os.path.exists(cameras_int_txt))
+    print(f"DEBUG: cameras_ext_txt={cameras_ext_txt}, exists={os.path.exists(cameras_ext_txt)}")
+    print(f"DEBUG: cameras_int_txt={cameras_int_txt}, exists={os.path.exists(cameras_int_txt)}")
+    print(f"DEBUG: has_text={has_text}")
 
     if has_binary:
         try:
@@ -245,9 +255,13 @@ def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sp
                 raise Exception("Binary files failed and no text files available")
 
 
+    print(f"DEBUG: Condition check - not has_binary: {not has_binary}, has_text: {has_text}")
+    print(f"DEBUG: Will execute text loading: {not has_binary and has_text}")
+    
     if not has_binary and has_text:
         try:
             print("Loading text COLMAP files...")
+            #print('aaa');   exit(1)
             cam_extrinsics = read_extrinsics_text(cameras_ext_txt)
             cam_intrinsics = read_intrinsics_text(cameras_int_txt)
             '''
@@ -294,8 +308,37 @@ def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sp
     ply_path = os.path.join(base_sparse_path, "points3D.ply")
     bin_path = os.path.join(base_sparse_path, "points3D.bin")
     txt_path = os.path.join(base_sparse_path, "points3D.txt")
-    #print(f"🔍 Loading points3D with track_by_projection={track_by_projection}")
-    try:
+
+    # Load points based on specified format
+    print(f"🔍 Loading points3D with format={point_cloud_format}, track_by_projection={track_by_projection}")
+
+    if point_cloud_format == "ply":
+        # Load PLY directly
+        if os.path.exists(ply_path):
+            print(f"Loading points from PLY file: {ply_path}")
+
+            # PLY files have no track info, so track_by_projection MUST be True
+            if not track_by_projection:
+                print("Warning: PLY files require track_by_projection=True. Forcing it to True.")
+                track_by_projection = True
+
+            pcd = fetchPly(ply_path)
+            xyz = np.array(pcd.points)
+            rgb = np.array(pcd.colors) / 255.0
+            errors = np.zeros(len(xyz))  # PLY doesn't store errors
+
+            # PLY files have no track info, so we MUST use projection
+            if cam_intrinsics and cam_extrinsics:
+                from .colmap_loader import generate_tracks_by_projection
+                tracks = generate_tracks_by_projection(xyz, cam_intrinsics, cam_extrinsics)
+                print(f"Generated tracks via projection for {len(xyz)} points (PLY requires projection)")
+            else:
+                raise ValueError("PLY files require camera information for track computation. Please provide cam_intrinsics and cam_extrinsics.")
+        else:
+            raise FileNotFoundError(f"PLY file not found: {ply_path}")
+
+    elif point_cloud_format == "bin":
+        # Load BIN only
         xyz, rgb, errors, tracks = read_points3D_binary(
             bin_path,
             track_by_projection=track_by_projection,
@@ -303,7 +346,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sp
             images=cam_extrinsics
         )
         rgb /= 255.0
-    except:
+
+    elif point_cloud_format == "txt":
+        # Load TXT only
         xyz, rgb, errors, tracks = read_points3D_text(
             txt_path,
             track_by_projection=track_by_projection,
@@ -311,6 +356,76 @@ def readColmapSceneInfo(path, images, eval, llffhold=10, dir_images=None, dir_sp
             images=cam_extrinsics
         )
         rgb /= 255.0
+
+    else:  # auto mode - try bin -> txt -> ply
+        loaded = False
+
+        # Try BIN first
+        if os.path.exists(bin_path):
+            try:
+                print(f"Trying to load BIN file: {bin_path}")
+                xyz, rgb, errors, tracks = read_points3D_binary(
+                    bin_path,
+                    track_by_projection=track_by_projection,
+                    cameras=cam_intrinsics,
+                    images=cam_extrinsics
+                )
+                rgb /= 255.0
+                loaded = True
+                print(f"Successfully loaded {len(xyz)} points from BIN file")
+            except Exception as e:
+                print(f"Failed to load BIN file: {e}")
+
+        # Try TXT if BIN failed
+        if not loaded and os.path.exists(txt_path):
+            try:
+                print(f"Trying to load TXT file: {txt_path}")
+                xyz, rgb, errors, tracks = read_points3D_text(
+                    txt_path,
+                    track_by_projection=track_by_projection,
+                    cameras=cam_intrinsics,
+                    images=cam_extrinsics
+                )
+                rgb /= 255.0
+                loaded = True
+                print(f"Successfully loaded {len(xyz)} points from TXT file")
+            except Exception as e:
+                print(f"Failed to load TXT file: {e}")
+
+        # Try PLY as last resort
+        if not loaded and os.path.exists(ply_path):
+            try:
+                print(f"Trying to load PLY file: {ply_path}")
+
+                # PLY files have no track info, so track_by_projection MUST be True
+                if not track_by_projection:
+                    print("Warning: PLY files require track_by_projection=True. Forcing it to True.")
+                    track_by_projection = True
+
+                pcd = fetchPly(ply_path)
+                xyz = np.array(pcd.points)
+                rgb = np.array(pcd.colors) / 255.0
+                errors = np.zeros(len(xyz))
+
+                # PLY files have no track info, so we MUST use projection
+                if cam_intrinsics and cam_extrinsics:
+                    from .colmap_loader import generate_tracks_by_projection
+                    tracks = generate_tracks_by_projection(xyz, cam_intrinsics, cam_extrinsics)
+                    print(f"Generated tracks via projection for {len(xyz)} points (PLY requires projection)")
+                else:
+                    raise ValueError("PLY files require camera information for track computation. Please provide cam_intrinsics and cam_extrinsics.")
+
+                loaded = True
+                print(f"Successfully loaded {len(xyz)} points from PLY file")
+
+
+            except Exception as e:
+                print(f"Failed to load PLY file: {e}")
+
+        # If nothing worked, raise error
+        if not loaded:
+            raise FileNotFoundError(f"No point cloud file could be loaded from {base_sparse_path}")
+
     #exit(1)
     '''
     # Debug: Print tracks for random 5 points

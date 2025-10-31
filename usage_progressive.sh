@@ -34,8 +34,8 @@ if [ -n "$1" ]; then
     echo "DEBUG: Set SOURCE_PATH to: $SOURCE_PATH"
     shift  # Remove dataset name from arguments
 else
-    SOURCE_PATH="/data/samsung_dong_mini_5"  # Path to COLMAP reconstruction
-    #SOURCE_PATH="/data/sillim_ew_mini_100024_20"  # Path to COLMAP reconstruction
+    #SOURCE_PATH="/data/samsung_dong_mini_5"  # Path to COLMAP reconstruction
+    SOURCE_PATH="/data/sillim_ew_mini_100024_20"  # Path to COLMAP reconstruction
     #SOURCE_PATH="/data/Samsung_SN_30"  # Default path to COLMAP reconstruction
     echo "DEBUG: Using default SOURCE_PATH: $SOURCE_PATH"
 fi
@@ -79,11 +79,12 @@ ITERATIONS=50                          # Training iterations
 ITERATIONS_PER_WINDOW=12                # Iterations per sliding window
 DENSIFICATION_INTERVAL=100              # Densification every 100 iterations
 DENSIFY_FROM_ITER=100                  # Start densification from iteration 300
-CAMERA_REMOVAL_MARGIN=0.25                 # Margin below densify_memory_limit for camera removal (0.99 - 0.25 = 0.74 = 74%)
-#CAMERA_REMOVAL_MARGIN=0.45                 # Margin below densify_memory_limit for camera removal (0.99 - 0.25 = 0.74 = 74%)
+#CAMERA_REMOVAL_MARGIN=0.1                  # Margin below densify_memory_limit for camera removal (0.3 - 0.1 = 0.2 = 20%)
+CAMERA_REMOVAL_MARGIN=0.5625                 # Margin below densify_memory_limit for camera removal (0.99 - 0.25 = 0.74 = 74%)
 ###
 
-DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.99    # GPU memory limit for densification (0.99 = 99%)
+#DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.3     # GPU memory limit for densification (0.3 = 30%)
+DENSIFY_MEMORY_LIMIT_PERCENTAGE=0.99     # GPU memory limit for densification (0.3 = 30%)
 MAX_WINDOW_SIZE=""                       # Maximum window size (number of cameras). Empty = unlimited
 #MAX_WINDOW_SIZE=3                       # Maximum window size (number of cameras). Empty = unlimited
 
@@ -100,12 +101,14 @@ MIN_ITERATIONS_PER_WINDOW=3             # Minimum iterations before convergence 
 
 CONVERGENCE_START_ITER=50              # Start convergence checking from this iteration
 CONVERGENCE_LOSS_THRESHOLD=1e-4         # Loss improvement threshold
+CONVERGENCE_PATIENCE=60                 # Number of iterations without improvement before convergence
+CONVERGENCE_CHECK_INTERVAL=10           # Check convergence every N iterations
 
 # Exponential fitting parameters for dynamic patience
 MIN_CAMERA_COUNT=2                      # Minimum camera count for exponential fitting
-MAX_PATIENCE_FOR_MIN_CAM=50             # Patience when camera count is MIN_CAMERA_COUNT
+MAX_PATIENCE_FOR_MIN_CAM=90            # Patience when camera count is MIN_CAMERA_COUNT
 MAX_CAMERA_COUNT=30                     # Maximum camera count for exponential fitting
-MIN_PATIENCE_FOR_MAX_CAM=15             # Patience when camera count is MAX_CAMERA_COUNT
+MIN_PATIENCE_FOR_MAX_CAM=35             # Patience when camera count is MAX_CAMERA_COUNT
 
 SH_DEGREE=3                              # Spherical harmonics degree (0 for testing, less memory)
 BACKEND="gsplat"                         # Rendering backend: default or gsplat
@@ -246,6 +249,8 @@ print_colored $GREEN "Adaptive Training Configuration:"
 echo "  Enable Adaptive Training: $ENABLE_ADAPTIVE_TRAINING"
 echo "  Min Iterations Per Window: $MIN_ITERATIONS_PER_WINDOW"
 echo "  Convergence Loss Threshold: $CONVERGENCE_LOSS_THRESHOLD"
+echo "  Convergence Patience: $CONVERGENCE_PATIENCE"
+echo "  Convergence Check Interval: $CONVERGENCE_CHECK_INTERVAL"
 echo "  Debug: $DEBUG"
 echo "  Show Memory Debug Info: $SHOW_MEMORY_DEBUG_INFO"
 echo "  Use Chunk: $USE_CHUNK"
@@ -380,6 +385,8 @@ if [[ "$ENABLE_ADAPTIVE_TRAINING" == "true" ]]; then
     CMD="$CMD --min_iterations_per_window $MIN_ITERATIONS_PER_WINDOW"
     CMD="$CMD --convergence_start_iter $CONVERGENCE_START_ITER"
     CMD="$CMD --convergence_loss_threshold $CONVERGENCE_LOSS_THRESHOLD"
+    CMD="$CMD --convergence_patience $CONVERGENCE_PATIENCE"
+    CMD="$CMD --convergence_check_interval $CONVERGENCE_CHECK_INTERVAL"
     CMD="$CMD --min_camera_count $MIN_CAMERA_COUNT"
     CMD="$CMD --max_patience_for_min_cam $MAX_PATIENCE_FOR_MIN_CAM"
     CMD="$CMD --max_camera_count $MAX_CAMERA_COUNT"

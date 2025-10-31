@@ -59,7 +59,7 @@ def calculate_balanced_smooth_score(candidate_idx, D_indices, positions, F, prev
     D_prime_indices = list(D_indices)
 
     # FIFO removal logic (matches line 2720-2732 in main loop)
-    if initial_window_indices is not None and len(D_prime_indices) >= window_size:
+    if initial_window_indices is not None and window_size is not None and len(D_prime_indices) >= window_size:
         # Check how many initial window cameras remain in D
         remaining_initial_in_D = [idx for idx in D_prime_indices if idx in initial_window_indices]
 
@@ -210,7 +210,7 @@ def calculate_balanced_smooth_score(candidate_idx, D_indices, positions, F, prev
     # Determine which cameras will remain after FIFO removal
     D_for_distance_indices = D_indices
 
-    if initial_window_indices is not None and len(D_indices) >= window_size:
+    if initial_window_indices is not None and window_size is not None and len(D_indices) >= window_size:
         # Check how many initial cameras remain in D
         remaining_initial_in_D = [idx for idx in D_indices if idx in initial_window_indices]
 
@@ -341,7 +341,18 @@ class ProgressiveTrainer:
         self.dataset_path = dataset_path
         self.densify_memory_limit_percentage = None  # Will be set from run_progressive.py
         self.exit_after_first_removal = False  # Will be set from run_progressive.py
-        
+
+        # Convergence detection parameters (default values)
+        self.convergence_loss_threshold = 1e-4
+        self.convergence_start_iter = 100
+        self.min_camera_count = 2
+        self.max_patience_for_min_cam = 50
+        self.max_camera_count = 30
+        self.min_patience_for_max_cam = 15
+
+        # Load convergence config if available
+        self._load_convergence_config()
+
         # Data containers
         self.cameras = {}
         self.images = {}
@@ -392,14 +403,25 @@ class ProgressiveTrainer:
         
         self.colmap_files_path = None
         for path in possible_paths:
-            if (path / "cameras.txt").exists() and (path / "images.txt").exists() and (path / "points3D.txt").exists():
+            # Check for cameras.txt and images.txt (required)
+            cameras_exists = (path / "cameras.txt").exists()
+            images_exists = (path / "images.txt").exists()
+
+            # Check for points3D in any format (bin, txt, or ply)
+            points3d_bin = (path / "points3D.bin").exists()
+            points3d_txt = (path / "points3D.txt").exists()
+            points3d_ply = (path / "points3D.ply").exists()
+            points3d_exists = points3d_bin or points3d_txt or points3d_ply
+
+            if cameras_exists and images_exists and points3d_exists:
                 self.colmap_files_path = path
-                print(f"Found COLMAP files in: {path}")
+                points3d_format = "bin" if points3d_bin else ("txt" if points3d_txt else "ply")
+                print(f"Found COLMAP files in: {path} (points3D format: {points3d_format})")
                 break
         
         #print(f'self.colmap_files_path : {self.colmap_files_path}');    exit(1)
         if self.colmap_files_path is None:
-            raise FileNotFoundError(f"Could not find COLMAP files (cameras.txt, images.txt, points3D.txt) in {self.colmap_path} or its sparse/ subdirectories")
+            raise FileNotFoundError(f"Could not find COLMAP files (cameras.txt, images.txt, points3D.[bin|txt|ply]) in {self.colmap_path} or its sparse/ subdirectories")
         
         # Find image directory by checking image names from images.txt
         print("Searching for image directory...")
@@ -1194,6 +1216,37 @@ class ProgressiveTrainer:
         if hasattr(self, 'enable_tile_distribution_stats') and self.enable_tile_distribution_stats:
             cmd.append("--enable_tile_distribution_stats")
 
+        # Add enable_adaptive_training flag if set
+        if hasattr(self, 'enable_adaptive_training') and self.enable_adaptive_training:
+            cmd.append("--enable_adaptive_training")
+
+        # Add convergence parameters if available
+        if hasattr(self, 'convergence_loss_threshold'):
+            cmd.extend(["--convergence_loss_threshold", str(self.convergence_loss_threshold)])
+            print(f"   [DEBUG] Adding convergence_loss_threshold: {self.convergence_loss_threshold}")
+
+        if hasattr(self, 'convergence_start_iter'):
+            cmd.extend(["--convergence_start_iter", str(self.convergence_start_iter)])
+            print(f"   [DEBUG] Adding convergence_start_iter: {self.convergence_start_iter}")
+
+        if hasattr(self, 'convergence_patience'):
+            cmd.extend(["--convergence_patience", str(self.convergence_patience)])
+
+        if hasattr(self, 'convergence_check_interval'):
+            cmd.extend(["--convergence_check_interval", str(self.convergence_check_interval)])
+
+        if hasattr(self, 'min_camera_count'):
+            cmd.extend(["--min_camera_count", str(self.min_camera_count)])
+
+        if hasattr(self, 'max_patience_for_min_cam'):
+            cmd.extend(["--max_patience_for_min_cam", str(self.max_patience_for_min_cam)])
+
+        if hasattr(self, 'max_camera_count'):
+            cmd.extend(["--max_camera_count", str(self.max_camera_count)])
+
+        if hasattr(self, 'min_patience_for_max_cam'):
+            cmd.extend(["--min_patience_for_max_cam", str(self.min_patience_for_max_cam)])
+
         # Force checkpoint save at final iteration for progressive training continuity
         final_iter = total_iterations if total_iterations else self.iterations
         cmd.extend(["--checkpoint_iterations", str(final_iter)])
@@ -1238,7 +1291,7 @@ class ProgressiveTrainer:
                 if prev_cameras:
                     cmd.extend(["--cams_prev", ",".join(map(str, prev_cameras))])
                 else:
-                    utils.print_rank_0("⚠️  Warning: No previous cameras found for progressive window")
+                    print("⚠️  Warning: No previous cameras found for progressive window")
 
                 # Add cameras to delete and add
                 if cam_id_2_delete is not None:
@@ -1261,7 +1314,7 @@ class ProgressiveTrainer:
                                   cwd=str(grendel_root),
                                   capture_output=not self.debug,
                                   text=True,
-                                  timeout=3600  # 1 hour timeout
+                                  timeout=3600000  # 1 hour timeout
                                   )
             
             if result.returncode == 0:
@@ -4271,6 +4324,62 @@ class ProgressiveTrainer:
         # For now, let's call the existing training method if it exists
         print("⚠️  Resume continuation logic needs to be fully implemented")
         print("   This would integrate with the existing training loop to continue from the specified window")
+
+    def _load_convergence_config(self):
+        """Load convergence parameters from convergence_config.txt if it exists"""
+        config_path = Path.cwd() / "convergence_config.txt"
+
+        if not config_path.exists():
+            print(f"[CONFIG DEBUG] No convergence config file found at {config_path}")
+            return
+
+        try:
+            # Store original values for debugging
+            original_values = {
+                'threshold': self.convergence_loss_threshold,
+                'start_iter': self.convergence_start_iter
+            }
+
+            print(f"[CONFIG DEBUG] Before reload: threshold={original_values['threshold']}, start_iter={original_values['start_iter']}")
+
+            # Read config file
+            with open(config_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+
+                        # Parse convergence parameters
+                        if key == 'CONVERGENCE_LOSS_THRESHOLD':
+                            self.convergence_loss_threshold = float(value)
+                        elif key == 'CONVERGENCE_START_ITER':
+                            self.convergence_start_iter = int(value)
+                        elif key == 'CONVERGENCE_PATIENCE':
+                            # Store for train_internal.py usage - always override
+                            self.convergence_patience = int(value)
+                        elif key == 'CONVERGENCE_CHECK_INTERVAL':
+                            # Store for train_internal.py usage - always override
+                            self.convergence_check_interval = int(value)
+                        elif key == 'MIN_CAMERA_COUNT':
+                            self.min_camera_count = int(value)
+                        elif key == 'MAX_PATIENCE_FOR_MIN_CAM':
+                            self.max_patience_for_min_cam = int(value)
+                        elif key == 'MAX_CAMERA_COUNT':
+                            self.max_camera_count = int(value)
+                        elif key == 'MIN_PATIENCE_FOR_MAX_CAM':
+                            self.min_patience_for_max_cam = int(value)
+
+            patience_info = f", patience={getattr(self, 'convergence_patience', 'default')}"
+            interval_info = f", interval={getattr(self, 'convergence_check_interval', 'default')}"
+            print(f"[CONFIG] Loaded from {config_path}: threshold={self.convergence_loss_threshold}{patience_info}{interval_info}, start_iter={self.convergence_start_iter}")
+
+        except Exception as e:
+            print(f"[CONFIG ERROR] Failed to load convergence config: {e}")
 
 
 # Example usage

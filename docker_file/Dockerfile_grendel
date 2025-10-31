@@ -38,8 +38,7 @@ RUN apt-get update && apt-get install -y \
     ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PuLP for DNQ optimization
-RUN pip install pulp
+# PuLP is now included in requirements.yml
 
 # Set the default shell to bash and activate Conda environment
 SHELL ["/bin/bash", "-c", "source activate Grendel && bash"]

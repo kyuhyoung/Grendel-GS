@@ -243,6 +243,10 @@ while [[ $# -gt 0 ]]; do
             USE_ALL_PROCESSED_CAMERAS=true
             shift
             ;;
+        --point_cloud_format)
+            POINT_CLOUD_FORMAT="$2"
+            shift 2
+            ;;
         --deterministic)
             DETERMINISTIC="--deterministic"
             shift
@@ -253,6 +257,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --exit-after-first-removal)
             EXIT_AFTER_FIRST_REMOVAL="--exit_after_first_removal"
+            shift
+            ;;
+        --skip-heavy-visualization)
+            SKIP_HEAVY_VISUALIZATION="--skip_heavy_visualization"
             shift
             ;;
         -h|--help)
@@ -488,6 +496,10 @@ if [[ -n "$FOOTPRINT_INTERSECTION_THRESHOLD" ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --footprint_intersection_threshold=$FOOTPRINT_INTERSECTION_THRESHOLD"
 fi
 
+if [[ -n "$POINT_CLOUD_FORMAT" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --point_cloud_format=$POINT_CLOUD_FORMAT"
+fi
+
 if [[ "$ENABLE_DIRECTION_FILTERING" == true ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --enable_direction_filtering"
 fi
@@ -522,6 +534,10 @@ fi
 
 if [[ -n "$EXIT_AFTER_FIRST_REMOVAL" ]]; then
     PYTHON_ARGS="$PYTHON_ARGS --exit_after_first_removal"
+fi
+
+if [[ -n "$SKIP_HEAVY_VISUALIZATION" ]]; then
+    PYTHON_ARGS="$PYTHON_ARGS --skip_heavy_visualization"
 fi
 
 # Add any extra arguments

@@ -126,9 +126,10 @@ class Scene:
 
             if has_colmap:  # This is the format from colmap.
                 track_by_projection = getattr(args, 'track_by_projection', False)
+                point_cloud_format = getattr(args, 'point_cloud_format', 'auto')
                 scene_info = sceneLoadTypeCallbacks["Colmap"](
                     args.source_path, args.images, args.eval, args.llffhold,
-                    args.dir_images, args.dir_sparse, track_by_projection
+                    args.dir_images, args.dir_sparse, track_by_projection, point_cloud_format
                 )
 
                 # Store all camera infos from COLMAP for progressive training (without loading images)
@@ -384,9 +385,10 @@ class Scene:
 
         if has_colmap:  # This is the format from colmap.
             track_by_projection = getattr(args, 'track_by_projection', False)
+            point_cloud_format = getattr(args, 'point_cloud_format', 'auto')
             scene_info = sceneLoadTypeCallbacks["Colmap"](
                 args.source_path, args.images, args.eval, args.llffhold,
-                args.dir_images, args.dir_sparse, track_by_projection
+                args.dir_images, args.dir_sparse, track_by_projection, point_cloud_format
             )
         elif "matrixcity" in args.source_path:  # This is for matrixcity
             scene_info = sceneLoadTypeCallbacks["City"](
