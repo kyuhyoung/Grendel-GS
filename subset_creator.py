@@ -173,11 +173,40 @@ class FootprintCalculator:
                 except Exception as e:
                     logger.warning(f"Failed to load points3D.txt: {e}")
             
+            # 3. PLY 파일 시도 (scene/dataset_readers.py와 동일한 순서)
+            if not points_loaded:
+                ply_files = list(sparse_dir.glob("*.ply"))
+                if ply_files:
+                    try:
+                        ply_path = ply_files[0]  # 첫 번째 PLY 파일 사용
+                        # fetchPly 함수를 직접 구현 (scene.dataset_readers에서 복사)
+                        from plyfile import PlyData, PlyElement
+                        
+                        plydata = PlyData.read(ply_path)
+                        vertices = plydata["vertex"]
+                        positions = np.vstack([vertices["x"], vertices["y"], vertices["z"]]).T
+                        try:
+                            colors = np.vstack([vertices["red"], vertices["green"], vertices["blue"]]).T
+                        except:
+                            colors = np.random.rand(positions.shape[0], 3) * 255
+                        
+                        # points3d_data 형식으로 변환
+                        points3d_data = {
+                            'xyzs': positions,
+                            'rgbs': colors,
+                            'errors': np.zeros((len(positions), 1)),
+                            'tracks': [set() for _ in range(len(positions))]  # PLY에는 track 정보 없음
+                        }
+                        points_loaded = True
+                        logger.info(f"Loaded {ply_path.name}: {len(positions)} points")
+                    except Exception as e:
+                        logger.warning(f"Failed to load PLY file {ply_files[0]}: {e}")
+            
             if not points_loaded:
                 # points3D가 없으면 에러
                 raise FileNotFoundError(
                     f"ERROR: No points3D file found in {sparse_dir}\n"
-                    f"Expected: points3D.txt or points3D.bin\n"
+                    f"Expected: points3D.bin, points3D.txt, or *.ply\n"
                     f"DTM-based footprint calculation requires 3D points from COLMAP reconstruction."
                 )
             
