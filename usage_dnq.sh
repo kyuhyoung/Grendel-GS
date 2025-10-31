@@ -33,6 +33,8 @@ THRESHOLD_D=0.7       # Minimum ratio between min(C) and max(C)
 DEBUG=false
 DRY_RUN=false
 MERGE_ONLY=false
+#VISUALIZE_FOOTPRINTS=false  # Enable footprint union visualization
+VISUALIZE_FOOTPRINTS=true  # Enable footprint union visualization
 
 # Grendel-GS parameters (inherit from usage_progressive.sh defaults)
 ITERATIONS=30000
@@ -68,6 +70,7 @@ function print_usage() {
     echo "  --debug                     Enable debug mode"
     echo "  --dry_run                   Only show subset division, don't run training"
     echo "  --merge_only                Only merge existing PLY files, skip training"
+    echo "  --visualize_footprints      Enable footprint union visualization"
     echo "  -h, --help                  Show this help message"
     echo ""
     echo "Example:"
@@ -141,6 +144,10 @@ while [[ $# -gt 0 ]]; do
             MERGE_ONLY=true
             shift
             ;;
+        --visualize_footprints)
+            VISUALIZE_FOOTPRINTS=true
+            shift
+            ;;
         *)
             # Unknown argument, add to EXTRA_ARGS
             EXTRA_ARGS="$EXTRA_ARGS $1"
@@ -184,6 +191,7 @@ if [[ "$MERGE_ONLY" != "true" ]]; then
     echo "  Backend: $BACKEND"
     echo "  Debug: $DEBUG"
     echo "  Dry Run: $DRY_RUN"
+    echo "  Visualize Footprints: $VISUALIZE_FOOTPRINTS"
 else
     log_info "Merge-only mode enabled"
     echo "  Output Path: $OUTPUT_PATH"
@@ -215,6 +223,10 @@ function create_subsets() {
     
     if [[ "$DEBUG" == "true" ]]; then
         cmd="$cmd --debug"
+    fi
+    
+    if [[ "$VISUALIZE_FOOTPRINTS" == "true" ]]; then
+        cmd="$cmd --visualize_footprints"
     fi
     
     log_info "Running DNQ command: $cmd"

@@ -60,6 +60,7 @@ class DNQRunner:
                 output_path=self.output_path,
                 pixel_threshold_a=self.args.pixel_threshold_a,
                 min_max_ratio_d=self.args.min_max_ratio_d,
+                visualize_footprints=self.args.visualize_footprints
                 #max_subsets=self.args.max_subsets
             )
             
@@ -416,6 +417,8 @@ def main():
                        help='Enable deterministic training')
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug output')
+    parser.add_argument('--visualize_footprints', action='store_true',
+                       help='Enable footprint union visualization')
     parser.add_argument('--white_background', action='store_true',
                        help='Use white background')
     parser.add_argument('--convert_SHs_python', action='store_true',

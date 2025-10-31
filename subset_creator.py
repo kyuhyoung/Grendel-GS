@@ -533,9 +533,8 @@ class SubsetCreator:
             
             # Fallback to simple method if DTM failed or not available
             if footprint is None:
-                footprint = FootprintCalculator.calculate_footprint(camera, image)
-                logger.debug(f"Using fallback footprint for image {img_id}")
-            
+                print(f'Footprint is NOT created for image {img_id}');  exit(1)
+                
             self.image_footprints[img_id] = footprint
             
         logger.info(f"Calculated {len(self.image_footprints)} footprints")
@@ -581,7 +580,7 @@ class SubsetCreator:
             'union_polygon': union_polygon
         }
     
-    def two_stage_subset_creation(self, target_a: int) -> List[List[int]]:
+    def two_stage_subset_creation(self, target_a: int, visualize_footprints: bool = False, output_path: Path = None) -> List[List[int]]:
         """
         Two-Stage 서브셋 생성:
         Stage 1: ILP로 픽셀 합 기반 초기 할당
@@ -594,7 +593,7 @@ class SubsetCreator:
         stage1_subsets = self.stage1_ilp_approximation(target_a)
         
         # Stage 2: 실제 union으로 최적화
-        final_subsets = self.stage2_union_optimization(stage1_subsets, target_a)
+        final_subsets = self.stage2_union_optimization(stage1_subsets, target_a, visualize_footprints=visualize_footprints, output_path=output_path)
         
         return final_subsets
     
@@ -714,7 +713,7 @@ class SubsetCreator:
         logger.info(f"Stage 1 완료: {len(subsets)}개 서브셋 생성")
         return subsets
     
-    def stage2_union_optimization(self, initial_subsets: List[List[int]], target_a: int, max_iterations: int = 100) -> List[List[int]]:
+    def stage2_union_optimization(self, initial_subsets: List[List[int]], target_a: int, max_iterations: int = 100, visualize_footprints: bool = False, output_path: Path = None) -> List[List[int]]:
         """
         Stage 2: 실제 footprint union 계산으로 local optimization
         """
@@ -724,8 +723,8 @@ class SubsetCreator:
         best_score = float('inf')
         best_subsets = [subset[:] for subset in current_subsets]
         
-        # 초기 점수 계산
-        current_score = self.calculate_union_based_score(current_subsets, target_a)
+        # 초기 점수 계산 (시각화 플래그에 따라)
+        current_score = self.calculate_union_based_score(current_subsets, target_a, visualize_unions=visualize_footprints, output_path=str(output_path) if output_path else "./output/dnq_debug")
         best_score = current_score
         
         logger.info(f"초기 점수: {current_score:.0f}")
@@ -771,20 +770,31 @@ class SubsetCreator:
         logger.info(f"Stage 2 완료: 최종 점수 {best_score:.0f} ({iteration+1}번 반복)")
         return best_subsets
     
-    def calculate_union_based_score(self, subsets: List[List[int]], target_a: int) -> float:
+    def calculate_union_based_score(self, subsets: List[List[int]], target_a: int, visualize_unions=False, output_path=None) -> float:
         """
         실제 footprint union을 기반으로 한 점수 계산
         """
         if not subsets or any(len(subset) < 2 for subset in subsets):
             return float('inf')  # 무효한 해
         
+        from pathlib import Path
+        
         pixel_counts = []
         aspect_penalties = 0
         deviation_from_a = 0
         
-        for subset in subsets:
-            # 실제 union 계산
-            union_polygon = self.calculate_real_footprint_union(subset)
+        for i, subset in enumerate(subsets):
+            # 실제 union 계산 (시각화 옵션 추가)
+            viz_path = None
+            if visualize_unions and output_path:
+                viz_path = Path(output_path) / f"footprint_union_subset_{i:03d}.png"
+            
+            union_polygon = self.calculate_real_footprint_union(
+                subset, 
+                visualize=visualize_unions, 
+                viz_path=viz_path, 
+                subset_name=f"Subset_{i}"
+            )
             if union_polygon is None or union_polygon.is_empty:
                 return float('inf')
             
@@ -814,7 +824,7 @@ class SubsetCreator:
         
         return total_score
     
-    def calculate_real_footprint_union(self, image_list: List[int]):
+    def calculate_real_footprint_union(self, image_list: List[int], visualize=False, viz_path=None, subset_name="subset"):
         """실제 footprint들의 union 계산"""
         if not image_list:
             return None
@@ -830,7 +840,82 @@ class SubsetCreator:
         
         from shapely.ops import unary_union
         union_polygon = unary_union(polygons)
+        print(f'visualize : {visualize}');  exit(1) 
+        # 시각화 옵션
+        if visualize and viz_path:
+            self._visualize_footprint_union(polygons, union_polygon, image_list, viz_path, subset_name)
+        
         return union_polygon
+    
+    def _visualize_footprint_union(self, polygons, union_polygon, image_list, viz_path, subset_name):
+        """Footprint union 시각화"""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as patches
+            import numpy as np
+            from pathlib import Path
+            
+            fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+            
+            # 개별 footprint들을 반투명하게 표시
+            colors = plt.cm.Set3(np.linspace(0, 1, len(polygons)))
+            
+            all_bounds = []
+            for i, (polygon, img_id) in enumerate(zip(polygons, image_list)):
+                if hasattr(polygon, 'exterior'):
+                    coords = list(polygon.exterior.coords)
+                    polygon_patch = patches.Polygon(coords, alpha=0.3, 
+                                                  facecolor=colors[i], 
+                                                  edgecolor='black', 
+                                                  linewidth=0.5,
+                                                  label=f'Image {img_id}')
+                    ax.add_patch(polygon_patch)
+                    
+                    # 범위 계산
+                    bounds = polygon.bounds
+                    all_bounds.extend([bounds[0], bounds[2]])  # x 좌표들
+                    all_bounds.extend([bounds[1], bounds[3]])  # y 좌표들
+            
+            # Union polygon을 굵은 선으로 표시
+            if hasattr(union_polygon, 'exterior'):
+                coords = list(union_polygon.exterior.coords)
+                union_patch = patches.Polygon(coords, alpha=0.0, 
+                                            facecolor='none', 
+                                            edgecolor='red', 
+                                            linewidth=3,
+                                            label=f'Union ({subset_name})')
+                ax.add_patch(union_patch)
+                
+                # Union 범위도 포함
+                bounds = union_polygon.bounds
+                all_bounds.extend([bounds[0], bounds[2]])
+                all_bounds.extend([bounds[1], bounds[3]])
+            
+            # 축 설정
+            if all_bounds:
+                margin = max(max(all_bounds[::2]) - min(all_bounds[::2]), 
+                           max(all_bounds[1::2]) - min(all_bounds[1::2])) * 0.1
+                ax.set_xlim(min(all_bounds[::2]) - margin, max(all_bounds[::2]) + margin)
+                ax.set_ylim(min(all_bounds[1::2]) - margin, max(all_bounds[1::2]) + margin)
+            
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3)
+            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            ax.set_title(f'Footprint Union Visualization - {subset_name}\\n'
+                        f'{len(image_list)} images, Union area: {union_polygon.area:.2f} m²')
+            ax.set_xlabel('X coordinate (m)')
+            ax.set_ylabel('Y coordinate (m)')
+            
+            # 저장
+            viz_path = Path(viz_path)
+            viz_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(viz_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"Footprint union visualization saved: {viz_path}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to create footprint union visualization: {e}")
     
     def estimate_union_pixels(self, union_polygon, image_list: List[int]) -> int:
         """Union 다각형의 픽셀 수 추정"""
@@ -1204,7 +1289,8 @@ class SubsetCreator:
 
 
 def create_subsets_with_footprints(source_path: Path, output_path: Path, 
-                                  pixel_threshold_a: int, min_max_ratio_d: float) -> List[List[int]]:
+                                  pixel_threshold_a: int, min_max_ratio_d: float, 
+                                  visualize_footprints: bool = False) -> List[List[int]]:
     """Main function to create subsets with footprint constraints"""
     
     logger.info("Starting subset creation with footprint constraints")
@@ -1218,7 +1304,7 @@ def create_subsets_with_footprints(source_path: Path, output_path: Path,
     print('222') 
     
     # Create subsets using Two-Stage approach
-    subsets = creator.two_stage_subset_creation(pixel_threshold_a)
+    subsets = creator.two_stage_subset_creation(pixel_threshold_a, visualize_footprints=visualize_footprints, output_path=output_path)
     print('333') 
     # Validate subsets
     valid = creator.validate_subsets(subsets, pixel_threshold_a, min_max_ratio_d)
