@@ -651,129 +651,6 @@ function train_subset() {
     fi
 }
 
-# Function to generate DNQ orthographic visualization
-function generate_dnq_visualization() {
-    local source_path="$1"
-    local output_path="$2"
-    
-    log_info "Creating DNQ visualization script..."
-    
-    # Create timestamp for filename
-    local timestamp=$(date +"%Y%m%d_%H%M%S")
-    
-    # Create Python script for DNQ visualization
-    cat > "${output_path}/generate_dnq_visualization.py" << 'EOF'
-#!/usr/bin/env python3
-"""
-Generate DNQ orthographic visualization using DTM
-Based on progressive_trainer.py visualization code
-"""
-
-import os
-import sys
-import json
-import argparse
-from pathlib import Path
-
-def main():
-    parser = argparse.ArgumentParser(description='Generate DNQ orthographic visualization')
-    parser.add_argument('--source_path', required=True, help='Path to COLMAP reconstruction')
-    parser.add_argument('--output_path', required=True, help='Output directory')
-    parser.add_argument('--timestamp', required=True, help='Timestamp for filename')
-    
-    args = parser.parse_args()
-    
-    source_path = Path(args.source_path)
-    output_path = Path(args.output_path)
-    timestamp = args.timestamp
-    
-    try:
-        # Import DTM module from progressive learning
-        sys.path.append(str(Path(__file__).parent / "progressive_learning"))
-        from progressive_trainer import ProgressiveTrainer
-        
-        print("Loading COLMAP data and creating DTM...")
-        
-        # Create a minimal ProgressiveTrainer instance for DTM functionality
-        # We only need the DTM visualization capabilities
-        trainer = ProgressiveTrainer(
-            source_path=str(source_path),
-            output_path=str(output_path / "temp_progressive"),
-            initial_cameras=2,
-            camera_removal_margin=0.5,
-            iterations=100,  # Minimal iterations since we're not training
-            iterations_per_window=100,
-            densification_interval=100,
-            densify_from_iter=100,
-            densify_memory_limit_percentage=0.3,
-            max_window_size=None,
-            sh_degree=3,
-            backend="gsplat",
-            deterministic=False,
-            debug=True
-        )
-        
-        # Initialize DTM module
-        print("Initializing DTM module...")
-        trainer._initialize_dtm_module()
-        
-        # Generate visualization paths
-        scene_path = output_path / f"dnq_3d_scene_{timestamp}.png"
-        ortho_path = output_path / f"dnq_ortho_view_{timestamp}.png"
-        
-        print(f"Generating 3D scene visualization: {scene_path}")
-        scene_center = trainer.dtm_module.visualize_3d_scene(save_path=str(scene_path))
-        
-        print(f"Generating orthographic view: {ortho_path}")
-        trainer.dtm_module.render_orthographic_view(scene_center, save_path=str(ortho_path))
-        
-        print("DNQ visualizations generated successfully!")
-        print(f"  - 3D scene: {scene_path}")
-        print(f"  - Orthographic view: {ortho_path}")
-        
-        # Load and display subset information if available
-        subsets_file = output_path / "subsets.json"
-        if subsets_file.exists():
-            with open(subsets_file, 'r') as f:
-                subsets_data = json.load(f)
-            
-            print(f"\nDNQ Subset Summary:")
-            print(f"  Total images: {subsets_data['metadata']['total_images']}")
-            print(f"  Number of subsets: {subsets_data['metadata']['num_subsets']}")
-            print(f"  Pixel threshold: {subsets_data['metadata']['pixel_threshold_a']:,}")
-            print(f"  Min ratio threshold: {subsets_data['metadata']['min_max_ratio_d']}")
-            
-            for i, subset in enumerate(subsets_data['subsets']):
-                print(f"  Subset {i+1}: {len(subset)} images")
-        
-        return 0
-        
-    except Exception as e:
-        print(f"Error generating DNQ visualization: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-
-if __name__ == "__main__":
-    sys.exit(main())
-EOF
-
-    chmod +x "${output_path}/generate_dnq_visualization.py"
-    
-    # Run DNQ visualization generation
-    log_info "Running DNQ visualization generation..."
-    
-    if python3 "${output_path}/generate_dnq_visualization.py" \
-        --source_path "$source_path" \
-        --output_path "$output_path" \
-        --timestamp "$timestamp"; then
-        log_success "DNQ visualization completed successfully"
-        return 0
-    else
-        log_error "DNQ visualization generation failed"
-        return 1
-    fi
-}
 
 # Function to merge all subset PLY files
 function merge_subsets() {
@@ -912,13 +789,7 @@ function main() {
         echo "=== End DNQ Runner Log ===" >> "$LOG_FILE"
     fi
 
-    # Generate DNQ orthographic visualization
-    log_info "Generating DNQ orthographic visualization..."
-    if generate_dnq_visualization "$SOURCE_PATH" "$OUTPUT_PATH"; then
-        log_success "DNQ orthographic visualization generated successfully"
-    else
-        log_warning "DNQ orthographic visualization generation failed"
-    fi
+    # DNQ orthographic visualization is generated automatically during DTM creation
 
     log_success "Divide and Conquer 3DGS completed successfully!"
     log_info "Check ${OUTPUT_PATH}/final_merged.ply for results"

@@ -226,9 +226,47 @@ class FootprintCalculator:
             logger.info("Creating DTM with 2m resolution...")
             self.visualizer.create_dtm(resolution=2.0)
             logger.info("DTM created successfully")
+            
+            # DTM 생성 직후 orthographic view 생성
+            self._generate_dtm_visualization(colmap_path)
         else:
             self.visualizer = None
             logger.warning("Could not find COLMAP sparse directory, DTM-based footprints disabled")
+    
+    def _generate_dtm_visualization(self, colmap_path):
+        """DTM 생성 직후 orthographic view 시각화 생성"""
+        try:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # 출력 디렉토리 설정 (colmap_path 기준)
+            if hasattr(self, 'output_path') and self.output_path:
+                output_dir = Path(self.output_path)
+            else:
+                output_dir = Path("./output/dnq_debug")  # 기본 출력 디렉토리
+            
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 시각화 파일 경로
+            scene_path = output_dir / f"dnq_3d_scene_{timestamp}.png"
+            ortho_path = output_dir / f"dnq_ortho_view_{timestamp}.png"
+            
+            logger.info(f"Generating DTM visualizations...")
+            logger.info(f"  3D scene: {scene_path}")
+            logger.info(f"  Orthographic view: {ortho_path}")
+            
+            # 3D scene 시각화
+            scene_center = self.visualizer.visualize_3d_scene(save_path=str(scene_path))
+            
+            # Orthographic view 시각화
+            self.visualizer.render_orthographic_view(scene_center, save_path=str(ortho_path))
+            
+            logger.info("DTM visualizations generated successfully!")
+            
+        except Exception as e:
+            logger.warning(f"Failed to generate DTM visualization: {e}")
+            import traceback
+            logger.debug(f"Visualization error traceback: {traceback.format_exc()}")
     
     @staticmethod
     def load_colmap_data(colmap_path: Path) -> Tuple[Dict, Dict]:
