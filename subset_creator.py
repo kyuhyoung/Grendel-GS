@@ -224,7 +224,7 @@ class FootprintCalculator:
                 
             # DTM 생성
             logger.info("Creating DTM with 2m resolution...")
-            self.visualizer.create_dtm(resolution=2.0)
+            self.visualizer.create_dtm(resolution=2.0)  #   몇 미터를 하던 수행시간은 같음.
             logger.info("DTM created successfully")
             
             # DTM 생성 직후 orthographic view 생성
@@ -249,17 +249,17 @@ class FootprintCalculator:
             
             # 시각화 파일 경로
             scene_path = output_dir / f"dnq_3d_scene_{timestamp}.png"
-            ortho_path = output_dir / f"dnq_ortho_view_{timestamp}.png"
+            #ortho_path = output_dir / f"dnq_ortho_view_{timestamp}.png"
             
             logger.info(f"Generating DTM visualizations...")
             logger.info(f"  3D scene: {scene_path}")
-            logger.info(f"  Orthographic view: {ortho_path}")
+            #logger.info(f"  Orthographic view: {ortho_path}")
             
             # 3D scene 시각화
             scene_center = self.visualizer.visualize_3d_scene(save_path=str(scene_path))
             
             # Orthographic view 시각화
-            self.visualizer.render_orthographic_view(scene_center, save_path=str(ortho_path))
+            #self.visualizer.render_orthographic_view(scene_center, save_path=str(ortho_path))
             
             logger.info("DTM visualizations generated successfully!")
             

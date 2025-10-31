@@ -162,7 +162,11 @@ if [[ "$MERGE_ONLY" != "true" ]]; then
     fi
 fi
 
-# Create output directory
+# Create output directory (remove existing first)
+if [[ -d "$OUTPUT_PATH" ]]; then
+    log_info "Removing existing output directory: $OUTPUT_PATH"
+    rm -rf "$OUTPUT_PATH"
+fi
 mkdir -p "$OUTPUT_PATH"
 
 echo -e "${CYAN}======================================${NC}"
