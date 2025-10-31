@@ -18,14 +18,104 @@ from typing import List, Dict, Tuple, Set, Optional
 from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 import json
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.cm as cm
+import random
+import sys
+sys.path.insert(0, '/workspace/Grendel-GS')
+sys.path.insert(0, '/workspace/Grendel-GS/scripts/experiments')
+
+# Import COLMAPVisualizer for DTM-based footprint calculation
+from scripts.experiments.colmap_visualizer import COLMAPVisualizer
+
+# Import points3D loading functions from scene
+from scene.colmap_loader import read_points3D_binary, read_points3D_text
+from scene.dataset_readers import fetchPly
 
 # PuLP import - required dependency
-from pulp import *
+from pulp import LpVariable, LpProblem, LpMinimize, LpStatus, LpStatusOptimal, lpSum, PULP_CBC_CMD
 
 logger = logging.getLogger(__name__)
 
 class FootprintCalculator:
-    """Calculate camera footprints from COLMAP data"""
+    """Calculate camera footprints from COLMAP data using DTM"""
+    
+    def __init__(self, colmap_path: Path):
+        """Initialize with COLMAPVisualizer for DTM-based footprint calculation"""
+        self.colmap_path = colmap_path
+        sparse_dir = None
+        for sdir in [colmap_path, colmap_path / "sparse", colmap_path / "sparse" / "0"]:
+            if sdir.exists() and (sdir / "cameras.txt").exists():
+                sparse_dir = sdir
+                break
+        
+        if sparse_dir:
+            logger.info(f"Initializing COLMAPVisualizer with DTM for: {sparse_dir}")
+            self.visualizer = COLMAPVisualizer(str(sparse_dir))
+            # Load COLMAP data
+            self.visualizer.read_cameras_txt()
+            self.visualizer.read_images_txt()
+            
+            # points3D 파일을 반드시 로드해야 함 (bin -> txt -> ply 순서로 시도)
+            points_loaded = False
+            points3d_data = None
+            
+            # 1. Binary 파일 시도
+            if (sparse_dir / "points3D.bin").exists():
+                try:
+                    points3d_data = read_points3D_binary(sparse_dir / "points3D.bin")
+                    points_loaded = True
+                    logger.info(f"Loaded points3D.bin: {len(points3d_data)} points")
+                except Exception as e:
+                    logger.warning(f"Failed to load points3D.bin: {e}")
+            
+            # 2. Text 파일 시도
+            if not points_loaded and (sparse_dir / "points3D.txt").exists():
+                try:
+                    points3d_data = read_points3D_text(sparse_dir / "points3D.txt")
+                    points_loaded = True
+                    logger.info(f"Loaded points3D.txt: {len(points3d_data)} points")
+                except Exception as e:
+                    logger.warning(f"Failed to load points3D.txt: {e}")
+            
+            # 3. PLY 파일 시도
+            if not points_loaded:
+                ply_files = list(sparse_dir.glob("*.ply"))
+                if ply_files:
+                    try:
+                        # fetchPly 함수 사용
+                        ply_path = ply_files[0]
+                        points3d_data = fetchPly(ply_path)
+                        # fetchPly는 point cloud object를 반환하므로 처리 필요
+                        points_loaded = True
+                        logger.info(f"Loaded {ply_path.name}: PLY point cloud")
+                    except Exception as e:
+                        logger.warning(f"Failed to load PLY file {ply_files[0]}: {e}")
+            
+            if not points_loaded:
+                # points3D가 없으면 에러
+                raise FileNotFoundError(
+                    f"ERROR: No points3D file found in {sparse_dir}\n"
+                    f"Expected: points3D.txt, points3D.bin, or *.ply\n"
+                    f"DTM-based footprint calculation requires 3D points from COLMAP reconstruction."
+                )
+            
+            # COLMAPVisualizer에 points3D 데이터 설정
+            if isinstance(points3d_data, dict):
+                # Binary/text 파일에서 온 dict 형태 데이터
+                self.visualizer.points3d = points3d_data
+            else:
+                # PLY에서 온 point cloud 데이터는 별도 처리 필요
+                self.visualizer.points3d = points3d_data
+                
+            # DTM 생성
+            logger.info("Creating DTM with 2m resolution...")
+            self.visualizer.create_dtm(resolution=2.0)
+            logger.info("DTM created successfully")
+        else:
+            self.visualizer = None
+            logger.warning("Could not find COLMAP sparse directory, DTM-based footprints disabled")
     
     @staticmethod
     def load_colmap_data(colmap_path: Path) -> Tuple[Dict, Dict]:
@@ -131,9 +221,51 @@ class FootprintCalculator:
             [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
         ])
     
+    def calculate_footprint_dtm(self, camera: Dict, image: Dict) -> Optional[Polygon]:
+        """Calculate camera footprint using DTM"""
+        if not self.visualizer:
+            return None
+            
+        try:
+            # Get camera center and rotation
+            quat = image['quat']
+            trans = np.array(image['trans'])
+            R = FootprintCalculator.quaternion_to_rotation_matrix(quat)
+            camera_center = -R.T @ trans
+            
+            # Get camera intrinsics
+            camera_intrinsics = {
+                'fx': camera['params'][0] if len(camera['params']) >= 1 else camera['width'],
+                'fy': camera['params'][1] if len(camera['params']) >= 2 else camera['params'][0],
+                'cx': camera['params'][2] if len(camera['params']) >= 3 else camera['width'] / 2,
+                'cy': camera['params'][3] if len(camera['params']) >= 4 else camera['height'] / 2,
+                'width': camera['width'],
+                'height': camera['height']
+            }
+            
+            # Use visualizer's compute_camera_footprint with DTM
+            footprint_data = self.visualizer.compute_camera_footprint(
+                camera_center=camera_center,
+                camera_rotation=R,
+                camera_intrinsics=camera_intrinsics,
+                points_3d=None,  # Use all points
+                point_ids=None   # Use all points
+            )
+            
+            if footprint_data and 'footprint_polygon' in footprint_data:
+                # Convert to Shapely Polygon
+                vertices = footprint_data['footprint_polygon']
+                if len(vertices) >= 3:
+                    return Polygon([(v[0], v[1]) for v in vertices])
+                    
+        except Exception as e:
+            logger.warning(f"Failed to calculate DTM footprint: {e}")
+            
+        return None
+    
     @staticmethod
     def calculate_footprint(camera: Dict, image: Dict, ground_height: float = 0.0) -> Polygon:
-        """Calculate camera footprint polygon"""
+        """Calculate camera footprint polygon (fallback method without DTM)"""
         
         # Camera intrinsics
         width = camera['width']
@@ -228,16 +360,31 @@ class FootprintCalculator:
 class SubsetCreator:
     """Create image subsets based on footprint constraints"""
     
-    def __init__(self, cameras: Dict, images: Dict):
+    def __init__(self, cameras: Dict, images: Dict, colmap_path: Path = None):
         self.cameras = cameras
         self.images = images
         self.image_footprints = {}
+        
+        # Initialize FootprintCalculator with DTM if path provided
+        self.footprint_calc = FootprintCalculator(colmap_path) if colmap_path else None
         
         # Calculate footprints for all images
         logger.info("Calculating footprints for all images...")
         for img_id, image in images.items():
             camera = cameras[image['camera_id']]
-            footprint = FootprintCalculator.calculate_footprint(camera, image)
+            
+            # Try DTM-based footprint first if available
+            footprint = None
+            if self.footprint_calc and self.footprint_calc.visualizer:
+                footprint = self.footprint_calc.calculate_footprint_dtm(camera, image)
+                if footprint:
+                    logger.debug(f"Using DTM footprint for image {img_id}")
+            
+            # Fallback to simple method if DTM failed or not available
+            if footprint is None:
+                footprint = FootprintCalculator.calculate_footprint(camera, image)
+                logger.debug(f"Using fallback footprint for image {img_id}")
+            
             self.image_footprints[img_id] = footprint
             
         logger.info(f"Calculated {len(self.image_footprints)} footprints")
@@ -283,35 +430,40 @@ class SubsetCreator:
             'union_polygon': union_polygon
         }
     
-    def two_stage_subset_creation(self, target_a: int, max_subsets: int) -> List[List[int]]:
+    def two_stage_subset_creation(self, target_a: int) -> List[List[int]]:
         """
         Two-Stage 서브셋 생성:
         Stage 1: ILP로 픽셀 합 기반 초기 할당
         Stage 2: 실제 union 계산으로 local optimization
         """
         logger.info("Starting Two-Stage subset creation...")
-        logger.info(f"Target A: {target_a:,}, Max subsets: {max_subsets}")
+        logger.info(f"Target A: {target_a:,}")
         
         # Stage 1: ILP 기반 초기 할당
-        stage1_subsets = self.stage1_ilp_approximation(target_a, max_subsets)
+        stage1_subsets = self.stage1_ilp_approximation(target_a)
         
         # Stage 2: 실제 union으로 최적화
         final_subsets = self.stage2_union_optimization(stage1_subsets, target_a)
         
         return final_subsets
     
-    def stage1_ilp_approximation(self, target_a: int, max_subsets: int) -> List[List[int]]:
+    def stage1_ilp_approximation(self, target_a: int) -> List[List[int]]:
         """
         Stage 1: ILP를 사용한 초기 서브셋 할당 (픽셀 합 근사)
         """
             
         logger.info("Stage 1: ILP 기반 초기 할당 시작...")
+        print(f"DEBUG: Stage 1 시작 - target_a: {target_a:,}")
         
         image_ids = list(self.images.keys())
         N = len(image_ids)
-        K = min(max_subsets, max(1, N // 2))  # 최대 subset 수 결정
+        # 각 subset은 최소 2개 이미지를 가져야 하므로 이론적 최대는 N//2
+        # 실용적으로는 더 적은 수가 효율적 (ILP 해결 시간 단축)
+        #K = max(2, min(N // 2, 8))  # 최소 2개, 최대 8개로 제한
+        K = N // 2  # 최소 2개, 최대 8개로 제한
         
         logger.info(f"Images: {N}, Max subsets: {K}")
+        print(f"DEBUG: 이미지 총 개수: {N}, 계산된 최대 subset 수: {K}")
         
         # 변수 정의
         x = {}  # x[i,j] = 1 if image i assigned to subset j
@@ -374,15 +526,26 @@ class SubsetCreator:
         
         # 문제 해결
         logger.info("ILP 문제 해결 중...")
-        prob.solve(PULP_CBC_CMD(msg=0))
+        print(f"DEBUG: ILP 문제 해결 시작 - 변수 수: {len(x) + len(y)}")
+        print(f"DEBUG: 제약조건 수: {len(prob.constraints)}")
+        print(f"DEBUG: K={K}, N={N}")
         
+        # 타임아웃 설정하여 해결 시도
+        solver = PULP_CBC_CMD(msg=1, timeLimit=60)  # 60초 타임아웃, 메시지 출력
+        print("DEBUG: CBC solver 시작 (60초 타임아웃)...")
+        prob.solve(solver)
+        
+        print(f"DEBUG: ILP 해결 완료 - 상태: {LpStatus[prob.status]}")
         if prob.status != LpStatusOptimal:
             logger.warning(f"ILP 최적해를 찾지 못함: {LpStatus[prob.status]}")
+            print(f"DEBUG: ILP 실패, fallback 방법 사용")
             # Fallback to greedy method
-            return self.greedy_subset_creation_fallback(target_a, max_subsets)
+            exit(1)
+            #return self.greedy_subset_creation_fallback(target_a, max_subsets)
         
         # 결과 추출
         subsets = []
+        print(f"DEBUG: 결과 추출 시작")
         for j in range(K):
             if y[j].value() > 0.5:
                 subset = []
@@ -391,6 +554,11 @@ class SubsetCreator:
                         subset.append(image_ids[i])
                 if subset:
                     subsets.append(subset)
+                    print(f"DEBUG: Subset {j}: {len(subset)}개 이미지 할당")
+        
+        print(f"DEBUG: Stage 1 완료 - 총 {len(subsets)}개 subset 생성")
+        for i, subset in enumerate(subsets):
+            print(f"DEBUG: Subset {i}: 이미지 {len(subset)}개 - {subset[:5]}{'...' if len(subset) > 5 else ''}")
         
         logger.info(f"Stage 1 완료: {len(subsets)}개 서브셋 생성")
         return subsets
@@ -813,25 +981,100 @@ class SubsetCreator:
         
         return valid
 
+    def visualize_subsets(self, subsets: List[List[int]], output_path: Path):
+        """각 subset의 footprint를 색상별로 시각화"""
+        print("DEBUG: subset 시각화 시작...")
+        
+        fig, ax = plt.subplots(1, 1, figsize=(15, 10))
+        
+        # 색상 생성 (subset별로 다른 색상)
+        colors = plt.cm.Set3(np.linspace(0, 1, len(subsets)))
+        
+        # 전체 footprint 범위 계산
+        all_bounds = []
+        for img_id in self.images.keys():
+            if img_id in self.image_footprints:
+                bounds = self.image_footprints[img_id].bounds
+                all_bounds.extend([bounds[0], bounds[2]])  # x좌표들
+                all_bounds.extend([bounds[1], bounds[3]])  # y좌표들
+        
+        if not all_bounds:
+            print("ERROR: footprint 데이터가 없습니다")
+            return
+            
+        # 각 subset별로 시각화
+        for subset_idx, subset in enumerate(subsets):
+            color = colors[subset_idx]
+            print(f"DEBUG: Subset {subset_idx} 시각화 중 - {len(subset)}개 이미지")
+            
+            # 개별 이미지 footprint 그리기
+            for img_id in subset:
+                if img_id in self.image_footprints:
+                    footprint = self.image_footprints[img_id]
+                    
+                    # Polygon을 matplotlib patch로 변환
+                    if hasattr(footprint, 'exterior'):
+                        coords = list(footprint.exterior.coords)
+                        polygon_patch = patches.Polygon(coords, alpha=0.3, 
+                                                      facecolor=color, 
+                                                      edgecolor='black', 
+                                                      linewidth=0.5)
+                        ax.add_patch(polygon_patch)
+            
+            # Subset union footprint 계산 및 표시
+            subset_footprints = [self.image_footprints[img_id] for img_id in subset 
+                               if img_id in self.image_footprints]
+            if subset_footprints:
+                union_footprint = unary_union(subset_footprints)
+                if hasattr(union_footprint, 'exterior'):
+                    coords = list(union_footprint.exterior.coords)
+                    union_patch = patches.Polygon(coords, alpha=0.8, 
+                                                facecolor='none', 
+                                                edgecolor=color, 
+                                                linewidth=3,
+                                                label=f'Subset {subset_idx} ({len(subset)} images)')
+                    ax.add_patch(union_patch)
+        
+        # 축 설정
+        ax.set_xlim(min(all_bounds[::2]) - 100, max(all_bounds[::2]) + 100)
+        ax.set_ylim(min(all_bounds[1::2]) - 100, max(all_bounds[1::2]) + 100)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        ax.set_title(f'Subset Footprint Visualization ({len(subsets)} subsets)')
+        ax.set_xlabel('X coordinate')
+        ax.set_ylabel('Y coordinate')
+        
+        # 저장
+        output_file = output_path / "subset_footprints.png"
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"DEBUG: 시각화 결과 저장: {output_file}")
+        plt.close()
+
 
 def create_subsets_with_footprints(source_path: Path, output_path: Path, 
-                                  pixel_threshold_a: int, min_max_ratio_d: float, 
-                                  max_subsets: int) -> List[List[int]]:
+                                  pixel_threshold_a: int, min_max_ratio_d: float) -> List[List[int]]:
     """Main function to create subsets with footprint constraints"""
     
     logger.info("Starting subset creation with footprint constraints")
     
     # Load COLMAP data
     cameras, images = FootprintCalculator.load_colmap_data(source_path)
+    print('111') 
     
-    # Create subset creator
-    creator = SubsetCreator(cameras, images)
+    # Create subset creator with DTM support
+    creator = SubsetCreator(cameras, images, colmap_path=source_path)
+    print('222') 
     
     # Create subsets using Two-Stage approach
-    subsets = creator.two_stage_subset_creation(pixel_threshold_a, max_subsets)
-    
+    subsets = creator.two_stage_subset_creation(pixel_threshold_a)
+    print('333') 
     # Validate subsets
     valid = creator.validate_subsets(subsets, pixel_threshold_a, min_max_ratio_d)
+    print('444') 
+    
+    # Visualize subsets
+    creator.visualize_subsets(subsets, output_path)
     
     # Save detailed results
     results = {
@@ -841,7 +1084,6 @@ def create_subsets_with_footprints(source_path: Path, output_path: Path,
             'num_subsets': len(subsets),
             'pixel_threshold_a': pixel_threshold_a,
             'min_max_ratio_d': min_max_ratio_d,
-            'max_subsets': max_subsets,
             'validation_passed': valid
         },
         'subset_details': []
