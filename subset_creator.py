@@ -30,11 +30,105 @@ sys.path.insert(0, '/workspace/Grendel-GS/scripts/experiments')
 from scripts.experiments.colmap_visualizer import COLMAPVisualizer
 
 # Import points3D loading functions from scene
-from scene.colmap_loader import read_points3D_binary, read_points3D_text
-from scene.dataset_readers import fetchPly
+# scene 모듈 import는 simple_knn 의존성 때문에 제거하고 직접 구현
 
 # PuLP import - required dependency
 from pulp import LpVariable, LpProblem, LpMinimize, LpStatus, LpStatusOptimal, lpSum, PULP_CBC_CMD
+
+# Points3D loading functions (copied from scene/colmap_loader.py to avoid simple_knn dependency)
+import struct
+
+def read_next_bytes(fid, num_bytes, format_char_sequence):
+    """Helper function for binary file reading"""
+    data = fid.read(num_bytes)
+    return struct.unpack(format_char_sequence, data)
+
+def read_points3D_text(path):
+    """Read points3D.txt file"""
+    xyzs = None
+    rgbs = None
+    errors = None
+    num_points = 0
+    
+    # Count points first
+    with open(path, "r") as fid:
+        while True:
+            line = fid.readline()
+            if not line:
+                break
+            line = line.strip()
+            if len(line) > 0 and line[0] != "#":
+                num_points += 1
+
+    # Allocate arrays
+    xyzs = np.empty((num_points, 3))
+    rgbs = np.empty((num_points, 3))
+    errors = np.empty((num_points, 1))
+    tracks = []
+    count = 0
+    
+    # Read data
+    with open(path, "r") as fid:
+        while True:
+            line = fid.readline()
+            if not line:
+                break
+            line = line.strip()
+            if len(line) > 0 and line[0] != "#":
+                elems = line.split()
+                xyz = np.array(tuple(map(float, elems[1:4])))
+                rgb = np.array(tuple(map(int, elems[4:7])))
+                error = np.array(float(elems[7]))
+
+                xyzs[count] = xyz
+                rgbs[count] = rgb
+                errors[count] = error
+
+                # Track 정보 파싱 (8번째 요소부터 image_id feature_id 쌍들)
+                track_image_ids = set()
+                for i in range(8, len(elems), 2):
+                    if i < len(elems):
+                        track_image_ids.add(int(elems[i]))
+                tracks.append(track_image_ids)
+                count += 1
+
+    return {'xyzs': xyzs, 'rgbs': rgbs, 'errors': errors, 'tracks': tracks}
+
+def read_points3D_binary(path_to_model_file):
+    """Read points3D.bin file"""
+    with open(path_to_model_file, "rb") as fid:
+        num_points = read_next_bytes(fid, 8, "Q")[0]
+
+        xyzs = np.empty((num_points, 3))
+        rgbs = np.empty((num_points, 3))
+        errors = np.empty((num_points, 1))
+        tracks = []
+
+        for p_id in range(num_points):
+            binary_point_line_properties = read_next_bytes(
+                fid, num_bytes=43, format_char_sequence="QdddBBBd"
+            )
+            xyz = np.array(binary_point_line_properties[1:4])
+            rgb = np.array(binary_point_line_properties[4:7])
+            error = np.array(binary_point_line_properties[7])
+            track_length = read_next_bytes(fid, num_bytes=8, format_char_sequence="Q")[0]
+            track_elems = read_next_bytes(
+                fid,
+                num_bytes=8 * track_length,
+                format_char_sequence="ii" * track_length,
+            )
+
+            xyzs[p_id] = xyz
+            rgbs[p_id] = rgb
+            errors[p_id] = error
+
+            # track_elems는 [image_id1, feature_id1, image_id2, feature_id2, ...] 형태
+            track_image_ids = set()
+            for i in range(0, len(track_elems), 2):
+                track_image_ids.add(track_elems[i])
+            tracks.append(track_image_ids)
+
+    return {'xyzs': xyzs, 'rgbs': rgbs, 'errors': errors, 'tracks': tracks}
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +160,7 @@ class FootprintCalculator:
                 try:
                     points3d_data = read_points3D_binary(sparse_dir / "points3D.bin")
                     points_loaded = True
-                    logger.info(f"Loaded points3D.bin: {len(points3d_data)} points")
+                    logger.info(f"Loaded points3D.bin: {len(points3d_data['xyzs'])} points")
                 except Exception as e:
                     logger.warning(f"Failed to load points3D.bin: {e}")
             
@@ -75,39 +169,21 @@ class FootprintCalculator:
                 try:
                     points3d_data = read_points3D_text(sparse_dir / "points3D.txt")
                     points_loaded = True
-                    logger.info(f"Loaded points3D.txt: {len(points3d_data)} points")
+                    logger.info(f"Loaded points3D.txt: {len(points3d_data['xyzs'])} points")
                 except Exception as e:
                     logger.warning(f"Failed to load points3D.txt: {e}")
-            
-            # 3. PLY 파일 시도
-            if not points_loaded:
-                ply_files = list(sparse_dir.glob("*.ply"))
-                if ply_files:
-                    try:
-                        # fetchPly 함수 사용
-                        ply_path = ply_files[0]
-                        points3d_data = fetchPly(ply_path)
-                        # fetchPly는 point cloud object를 반환하므로 처리 필요
-                        points_loaded = True
-                        logger.info(f"Loaded {ply_path.name}: PLY point cloud")
-                    except Exception as e:
-                        logger.warning(f"Failed to load PLY file {ply_files[0]}: {e}")
             
             if not points_loaded:
                 # points3D가 없으면 에러
                 raise FileNotFoundError(
                     f"ERROR: No points3D file found in {sparse_dir}\n"
-                    f"Expected: points3D.txt, points3D.bin, or *.ply\n"
+                    f"Expected: points3D.txt or points3D.bin\n"
                     f"DTM-based footprint calculation requires 3D points from COLMAP reconstruction."
                 )
             
             # COLMAPVisualizer에 points3D 데이터 설정
-            if isinstance(points3d_data, dict):
-                # Binary/text 파일에서 온 dict 형태 데이터
-                self.visualizer.points3d = points3d_data
-            else:
-                # PLY에서 온 point cloud 데이터는 별도 처리 필요
-                self.visualizer.points3d = points3d_data
+            # COLMAPVisualizer는 points3d를 xyz 배열로 기대하므로 변환
+            self.visualizer.points3d = points3d_data['xyzs']
                 
             # DTM 생성
             logger.info("Creating DTM with 2m resolution...")
