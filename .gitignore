@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Project specific
+data/
+result/
+tmp/
+*.log
+*.ply
+*.npz
+
+# VS Code
+.vscode/
+output/
+Grendel-GS/output/
+Grendel-GS/assets/
+*.ply
+*.pth

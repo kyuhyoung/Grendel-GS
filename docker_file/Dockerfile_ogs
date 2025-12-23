@@ -1,0 +1,69 @@
+# Use a Miniconda base image
+FROM continuumio/miniconda3
+
+# Set non-interactive mode to avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    wget curl git build-essential libgl1-mesa-glx libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create and activate the Conda environment with Python 3.8
+RUN conda create -n citygs-x python=3.8 -y
+
+# Install PyTorch and CUDA
+RUN conda run -n citygs-x pip install torch==2.0.0+cu118 torchvision==0.15.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+
+# Install CUDA toolkit
+RUN conda run -n citygs-x conda install -c "nvidia/label/cuda-11.8.0" cuda
+
+# Install gcc-11 and g++-11 for CUDA compilation
+RUN apt-get update && apt-get install -y gcc-11 g++-11
+ENV CC=/usr/bin/gcc-11
+ENV CXX=/usr/bin/g++-11
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+
+# Install pytorch3d
+RUN conda run -n citygs-x conda install -y pytorch3d -c pytorch3d -c conda-forge
+
+# Install torch-scatter
+RUN conda run -n citygs-x pip install torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+
+# Install gsplat
+RUN conda run -n citygs-x pip install gsplat==1.4.0
+
+# Install additional packages
+RUN conda run -n citygs-x pip install \
+    tqdm scikit-image opencv-python configargparse lpips \
+    imageio-ffmpeg kornia tensorboard matplotlib plyfile trimesh \
+    h5py pandas omegaconf einops ninja open3d==0.11.0 \
+    scipy scikit-learn networkx pillow pyyaml wandb rich
+
+# Install additional dependencies from environment.yml
+RUN conda run -n citygs-x pip install \
+    addict jaxtyping fvcore iopath portalocker yacs tabulate
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy Grendel-GS submodules for building
+COPY Grendel-GS/submodules /workspace/submodules
+
+# Build and install simple-knn
+RUN conda run -n citygs-x pip install /workspace/submodules/simple-knn
+
+# Build and install diff-gaussian-rasterization (Grendel-GS distributed version)
+RUN conda run -n citygs-x pip install /workspace/submodules/diff-gaussian-rasterization
+
+# Install colmap and xvfb for headless rendering
+RUN apt-get update && apt-get install -y colmap xvfb fish \
+    && rm -rf /var/lib/apt/lists/*
+
+# Activate conda environment by default
+RUN echo ". activate citygs-x" >> ~/.bashrc
+SHELL ["/bin/bash", "-c", "source activate citygs-x && bash"]
+RUN conda init bash && conda info --envs
+
+# Set default command
+CMD ["/bin/bash"]
