@@ -32,6 +32,8 @@ class Camera(nn.Module):
         uid,
         trans=np.array([0.0, 0.0, 0.0]),
         scale=1.0,
+        image_width=None,  # Explicit size (for distributed storage where some ranks don't load image)
+        image_height=None,
     ):
         super(Camera, self).__init__()
 
@@ -70,7 +72,12 @@ class Camera(nn.Module):
             self.image_height = self.original_image_backup.shape[1]
         else:
             self.original_image_backup = None
-            self.image_height, self.image_width = utils.get_img_size()
+            # Use explicit dimensions if provided, otherwise fall back to global size
+            if image_width is not None and image_height is not None:
+                self.image_width = image_width
+                self.image_height = image_height
+            else:
+                self.image_height, self.image_width = utils.get_img_size()
 
         if args.time_image_loading:
             log_file.write(f"Image processing in {time.time() - start_time} seconds\n")

@@ -280,8 +280,13 @@ class AdaptiveTileParams(ParamGroup):
         self.adaptive_tile_enabled = False
         # Margin for crop region (in pixels)
         self.tile_crop_margin = 100
+        # NDC limit for projection filtering (1.0 = image bounds)
+        self.ndc_limit = 1.0
         # State file for tile management
         self.tile_state_file = ""
+        # Pre-computed visible camera names (comma-separated)
+        # If provided, Scene will use this instead of recomputing visibility
+        self.visible_cameras = ""
         super().__init__(parser, "Adaptive Tile Parameters")
 
 

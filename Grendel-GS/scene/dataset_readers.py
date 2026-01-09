@@ -83,11 +83,11 @@ def getNerfppNorm(cam_info):
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     args = utils.get_args()
     cam_infos = []
-    utils.print_rank_0("Loading cameras from disk...")
     for idx, key in tqdm(
         enumerate(cam_extrinsics),
         total=len(cam_extrinsics),
         disable=(utils.LOCAL_RANK != 0),
+        desc="Loading camera metadata",
     ):
 
         extr = cam_extrinsics[key]

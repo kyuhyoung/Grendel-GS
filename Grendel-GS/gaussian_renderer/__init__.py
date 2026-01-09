@@ -548,6 +548,10 @@ def all_to_all_communication_final(
     batched_cuda_args,
     batched_strategies,
 ):
+    debug_first = utils.get_cur_iter() <= 3
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: all_to_all_communication_final ENTERED", flush=True)
+
     num_cameras = len(batched_rasterizers)
     # gpui_to_gpuj_camk_size
     # gpui_to_gpuj_camk_send_ids
@@ -555,11 +559,18 @@ def all_to_all_communication_final(
     local_to_gpuj_camk_size = [[] for j in range(utils.DEFAULT_GROUP.size())]
     local_to_gpuj_camk_send_ids = [[] for j in range(utils.DEFAULT_GROUP.size())]
     for k in range(num_cameras):
+        if debug_first:
+            print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: processing camera {k} for local2j_ids...", flush=True)
         strategy = batched_strategies[k]
         means2D, rgb, conic_opacity, radii, depths = batched_screenspace_params[k]
+        if debug_first:
+            rset = batched_rasterizers[k].raster_settings
+            print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: camera {k} calling get_local2j_ids, means2D={means2D.shape}, img={rset.image_width}x{rset.image_height}", flush=True)
         local2j_ids, local2j_ids_bool = batched_strategies[k].get_local2j_ids(
             means2D, radii, batched_rasterizers[k].raster_settings, batched_cuda_args[k]
         )
+        if debug_first:
+            print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: camera {k} get_local2j_ids done", flush=True)
 
         for local_id, global_id in enumerate(strategy.gpu_ids):
             local_to_gpuj_camk_size[global_id].append(len(local2j_ids[local_id]))
@@ -572,6 +583,9 @@ def all_to_all_communication_final(
                     torch.empty((0, 1), dtype=torch.int64)
                 )
 
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: computed local2j_ids for {num_cameras} cameras", flush=True)
+
     gpui_to_gpuj_imgk_size = torch.zeros(
         (utils.DEFAULT_GROUP.size(), utils.DEFAULT_GROUP.size(), num_cameras),
         dtype=torch.int,
@@ -580,12 +594,18 @@ def all_to_all_communication_final(
     local_to_gpuj_camk_size_tensor = torch.tensor(
         local_to_gpuj_camk_size, dtype=torch.int, device="cuda"
     )
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: calling all_gather_into_tensor...", flush=True)
     torch.distributed.all_gather_into_tensor(
         gpui_to_gpuj_imgk_size,
         local_to_gpuj_camk_size_tensor,
         group=utils.DEFAULT_GROUP,
     )
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: all_gather_into_tensor done, calling .cpu()...", flush=True)
     gpui_to_gpuj_imgk_size = gpui_to_gpuj_imgk_size.cpu().numpy().tolist()
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: .cpu() done", flush=True)
 
     def one_all_to_all(batched_tensors, use_function_version=False):
         tensor_to_rki = []
@@ -609,6 +629,10 @@ def all_to_all_communication_final(
                 )
             )
 
+        if debug_first:
+            sizes_in = [t.shape for t in tensor_to_rki]
+            sizes_out = [t.shape for t in tensor_from_rki]
+            print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: one_all_to_all calling dist.all_to_all, in={sizes_in}, out={sizes_out}", flush=True)
         if (
             use_function_version
         ):  # FIXME: there is error if I use torch.distributed.nn.functional to replace dist_func here. So weird.
@@ -623,6 +647,8 @@ def all_to_all_communication_final(
                 input_tensor_list=tensor_to_rki,
                 group=utils.DEFAULT_GROUP,
             )
+        if debug_first:
+            print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: one_all_to_all dist.all_to_all done", flush=True)
 
         # tensor_from_rki: (world_size, (all data received from all other GPUs))
         for i in range(utils.DEFAULT_GROUP.size()):
@@ -643,6 +669,8 @@ def all_to_all_communication_final(
         return tensors_per_camera
 
     # Merge means2D, rgb, conic_opacity into one functional all-to-all communication call.
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: preparing batched_catted_screenspace_states...", flush=True)
     batched_catted_screenspace_states = []
     batched_catted_screenspace_auxiliary_states = []
     for k in range(num_cameras):
@@ -659,10 +687,14 @@ def all_to_all_communication_final(
                 [radii.float().unsqueeze(1), depths.unsqueeze(1)], dim=1
             ).contiguous()
         )
-
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: batched_catted_screenspace_states prepared", flush=True)
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: calling one_all_to_all for screenspace_states...", flush=True)
     batched_params_redistributed = one_all_to_all(
         batched_catted_screenspace_states, use_function_version=True
     )
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: one_all_to_all done", flush=True)
     batched_means2D_redistributed = []
     batched_rgb_redistributed = []
     batched_conic_opacity_redistributed = []
@@ -892,6 +924,11 @@ def distributed_preprocess3dgs_and_all2all_final(
 
     distribute gaussians parameters across all GPUs.
     """
+    # Debug: Check if function is even called
+    debug_first = utils.get_cur_iter() <= 3
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: distributed_preprocess3dgs ENTERED", flush=True)
+
     timers = utils.get_timers()
     args = utils.get_args()
 
@@ -902,11 +939,17 @@ def distributed_preprocess3dgs_and_all2all_final(
     ########## [START] Prepare Gaussians for rendering ##########
     if timers is not None:
         timers.start("forward_prepare_gaussians")
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: getting means3D...", flush=True)
     means3D = pc.get_xyz
+    if debug_first:
+        print(f"[DEBUG] rank {utils.DEFAULT_GROUP.rank()}: means3D shape={means3D.shape}", flush=True)
     opacity = pc.get_opacity
     scales = pc.get_scaling
     rotations = pc.get_rotation
     shs = pc.get_features
+    if debug_first:
+        utils.print_rank_0(f"[DEBUG] distributed_preprocess: got all gaussian properties")
     if timers is not None:
         timers.stop("forward_prepare_gaussians")
     utils.check_initial_gpu_memory_usage("after forward_prepare_gaussians")
@@ -914,6 +957,10 @@ def distributed_preprocess3dgs_and_all2all_final(
 
     if timers is not None:
         timers.start("forward_preprocess_gaussians")
+
+    if debug_first:
+        utils.print_rank_0(f"[DEBUG] distributed_preprocess: starting, {len(batched_viewpoint_cameras)} cameras, {means3D.shape[0]} gaussians")
+
     batched_rasterizers = []  # One rasterizer for each picture in a batch
     batched_cuda_args = []  # Per picture in a batch
     batched_screenspace_params = []  # Per picture in a batch
@@ -922,6 +969,8 @@ def distributed_preprocess3dgs_and_all2all_final(
     for i, (viewpoint_camera, strategy) in enumerate(
         zip(batched_viewpoint_cameras, batched_strategies)
     ):
+        if debug_first:
+            utils.print_rank_0(f"[DEBUG] distributed_preprocess: camera {i} ({viewpoint_camera.image_name}) {viewpoint_camera.image_width}x{viewpoint_camera.image_height}")
         ########## [START] Prepare CUDA Rasterization Settings ##########
         cuda_args = get_cuda_args_final(strategy, mode)
         batched_cuda_args.append(cuda_args)
@@ -949,6 +998,8 @@ def distributed_preprocess3dgs_and_all2all_final(
         ########## [END] Prepare CUDA Rasterization Settings ##########
 
         # [3DGS-wise preprocess]
+        if debug_first:
+            utils.print_rank_0(f"[DEBUG] distributed_preprocess: camera {i} calling preprocess_gaussians...")
         if means3D.shape[0] == 0:
             means2D = torch.zeros((0, 2), device="cuda", requires_grad=True)
             rgb = torch.zeros((0, 3), device="cuda", requires_grad=True)
@@ -971,6 +1022,11 @@ def distributed_preprocess3dgs_and_all2all_final(
         batched_rasterizers.append(rasterizer)
         batched_screenspace_params.append(screenspace_params)
         batched_radii.append(radii)
+        if debug_first:
+            utils.print_rank_0(f"[DEBUG] distributed_preprocess: camera {i} done, means2D shape={means2D.shape}")
+
+    if debug_first:
+        utils.print_rank_0(f"[DEBUG] distributed_preprocess: all cameras preprocessed, world_size={utils.DEFAULT_GROUP.size()}")
     utils.check_initial_gpu_memory_usage("after forward_preprocess_gaussians")
     if timers is not None:
         timers.stop("forward_preprocess_gaussians")
@@ -1012,6 +1068,8 @@ def distributed_preprocess3dgs_and_all2all_final(
 
     if timers is not None:
         timers.start("forward_all_to_all_communication")
+    if debug_first:
+        utils.print_rank_0(f"[DEBUG] distributed_preprocess: calling all_to_all_communication_final...")
     (
         batched_means2D_redistributed,
         batched_rgb_redistributed,
@@ -1025,6 +1083,8 @@ def distributed_preprocess3dgs_and_all2all_final(
         batched_cuda_args,
         batched_strategies,
     )
+    if debug_first:
+        utils.print_rank_0(f"[DEBUG] distributed_preprocess: all_to_all_communication_final done")
     utils.check_initial_gpu_memory_usage("after forward_all_to_all_communication")
     if timers is not None:
         timers.stop("forward_all_to_all_communication")

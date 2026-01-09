@@ -123,10 +123,10 @@ def inc_densify_iter():
     DENSIFY_ITER += 1
 
 
-def print_rank_0(str):
+def print_rank_0(str, flush=True):
     global GLOBAL_RANK
     if GLOBAL_RANK == 0:
-        print(str)
+        print(str, flush=flush)
 
 
 def check_enable_python_timer():
@@ -281,9 +281,13 @@ def inverse_sigmoid(x):
 
 
 def check_initial_gpu_memory_usage(prefix):
+    # Skip in adaptive tile mode - OOM is expected and handled by tile splitting
+    args = get_args()
+    if getattr(args, 'adaptive_tile_enabled', False):
+        return
+
     if get_cur_iter() not in [0, 1]:
         return
-    args = get_args()
     log_file = get_log_file()
     if (
         hasattr(args, "check_gpu_memory")
@@ -302,6 +306,10 @@ def check_initial_gpu_memory_usage(prefix):
 
 def check_memory_usage(log_file, args, iteration, gaussians, before_densification_stop):
     global DEFAULT_GROUP
+
+    # Skip in adaptive tile mode - OOM is expected and handled by tile splitting
+    if getattr(args, 'adaptive_tile_enabled', False):
+        return
 
     memory_usage = torch.cuda.memory_allocated() / 1024 / 1024 / 1024
     max_memory_usage = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024

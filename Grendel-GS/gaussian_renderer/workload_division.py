@@ -91,6 +91,21 @@ def division_pos_heuristic(heuristic, tile_num, world_size, right=False):
     # Convert to a Python list and prepend the initial division at 0.
     division_pos = [0] + division_indices.cpu().tolist() + [tile_num]
 
+    # Ensure each GPU gets at least 1 tile (if tile_num >= world_size)
+    # This prevents empty gpuid2tasks which causes IndexError
+    if tile_num >= world_size:
+        for i in range(1, len(division_pos)):
+            if division_pos[i] <= division_pos[i - 1]:
+                division_pos[i] = division_pos[i - 1] + 1
+        # Clamp last position to tile_num
+        if division_pos[-1] > tile_num:
+            # Redistribute from the end
+            for i in range(len(division_pos) - 1, 0, -1):
+                if division_pos[i] > tile_num:
+                    division_pos[i] = tile_num
+                if division_pos[i] <= division_pos[i - 1]:
+                    division_pos[i - 1] = division_pos[i] - 1
+
     return division_pos
 
 
@@ -809,8 +824,10 @@ class DivisionStrategyHistoryFinal:
         self.rank = rank
         self.accum_heuristic = {}
         for camera in dataset.cameras:
+            # Use camera's actual tile_y (for adaptive tile with varying crop sizes)
+            tile_y = (camera.image_height + utils.BLOCK_Y - 1) // utils.BLOCK_Y
             self.accum_heuristic[camera.uid] = torch.ones(
-                (utils.TILE_Y,), dtype=torch.float32, device="cuda", requires_grad=False
+                (tile_y,), dtype=torch.float32, device="cuda", requires_grad=False
             )
 
         self.history = []
@@ -903,7 +920,22 @@ def start_strategy_final(batched_cameras, strategy_history):
         
         # Ensure ascending order after adjustment
         division_pos.sort()
-        
+
+        # Ensure each GPU gets at least 1 tile after adjustment (if total_tiles >= world_size)
+        # This prevents empty gpuid2tasks which causes IndexError
+        world_size = utils.DEFAULT_GROUP.size()
+        if total_tiles >= world_size:
+            for i in range(1, len(division_pos)):
+                if division_pos[i] <= division_pos[i - 1]:
+                    division_pos[i] = division_pos[i - 1] + 1
+            # Clamp last position to total_tiles
+            if division_pos[-1] > total_tiles:
+                for i in range(len(division_pos) - 1, 0, -1):
+                    if division_pos[i] > total_tiles:
+                        division_pos[i] = total_tiles
+                    if division_pos[i] <= division_pos[i - 1]:
+                        division_pos[i - 1] = division_pos[i] - 1
+
         # for i in range(0, len(division_pos) - 1):
         #     assert (
         #         division_pos[i] + args.border_divpos_coeff < division_pos[i + 1]

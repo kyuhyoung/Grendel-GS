@@ -11,6 +11,7 @@
 
 from scene.cameras import Camera
 import numpy as np
+import sys
 from utils.general_utils import PILtoTorch, get_args, get_log_file
 import utils.general_utils as utils
 from tqdm import tqdm
@@ -22,16 +23,51 @@ import torch
 from PIL import Image
 
 
-def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
+def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, crop=None):
+    """
+    Load a camera with its ground truth image.
+
+    Args:
+        args: Arguments
+        id: Camera ID
+        cam_info: CameraInfo object
+        decompressed_image: Optional pre-decompressed image
+        return_image: If True, return only the image tensor
+        crop: Optional CropRegion to apply during loading (saves memory)
+    """
+    import math
+
     orig_w, orig_h = cam_info.width, cam_info.height
-    assert (
-        orig_w == utils.get_img_width() and orig_h == utils.get_img_height()
-    ), "All images should have the same size. "
+
+    # With crop, we allow different image sizes (will be cropped to different sizes)
+    if crop is None:
+        assert (
+            orig_w == utils.get_img_width() and orig_h == utils.get_img_height()
+        ), "All images should have the same size (unless using adaptive tile crop)."
 
     args = get_args()
     log_file = get_log_file()
-    resolution = orig_w, orig_h
-    # NOTE: we do not support downsampling here.
+
+    # Determine final resolution (after crop if applicable)
+    if crop:
+        resolution = crop.width, crop.height
+    else:
+        resolution = orig_w, orig_h
+
+    # Compute FoV (will be adjusted if cropped)
+    FovX = cam_info.FovX
+    FovY = cam_info.FovY
+
+    if crop:
+        # Adjust FoV to maintain correct focal length after crop
+        # focal_x = orig_w / (2 * tan(FoVx/2))
+        # new_FoVx = 2 * atan(crop_width / (2 * focal_x))
+        tanfovx = math.tan(FovX / 2)
+        tanfovy = math.tan(FovY / 2)
+        focal_x = orig_w / (2 * tanfovx)
+        focal_y = orig_h / (2 * tanfovy)
+        FovX = 2 * math.atan(crop.width / (2 * focal_x))
+        FovY = 2 * math.atan(crop.height / (2 * focal_y))
 
     # may use cam_info.uid
     if (
@@ -49,7 +85,18 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
     ):
         if args.time_image_loading:
             start_time = time.time()
+
         image = Image.open(cam_info.image_path)
+        orig_size = image.size  # (width, height)
+
+        # Apply crop during loading (saves memory - don't decode full image)
+        if crop:
+            # PIL crop: (left, upper, right, lower)
+            image = image.crop((crop.x_min, crop.y_min, crop.x_max, crop.y_max))
+            worker_name = multiprocessing.current_process().name
+            worker_num = worker_name.split("-")[-1] if "-" in worker_name else worker_name
+            utils.print_rank_0(f"[loadCam] Camera {id+1}: orig={orig_size}, crop=({crop.x_min},{crop.y_min})-({crop.x_max},{crop.y_max}), after_crop={image.size}, resolution={resolution} (worker {worker_num})")
+
         resized_image_rgb = PILtoTorch(
             image, resolution, args, log_file, decompressed_image=decompressed_image
         )
@@ -74,42 +121,50 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
         colmap_id=cam_info.uid,
         R=cam_info.R,
         T=cam_info.T,
-        FoVx=cam_info.FovX,
-        FoVy=cam_info.FovY,
+        FoVx=FovX,
+        FoVy=FovY,
         image=gt_image,
         gt_alpha_mask=loaded_mask,
         image_name=cam_info.image_name,
         uid=id,
+        image_width=resolution[0],  # Pass explicit size for distributed storage
+        image_height=resolution[1],
     )
 
 
 def load_decompressed_image(params):
-    args, id, cam_info = params
-    return loadCam(args, id, cam_info, decompressed_image=None, return_image=True)
+    args, id, cam_info, crop = params
+    worker_name = multiprocessing.current_process().name  # e.g., "ForkPoolWorker-1"
+    result = loadCam(args, id, cam_info, decompressed_image=None, return_image=True, crop=crop)
+    return (result, worker_name)
 
 
 # Modify this code to support shared_memory.SharedMemory to make inter-process communication faster
-def decompressed_images_from_camInfos_multiprocess(cam_infos, args):
+def decompressed_images_from_camInfos_multiprocess(cam_infos, args, crops=None):
     args = get_args()
     decompressed_images = []
     total_cameras = len(cam_infos)
 
-    # Create a pool of processes
-    with multiprocessing.Pool(processes=2) as pool:
-        # Prepare data for processing
-        tasks = [(args, id, cam_info) for id, cam_info in enumerate(cam_infos)]
+    # Create a pool of processes (auto-detect based on CPU cores, max 8)
+    import os
+    num_workers = min(os.cpu_count() or 2, 8)
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        # Prepare data for processing (include crop for each camera)
+        tasks = [
+            (args, id, cam_info, crops.get(id) if crops else None)
+            for id, cam_info in enumerate(cam_infos)
+        ]
 
-        # Map load_camera_data to the tasks
-        # results = pool.map(load_decompressed_image, tasks)
-        results = list(
-            tqdm(
-                pool.imap(load_decompressed_image, tasks),
-                total=total_cameras,
-                disable=(utils.LOCAL_RANK != 0),
-            )
-        )
-
-        for id, result in enumerate(results):
+        # Process images and print progress
+        utils.print_rank_0(f"Loading {total_cameras} images (multiprocess, {num_workers} workers)...")
+        for id, (result, worker_name) in enumerate(pool.imap(load_decompressed_image, tasks)):
+            crop = crops.get(id) if crops else None
+            # Extract worker number from name like "ForkPoolWorker-1" or "SpawnPoolWorker-1"
+            worker_num = worker_name.split("-")[-1] if "-" in worker_name else worker_name
+            if crop:
+                utils.print_rank_0(f"  [{id+1}/{total_cameras}] {cam_infos[id].image_name}: {crop.width}x{crop.height} (worker {worker_num})")
+            else:
+                utils.print_rank_0(f"  [{id+1}/{total_cameras}] {cam_infos[id].image_name}: full image (worker {worker_num})")
             decompressed_images.append(result)
 
     return decompressed_images
@@ -186,7 +241,8 @@ def decompressed_images_from_camInfos_multiprocess_sharedmem(
         # print("Start Parallel loading...")
         # Map load_camera_data to the tasks
         list(
-            tqdm(pool.imap(load_decompressed_image_shared, tasks), total=total_cameras)
+            tqdm(pool.imap(load_decompressed_image_shared, tasks), total=total_cameras,
+                 desc="Loading images (shared mem)")
         )
 
     # Read images from shared memory
@@ -207,12 +263,22 @@ def decompressed_images_from_camInfos_multiprocess_sharedmem(
     return decompressed_images
 
 
-def cameraList_from_camInfos(cam_infos, args):
+def cameraList_from_camInfos(cam_infos, args, crops=None):
+    """
+    Load cameras from camera infos.
+
+    Args:
+        cam_infos: List of CameraInfo objects
+        args: Arguments
+        crops: Optional dict mapping camera index to CropRegion.
+               If provided, images will be cropped during loading (saves memory).
+    """
     args = get_args()
 
     if args.multiprocesses_image_loading:
+        # Multiprocess loading already applies crops and returns image tensors
         decompressed_images = decompressed_images_from_camInfos_multiprocess(
-            cam_infos, args
+            cam_infos, args, crops=crops
         )
         # decompressed_images = decompressed_images_from_camInfos_multiprocess_sharedmem(cam_infos, resolution_scale, args)
     else:
@@ -220,8 +286,12 @@ def cameraList_from_camInfos(cam_infos, args):
 
     camera_list = []
     for id, c in tqdm(
-        enumerate(cam_infos), total=len(cam_infos), disable=(utils.LOCAL_RANK != 0)
+        enumerate(cam_infos), total=len(cam_infos), disable=(utils.LOCAL_RANK != 0),
+        desc="Creating Camera objects"
     ):
+        # Always pass crop info so that loadCam computes correct resolution
+        # (even if multiprocess loading already applied the crop to the image)
+        crop = crops.get(id) if crops else None
         camera_list.append(
             loadCam(
                 args,
@@ -229,6 +299,7 @@ def cameraList_from_camInfos(cam_infos, args):
                 c,
                 decompressed_image=decompressed_images[id],
                 return_image=False,
+                crop=crop,
             )
         )
 

@@ -26,9 +26,9 @@ import numpy as np
 from scene.adaptive_tile_utils import (
     TileBBox,
     filter_point_cloud,
+    compute_visible_caminfos,
     compute_visible_cameras_and_crops,
-    apply_crop_to_camera,
-    expand_crop_to_size,
+    ProjectionDebugInfo,
 )
 
 
@@ -136,10 +136,208 @@ class Scene:
         self.train_cameras = None
         self.test_cameras = None
         if args.num_train_cameras >= 0:
-            train_cameras = scene_info.train_cameras[: args.num_train_cameras]
+            train_cam_infos = scene_info.train_cameras[: args.num_train_cameras]
         else:
-            train_cameras = scene_info.train_cameras
-        self.train_cameras = cameraList_from_camInfos(train_cameras, args)
+            train_cam_infos = scene_info.train_cameras
+
+        # ============================================
+        # Adaptive tile: filter cameras BEFORE loading images
+        # ============================================
+        tile_bbox = None
+        self.camera_crops = {}  # camera_idx -> CropRegion
+        visible_cam_crops = None  # List of (idx, crop, debug_info) for visible cameras
+
+        if getattr(args, "adaptive_tile_enabled", False) and getattr(args, "tile_bbox", ""):
+            tile_bbox = TileBBox.from_string(args.tile_bbox)
+
+            # Print full scene extent vs tile extent
+            pcd = scene_info.point_cloud
+            pcd_points = np.asarray(pcd.points)
+
+            # Full scene extent (min/max)
+            scene_min = pcd_points.min(axis=0)
+            scene_max = pcd_points.max(axis=0)
+            scene_size = scene_max - scene_min
+
+            # Outlier-free extent (0.1% ~ 99.9% percentile)
+            pct_low, pct_high = 0.1, 99.9
+            clean_min = np.percentile(pcd_points, pct_low, axis=0)
+            clean_max = np.percentile(pcd_points, pct_high, axis=0)
+            clean_size = clean_max - clean_min
+
+            # Current tile extent
+            tile_size = np.array([
+                tile_bbox.x_max - tile_bbox.x_min,
+                tile_bbox.y_max - tile_bbox.y_min,
+                tile_bbox.z_max - tile_bbox.z_min
+            ])
+
+            # Calculate margin percentage
+            margin_pct = ((tile_size / clean_size) - 1.0) * 100 / 2  # divide by 2 since margin is on both sides
+
+            utils.print_rank_0(f"[adaptive-tile] ========== Tile Info ==========")
+            utils.print_rank_0(f"[adaptive-tile] Tile ID: {getattr(args, 'tile_id', 'unknown')}")
+            utils.print_rank_0(f"[adaptive-tile] Full scene extent (min/max):")
+            utils.print_rank_0(f"[adaptive-tile]   X: {scene_min[0]:.3f} ~ {scene_max[0]:.3f} (size: {scene_size[0]:.3f})")
+            utils.print_rank_0(f"[adaptive-tile]   Y: {scene_min[1]:.3f} ~ {scene_max[1]:.3f} (size: {scene_size[1]:.3f})")
+            utils.print_rank_0(f"[adaptive-tile]   Z: {scene_min[2]:.3f} ~ {scene_max[2]:.3f} (size: {scene_size[2]:.3f})")
+            utils.print_rank_0(f"[adaptive-tile] Outlier-free extent ({pct_low}%-{pct_high}% percentile):")
+            utils.print_rank_0(f"[adaptive-tile]   X: {clean_min[0]:.3f} ~ {clean_max[0]:.3f} (size: {clean_size[0]:.3f})")
+            utils.print_rank_0(f"[adaptive-tile]   Y: {clean_min[1]:.3f} ~ {clean_max[1]:.3f} (size: {clean_size[1]:.3f})")
+            utils.print_rank_0(f"[adaptive-tile]   Z: {clean_min[2]:.3f} ~ {clean_max[2]:.3f} (size: {clean_size[2]:.3f})")
+            utils.print_rank_0(f"[adaptive-tile] Current tile extent (~{margin_pct[0]:.0f}% margin):")
+            utils.print_rank_0(f"[adaptive-tile]   X: {tile_bbox.x_min:.3f} ~ {tile_bbox.x_max:.3f} (size: {tile_size[0]:.3f})")
+            utils.print_rank_0(f"[adaptive-tile]   Y: {tile_bbox.y_min:.3f} ~ {tile_bbox.y_max:.3f} (size: {tile_size[1]:.3f})")
+            utils.print_rank_0(f"[adaptive-tile]   Z: {tile_bbox.z_min:.3f} ~ {tile_bbox.z_max:.3f} (size: {tile_size[2]:.3f})")
+            utils.print_rank_0(f"[adaptive-tile] ===============================")
+
+            crop_margin = getattr(args, "tile_crop_margin", 100)
+            ndc_limit = getattr(args, "ndc_limit", 1.0)
+            utils.print_rank_0(f"[adaptive-tile] Crop margin: {crop_margin}px, NDC limit: {ndc_limit}")
+            total_cams = len(train_cam_infos)
+
+            # Check if visible_cameras was pre-computed by train_adaptive.py
+            precomputed_visible = getattr(args, "visible_cameras", "")
+            if precomputed_visible:
+                # Use pre-computed visible camera list from train_adaptive.py
+                visible_camera_names = set(precomputed_visible.split(","))
+                utils.print_rank_0(f"[adaptive-tile] Using pre-computed visible cameras: {len(visible_camera_names)}")
+
+                # Filter by name and compute crops for remaining cameras
+                # IMPORTANT: Only include cameras that have valid crops!
+                filtered_cam_infos = []
+                visible_cam_crops = []  # List of (idx, crop, debug_info)
+                for idx, cam_info in enumerate(train_cam_infos):
+                    if cam_info.image_name in visible_camera_names:
+                        # Compute crop for this camera (using point cloud for accuracy)
+                        crop_result = compute_visible_caminfos(
+                            tile_bbox, [cam_info], margin=crop_margin,
+                            points=pcd_points, return_debug_info=True,
+                            ndc_limit=ndc_limit
+                        )
+                        if crop_result:
+                            # crop_result is [(0, crop, debug_info)]
+                            # Only add camera if crop was successfully computed
+                            new_idx = len(filtered_cam_infos)
+                            filtered_cam_infos.append(cam_info)
+                            visible_cam_crops.append((new_idx, crop_result[0][1], crop_result[0][2]))
+                        else:
+                            utils.print_rank_0(f"[adaptive-tile] Skipping camera {cam_info.image_name}: no valid crop computed")
+
+                train_cam_infos = filtered_cam_infos
+                visible_indices = list(range(len(train_cam_infos)))
+            else:
+                # Compute visibility here (fallback for direct torchrun invocation)
+                crop_results = compute_visible_caminfos(
+                    tile_bbox, train_cam_infos, margin=crop_margin,
+                    points=pcd_points, return_debug_info=True,
+                    ndc_limit=ndc_limit
+                )
+                visible_indices = [idx for idx, crop, debug in crop_results]
+
+                # Filter train_cam_infos to only visible cameras
+                train_cam_infos = [train_cam_infos[idx] for idx in visible_indices]
+
+                # Re-index crops for filtered list (keep debug info)
+                visible_cam_crops = [(new_idx, crop, debug) for new_idx, (_, crop, debug) in enumerate(crop_results)]
+
+            # Filter out crops that are too small for distributed rendering
+            # Minimum size = num_gpus * BLOCK_SIZE (each GPU needs at least 1 tile)
+            # Combined with division_pos_heuristic fix, this ensures no GPU gets 0 tiles
+            BLOCK_SIZE = 16  # BLOCK_X = BLOCK_Y = 16
+            num_gpus = utils.WORLD_SIZE if hasattr(utils, 'WORLD_SIZE') and utils.WORLD_SIZE > 0 else 4
+            MIN_CROP_SIZE = num_gpus * BLOCK_SIZE  # e.g., 8 GPUs → 128 pixels
+            if visible_cam_crops:
+                original_count = len(visible_cam_crops)
+                # Filter crops and track which indices to keep
+                filtered_crops = []
+                filtered_indices = []
+                for idx, crop, debug in visible_cam_crops:
+                    if crop.width >= MIN_CROP_SIZE and crop.height >= MIN_CROP_SIZE:
+                        filtered_indices.append(idx)
+                        filtered_crops.append((len(filtered_crops), crop, debug))
+                    else:
+                        cam_name = train_cam_infos[idx].image_name
+                        utils.print_rank_0(f"[adaptive-tile] Skipping camera {cam_name}: crop {crop.width}x{crop.height} < {MIN_CROP_SIZE}x{MIN_CROP_SIZE}")
+
+                if len(filtered_crops) < original_count:
+                    # Re-filter train_cam_infos
+                    train_cam_infos = [train_cam_infos[idx] for idx in filtered_indices]
+                    visible_cam_crops = filtered_crops
+                    utils.print_rank_0(f"[adaptive-tile] Filtered out {original_count - len(filtered_crops)} cameras with small crops")
+
+            utils.print_rank_0(f"[adaptive-tile] Camera visibility (before image loading):")
+            utils.print_rank_0(f"[adaptive-tile]   Total cameras: {total_cams}")
+            utils.print_rank_0(f"[adaptive-tile]   Visible cameras: {len(train_cam_infos)}")
+
+            # If no cameras remain after filtering, this tile is too small/problematic
+            if len(train_cam_infos) == 0:
+                utils.print_rank_0(f"[adaptive-tile] ERROR: No cameras with valid crops for this tile!")
+                utils.print_rank_0(f"[adaptive-tile] Tile is likely too small or outside camera frustums.")
+                # Raise OOM-like error to trigger tile split or skip
+                raise RuntimeError("No cameras with valid crops - tile too small")
+
+            if train_cam_infos:
+                # Print which cameras are visible
+                visible_names = [cam.image_name for cam in train_cam_infos]
+                utils.print_rank_0(f"[adaptive-tile]   Visible camera names: {visible_names[:10]}{'...' if len(visible_names) > 10 else ''}")
+
+            utils.print_rank_0(f"[adaptive-tile] Loading only {len(train_cam_infos)} visible camera images (skipping {total_cams - len(train_cam_infos)})")
+
+            # Print crop info BEFORE loading
+            if visible_cam_crops:
+                max_width = max(crop.width for _, crop, _ in visible_cam_crops)
+                max_height = max(crop.height for _, crop, _ in visible_cam_crops)
+                utils.print_rank_0(f"[adaptive-tile] Crop regions calculated (uniform size: {max_width}x{max_height})")
+                # Print all crop regions
+                for idx, crop, debug in visible_cam_crops:
+                    cam_name = train_cam_infos[idx].image_name
+                    utils.print_rank_0(f"[adaptive-tile]   {idx+1}: {cam_name}: ({crop.x_min},{crop.y_min}) - ({crop.x_max},{crop.y_max}) = {crop.width}x{crop.height}")
+
+            log_file.write(f"[adaptive-tile] Visible cameras: {total_cams} -> {len(train_cam_infos)}\n")
+
+        # Build crop dict for loading (crop during image load, not after)
+        load_crops = None
+        if visible_cam_crops:
+            # Print point cloud info
+            points_in_tile_mask = tile_bbox.contains_points(pcd_points)
+            num_points_in_tile = np.sum(points_in_tile_mask)
+            utils.print_rank_0(f"[adaptive-tile] ========== Point Cloud Info ==========")
+            utils.print_rank_0(f"[adaptive-tile] PLY file: {scene_info.ply_path}")
+            utils.print_rank_0(f"[adaptive-tile] Total points: {len(pcd_points)}")
+            utils.print_rank_0(f"[adaptive-tile] Points in tile: {num_points_in_tile}")
+            utils.print_rank_0(f"[adaptive-tile] ======================================")
+
+            load_crops = {idx: crop for idx, crop, _ in visible_cam_crops}
+            utils.print_rank_0(f"[adaptive-tile] Applying crop DURING image loading (memory efficient)")
+            utils.print_rank_0(f"[adaptive-tile] Crop info per camera ({len(load_crops)} cameras):")
+            for idx, crop, debug in visible_cam_crops:
+                cam_info = train_cam_infos[idx]
+                cam_name = cam_info.image_name
+                # Camera intrinsics and pose
+                fx = cam_info.width / (2 * np.tan(cam_info.FovX / 2))
+                fy = cam_info.height / (2 * np.tan(cam_info.FovY / 2))
+                T = np.array(cam_info.T)
+                R = np.array(cam_info.R)
+                # Extract camera axes in world coordinates
+                # R[:, 0] = image right direction, R[:, 1] = image down direction, R[:, 2] = viewing direction (before negation)
+                img_right = R[:, 0]  # image X axis in world coords
+                img_down = R[:, 1]   # image Y axis in world coords
+                # Debug info: raw projected range before margin/clamp
+                if debug:
+                    raw_x = f"raw_x=[{debug.raw_x_min:.0f}, {debug.raw_x_max:.0f}]"
+                    raw_y = f"raw_y=[{debug.raw_y_min:.0f}, {debug.raw_y_max:.0f}]"
+                else:
+                    raw_x = raw_y = "no_debug"
+                utils.print_rank_0(
+                    f"[adaptive-tile]   {idx}: {cam_name} | "
+                    f"T=[{T[0]:.1f}, {T[1]:.1f}, {T[2]:.1f}] | "
+                    f"crop: x={crop.x_min}, y={crop.y_min}, w={crop.width}, h={crop.height} | "
+                    f"{raw_x} | {raw_y}"
+                )
+
+        # Now load images only for visible/selected cameras
+        self.train_cameras = cameraList_from_camInfos(train_cam_infos, args, crops=load_crops)
         # output the number of cameras in the training set and image size to the log file
         log_file.write(
             "Number of local training cameras: {}\n".format(len(self.train_cameras))
@@ -174,55 +372,31 @@ class Scene:
         utils.check_initial_gpu_memory_usage("after Loading all images")
         utils.log_cpu_memory_usage("after decoding images")
 
-        # Check for adaptive tile mode
-        tile_bbox = None
-        self.camera_crops = {}  # camera_idx -> CropRegion
-        if getattr(args, "adaptive_tile_enabled", False) and getattr(args, "tile_bbox", ""):
-            tile_bbox = TileBBox.from_string(args.tile_bbox)
-            utils.print_rank_0(f"[adaptive-tile] Tile mode enabled: {args.tile_id}")
-            utils.print_rank_0(f"[adaptive-tile] BBox: {args.tile_bbox}")
+        # Store crop info and update global image size (crop already applied during load)
+        if visible_cam_crops and self.train_cameras:
+            crop_sizes = [(crop.width, crop.height) for _, crop, _ in visible_cam_crops]
+            min_w, min_h = min(c[0] for c in crop_sizes), min(c[1] for c in crop_sizes)
+            max_w, max_h = max(c[0] for c in crop_sizes), max(c[1] for c in crop_sizes)
 
-            # Filter cameras to those that can see the tile and compute crops
-            crop_margin = getattr(args, "tile_crop_margin", 100)
-            if self.train_cameras:
-                visible_train = compute_visible_cameras_and_crops(
-                    tile_bbox, self.train_cameras, margin=crop_margin
-                )
-                visible_indices = [idx for idx, crop in visible_train]
-                self.train_cameras = [self.train_cameras[idx] for idx in visible_indices]
+            utils.print_rank_0(
+                f"[adaptive-tile] Crop sizes applied: min={min_w}x{min_h}, max={max_w}x{max_h}"
+            )
 
-                # For distributed training: use uniform crop size across all cameras
-                # Find max crop dimensions to ensure all cameras have same size
-                if visible_train:
-                    max_width = max(crop.width for _, crop in visible_train)
-                    max_height = max(crop.height for _, crop in visible_train)
-                    utils.print_rank_0(
-                        f"[adaptive-tile] Uniform crop size: {max_width}x{max_height}"
-                    )
+            # Store crop info for reference (crop already applied during loading)
+            for idx, crop, _ in visible_cam_crops:
+                self.camera_crops[idx] = crop
 
-                    # Apply uniform-sized crops to all cameras
-                    for new_idx, (old_idx, crop) in enumerate(visible_train):
-                        self.camera_crops[new_idx] = crop
-                        # Expand crop to uniform size (center the original crop in the larger region)
-                        uniform_crop = expand_crop_to_size(
-                            crop, max_width, max_height,
-                            self.train_cameras[new_idx].image_width,
-                            self.train_cameras[new_idx].image_height
-                        )
-                        apply_crop_to_camera(self.train_cameras[new_idx], uniform_crop)
-
-                    # Update global image size to match cropped size
-                    utils.set_img_size(max_height, max_width)
-                    utils.print_rank_0(
-                        f"[adaptive-tile] Updated global image size to {max_width}x{max_height}"
-                    )
-
+            # Print actual loaded camera sizes
+            for idx, cam in enumerate(self.train_cameras):
                 utils.print_rank_0(
-                    f"[adaptive-tile] Visible train cameras: {len(scene_info.train_cameras)} -> {len(self.train_cameras)}"
+                    f"[adaptive-tile]   Camera {idx+1} ({cam.image_name}): loaded as {cam.image_width}x{cam.image_height}"
                 )
-                log_file.write(
-                    f"[adaptive-tile] Visible train cameras: {len(visible_train)}\n"
-                )
+
+            # Set global image size to max crop size (for any code that needs it)
+            utils.set_img_size(max_h, max_w)
+            utils.print_rank_0(
+                f"[adaptive-tile] Global image size set to max: {max_w}x{max_h}"
+            )
 
         if self.loaded_iter:
             self.gaussians.load_ply(

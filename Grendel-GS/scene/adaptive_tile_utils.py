@@ -53,6 +53,14 @@ class TileBBox:
         )
         return mask
 
+    def contains_point(self, point: np.ndarray) -> bool:
+        """Check if a single point is inside the bounding box."""
+        return (
+            self.x_min <= point[0] <= self.x_max and
+            self.y_min <= point[1] <= self.y_max and
+            self.z_min <= point[2] <= self.z_max
+        )
+
     def split(self) -> Tuple["TileBBox", "TileBBox"]:
         """Split the tile along the longest axis."""
         dx = self.x_max - self.x_min
@@ -199,19 +207,20 @@ def filter_point_cloud(points: np.ndarray, colors: np.ndarray, normals: np.ndarr
 
 
 def project_points_to_camera(points_3d: np.ndarray,
-                             view_matrix: np.ndarray,
-                             proj_matrix: np.ndarray,
+                             full_proj_transform: np.ndarray,
                              img_width: int,
-                             img_height: int) -> Tuple[np.ndarray, np.ndarray]:
+                             img_height: int,
+                             ndc_limit: float = 3.0) -> Tuple[np.ndarray, np.ndarray]:
     """
     Project 3D points to 2D image coordinates.
 
     Args:
         points_3d: (N, 3) array of 3D points
-        view_matrix: (4, 4) world-to-camera matrix
-        proj_matrix: (4, 4) projection matrix
+        full_proj_transform: (4, 4) combined world-view-projection matrix
         img_width: Image width
         img_height: Image height
+        ndc_limit: Maximum allowed NDC coordinate (points outside are invalid).
+                   NDC of 1.0 = edge of image, 3.0 = 3x image size away (generous margin)
 
     Returns:
         Tuple of (2D points, valid mask)
@@ -220,21 +229,20 @@ def project_points_to_camera(points_3d: np.ndarray,
     N = points_3d.shape[0]
     points_h = np.concatenate([points_3d, np.ones((N, 1))], axis=1)  # (N, 4)
 
-    # Transform to camera space
-    points_cam = points_h @ view_matrix.T  # (N, 4)
-
-    # Project to clip space
-    points_clip = points_cam @ proj_matrix.T  # (N, 4)
+    # Project directly to clip space using full_proj_transform
+    # full_proj_transform = Rt.T @ P.T, so:
+    # points_h @ full_proj_transform = points_h @ Rt.T @ P.T (correct order)
+    points_clip = points_h @ full_proj_transform  # (N, 4)
 
     # Perspective divide (check for points behind camera)
     w = points_clip[:, 3:4]
     valid_mask = (w[:, 0] > 0.001)  # Points in front of camera
 
-    # Normalize to NDC
+    # Normalize to NDC (only for valid points)
     points_ndc = np.zeros((N, 2))
     points_ndc[valid_mask] = points_clip[valid_mask, :2] / w[valid_mask]
 
-    # Convert to pixel coordinates
+    # Convert to pixel coordinates (no NDC filtering - just project and clamp later)
     points_2d = np.zeros((N, 2))
     points_2d[:, 0] = (points_ndc[:, 0] + 1.0) * 0.5 * img_width
     points_2d[:, 1] = (points_ndc[:, 1] + 1.0) * 0.5 * img_height
@@ -242,53 +250,258 @@ def project_points_to_camera(points_3d: np.ndarray,
     return points_2d, valid_mask
 
 
+@dataclass
+class ProjectionDebugInfo:
+    """Debug info for point projection."""
+    num_valid_points: int
+    raw_x_min: float
+    raw_x_max: float
+    raw_y_min: float
+    raw_y_max: float
+
+
+def get_camera_position_from_RT(R: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """
+    Get camera position in world coordinates from R and T.
+
+    The world-view transform Rt has:
+    - Rt[:3, :3] = R.T
+    - Rt[:3, 3] = T
+
+    Camera position in world space = -R @ T
+
+    Args:
+        R: (3, 3) rotation matrix
+        T: (3,) translation vector
+
+    Returns:
+        (3,) camera position in world coordinates
+    """
+    return -R @ T
+
+
 def compute_tile_crop_for_camera(tile_bbox: TileBBox,
-                                  view_matrix: np.ndarray,
-                                  proj_matrix: np.ndarray,
+                                  full_proj_transform: np.ndarray,
                                   img_width: int,
                                   img_height: int,
-                                  margin: int = 100) -> Optional[CropRegion]:
+                                  margin: int = 100,
+                                  points_in_tile: np.ndarray = None,
+                                  return_debug_info: bool = False,
+                                  ndc_limit: float = 1.0,
+                                  camera_position: np.ndarray = None) -> Optional[CropRegion]:
     """
     Compute the crop region for a tile in a camera's view.
 
+    NEW ALGORITHM (efficient):
+    1. Project only the 8 corners of the tile bounding box
+    2. Use min/max of projected corners as crop region
+    3. Error if camera is inside the bounding box
+
     Args:
         tile_bbox: 3D bounding box of the tile
-        view_matrix: (4, 4) world-to-camera matrix
-        proj_matrix: (4, 4) projection matrix
+        full_proj_transform: (4, 4) combined world-view-projection matrix
         img_width: Image width
         img_height: Image height
         margin: Extra margin around the projected bbox (in pixels)
+        points_in_tile: DEPRECATED - no longer used, kept for API compatibility
+        return_debug_info: If True, return (crop, debug_info) tuple
+        ndc_limit: Maximum allowed NDC coordinate
+        camera_position: (3,) camera position in world coordinates (required for inside check)
 
     Returns:
         CropRegion if tile is visible, None otherwise
+        If return_debug_info is True, returns (CropRegion, ProjectionDebugInfo) or (None, None)
     """
-    # Get 8 corners of the bbox
-    corners = tile_bbox.get_corners()
+    # Check if camera is inside the bounding box
+    if camera_position is not None:
+        if tile_bbox.contains_point(camera_position):
+            raise RuntimeError(
+                f"Camera is inside the tile bounding box! "
+                f"Camera position: ({camera_position[0]:.2f}, {camera_position[1]:.2f}, {camera_position[2]:.2f}), "
+                f"Tile bbox: X[{tile_bbox.x_min:.2f}, {tile_bbox.x_max:.2f}], "
+                f"Y[{tile_bbox.y_min:.2f}, {tile_bbox.y_max:.2f}], "
+                f"Z[{tile_bbox.z_min:.2f}, {tile_bbox.z_max:.2f}]. "
+                f"This case is not supported."
+            )
 
-    # Project to 2D
+    # Get 8 corners of the bounding box
+    corners = tile_bbox.get_corners()  # (8, 3)
+
+    # Project corners to 2D
     corners_2d, valid_mask = project_points_to_camera(
-        corners, view_matrix, proj_matrix, img_width, img_height
+        corners, full_proj_transform, img_width, img_height, ndc_limit=ndc_limit
     )
 
     # Need at least one valid corner
     if not np.any(valid_mask):
+        if return_debug_info:
+            return None, None
         return None
 
     # Get bounding box of valid projected corners
     valid_corners = corners_2d[valid_mask]
-    x_min = int(np.floor(valid_corners[:, 0].min())) - margin
-    y_min = int(np.floor(valid_corners[:, 1].min())) - margin
-    x_max = int(np.ceil(valid_corners[:, 0].max())) + margin
-    y_max = int(np.ceil(valid_corners[:, 1].max())) + margin
+    raw_x_min = valid_corners[:, 0].min()
+    raw_y_min = valid_corners[:, 1].min()
+    raw_x_max = valid_corners[:, 0].max()
+    raw_y_max = valid_corners[:, 1].max()
+
+    x_min = int(np.floor(raw_x_min)) - margin
+    y_min = int(np.floor(raw_y_min)) - margin
+    x_max = int(np.ceil(raw_x_max)) + margin
+    y_max = int(np.ceil(raw_y_max)) + margin
 
     crop = CropRegion(x_min, y_min, x_max, y_max)
 
+    debug_info = ProjectionDebugInfo(
+        num_valid_points=int(np.sum(valid_mask)),
+        raw_x_min=float(raw_x_min),
+        raw_x_max=float(raw_x_max),
+        raw_y_min=float(raw_y_min),
+        raw_y_max=float(raw_y_max),
+    )
+
     # Check if crop overlaps with image
     if not crop.is_valid(img_width, img_height):
+        if return_debug_info:
+            return None, debug_info
         return None
 
     # Clamp to image bounds
-    return crop.clamp(img_width, img_height)
+    clamped = crop.clamp(img_width, img_height)
+    if return_debug_info:
+        return clamped, debug_info
+    return clamped
+
+
+def build_full_proj_transform(R: np.ndarray, T: np.ndarray,
+                               fov_x: float, fov_y: float,
+                               width: int, height: int,
+                               znear: float = 0.01, zfar: float = 100.0) -> np.ndarray:
+    """
+    Build full_proj_transform from camera parameters (R, T, FoV).
+
+    Uses the exact same formula as Grendel-GS's getWorld2View2 and getProjectionMatrix.
+
+    Args:
+        R: (3, 3) rotation matrix (camera orientation)
+        T: (3,) translation vector (camera position)
+        fov_x: horizontal field of view in radians
+        fov_y: vertical field of view in radians
+        width: image width
+        height: image height
+        znear: near clipping plane
+        zfar: far clipping plane
+
+    Returns:
+        (4, 4) full projection transform matrix
+    """
+    import math
+
+    # Build world_view_transform using getWorld2View2 formula
+    # (with translate=[0,0,0] and scale=1.0)
+    Rt = np.zeros((4, 4))
+    Rt[:3, :3] = R.T  # transpose of R
+    Rt[:3, 3] = T
+    Rt[3, 3] = 1.0
+    # Note: getWorld2View2 does C2W = inv(Rt), cam_center = (cam_center + translate) * scale,
+    # C2W[:3, 3] = cam_center, Rt = inv(C2W). With translate=0 and scale=1, this is identity transform.
+    # So Rt stays as is.
+
+    # Build projection matrix using getProjectionMatrix formula (EXACTLY)
+    tanHalfFovY = math.tan(fov_y / 2)
+    tanHalfFovX = math.tan(fov_x / 2)
+
+    top = tanHalfFovY * znear
+    bottom = -top
+    right = tanHalfFovX * znear
+    left = -right
+
+    z_sign = 1.0
+
+    P = np.zeros((4, 4))
+    P[0, 0] = 2.0 * znear / (right - left)
+    P[1, 1] = 2.0 * znear / (top - bottom)
+    P[0, 2] = (right + left) / (right - left)
+    P[1, 2] = (top + bottom) / (top - bottom)
+    P[3, 2] = z_sign
+    P[2, 2] = z_sign * zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+
+    # Match cameras.py convention:
+    # world_view_transform = Rt.T
+    # projection_matrix = P.T
+    # full_proj_transform = world_view_transform @ projection_matrix = Rt.T @ P.T
+    world_view_T = Rt.T
+    proj_T = P.T
+    full_proj = world_view_T @ proj_T
+
+    return full_proj
+
+
+def compute_visible_caminfos(tile_bbox: TileBBox,
+                              cam_infos: List,
+                              margin: int = 100,
+                              points: np.ndarray = None,
+                              return_debug_info: bool = False,
+                              ndc_limit: float = 1.0) -> List[Tuple[int, CropRegion]]:
+    """
+    Compute which CamInfos can see the tile (without loading images).
+
+    NEW ALGORITHM:
+    - Projects only the 8 corners of the tile bounding box (O(1) per camera)
+    - Uses min/max of projected corners as crop region
+    - Errors if camera is inside the bounding box
+
+    Args:
+        tile_bbox: 3D bounding box of the tile
+        cam_infos: List of CamInfo objects (R, T, FovX, FovY, width, height)
+        margin: Extra margin around the projected bbox (in pixels)
+        points: DEPRECATED - no longer used, kept for API compatibility
+        return_debug_info: If True, include ProjectionDebugInfo in results.
+        ndc_limit: Maximum allowed NDC coordinate
+
+    Returns:
+        List of (camera_index, crop_region) for visible cameras
+        If return_debug_info is True, returns List of (camera_index, crop_region, debug_info)
+    """
+    visible = []
+
+    for idx, cam_info in enumerate(cam_infos):
+        R = np.array(cam_info.R)
+        T = np.array(cam_info.T)
+
+        # Compute camera position in world coordinates
+        camera_position = get_camera_position_from_RT(R, T)
+
+        # Build full_proj_transform from CamInfo
+        full_proj = build_full_proj_transform(
+            R=R,
+            T=T,
+            fov_x=cam_info.FovX,
+            fov_y=cam_info.FovY,
+            width=cam_info.width,
+            height=cam_info.height
+        )
+
+        if return_debug_info:
+            crop, debug = compute_tile_crop_for_camera(
+                tile_bbox, full_proj, cam_info.width, cam_info.height, margin,
+                return_debug_info=True,
+                ndc_limit=ndc_limit,
+                camera_position=camera_position
+            )
+            if crop is not None:
+                visible.append((idx, crop, debug))
+        else:
+            crop = compute_tile_crop_for_camera(
+                tile_bbox, full_proj, cam_info.width, cam_info.height, margin,
+                ndc_limit=ndc_limit,
+                camera_position=camera_position
+            )
+            if crop is not None:
+                visible.append((idx, crop))
+
+    return visible
 
 
 def compute_visible_cameras_and_crops(tile_bbox: TileBBox,
@@ -299,7 +512,7 @@ def compute_visible_cameras_and_crops(tile_bbox: TileBBox,
 
     Args:
         tile_bbox: 3D bounding box of the tile
-        cameras: List of camera objects with view_matrix, proj_matrix, width, height
+        cameras: List of camera objects with full_proj_transform, width, height
         margin: Extra margin around the projected bbox (in pixels)
 
     Returns:
@@ -308,22 +521,18 @@ def compute_visible_cameras_and_crops(tile_bbox: TileBBox,
     visible = []
 
     for idx, cam in enumerate(cameras):
-        # Get camera matrices (convert from torch if needed)
-        if hasattr(cam, 'world_view_transform'):
-            view_matrix = cam.world_view_transform.cpu().numpy()
-        else:
-            view_matrix = np.array(cam.view_matrix)
-
+        # Get full_proj_transform (combined world-view-projection matrix)
+        # full_proj_transform = world_view_transform @ projection_matrix
         if hasattr(cam, 'full_proj_transform'):
-            proj_matrix = cam.full_proj_transform.cpu().numpy()
+            full_proj_transform = cam.full_proj_transform.cpu().numpy()
         else:
-            proj_matrix = np.array(cam.proj_matrix)
+            raise ValueError(f"Camera {idx} does not have full_proj_transform attribute")
 
         img_width = cam.image_width if hasattr(cam, 'image_width') else cam.width
         img_height = cam.image_height if hasattr(cam, 'image_height') else cam.height
 
         crop = compute_tile_crop_for_camera(
-            tile_bbox, view_matrix, proj_matrix, img_width, img_height, margin
+            tile_bbox, full_proj_transform, img_width, img_height, margin
         )
 
         if crop is not None:

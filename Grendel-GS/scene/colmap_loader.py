@@ -195,9 +195,8 @@ def read_intrinsics_text(path):
                 elems = line.split()
                 camera_id = int(elems[0])
                 model = elems[1]
-                assert (
-                    model == "PINHOLE"
-                ), "While the loader support other types, the rest of the code assumes PINHOLE"
+                # Note: readColmapCameras in dataset_readers.py supports
+                # PINHOLE, SIMPLE_PINHOLE, OPENCV, SIMPLE_RADIAL, RADIAL
                 width = int(elems[2])
                 height = int(elems[3])
                 params = np.array(tuple(map(float, elems[4:])))

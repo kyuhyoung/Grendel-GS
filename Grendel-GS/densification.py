@@ -30,7 +30,7 @@ def densification(iteration, scene, gaussians, batched_screenspace_pkg):
             assert (
                 args.stop_update_param == False
             ), "stop_update_param must be false for densification; because it is a flag for debugging."
-            # utils.print_rank_0("iteration: {}, bsz: {}, update_interval: {}, update_residual: {}".format(iteration, args.bsz, args.densification_interval, 0))
+            utils.print_rank_0("[densification] iteration: {}, bsz: {}, update_interval: {}".format(iteration, args.bsz, args.densification_interval))
 
             timers.start("densify_and_prune")
             size_threshold = 20 if iteration > args.opacity_reset_interval else None
@@ -126,7 +126,7 @@ def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
             assert (
                 args.stop_update_param == False
             ), "stop_update_param must be false for densification; because it is a flag for debugging."
-            # utils.print_rank_0("iteration: {}, bsz: {}, update_interval: {}, update_residual: {}".format(iteration, args.bsz, args.densification_interval, 0))
+            utils.print_rank_0("[densification] iteration: {}, bsz: {}, update_interval: {}".format(iteration, args.bsz, args.densification_interval))
 
             timers.start("densify_and_prune")
             size_threshold = 20 if iteration > args.opacity_reset_interval else None

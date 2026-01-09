@@ -53,6 +53,112 @@ EXIT_CODE_SUCCESS = 0
 EXIT_CODE_OOM = 42  # Special exit code to signal OOM to wrapper script
 
 
+# ============================================================================
+# GPU Memory Logging for OOM Diagnosis
+# ============================================================================
+
+class GPUMemoryTracker:
+    """Track GPU memory usage and current operation for OOM diagnosis."""
+
+    def __init__(self):
+        self.current_operation = "initialization"
+        self.memory_log = []
+        self.enabled = True
+
+    def set_operation(self, operation: str):
+        """Set the current operation being performed."""
+        self.current_operation = operation
+
+    def log_memory(self, label: str = None, force: bool = False):
+        """Log current GPU memory usage."""
+        if not self.enabled and not force:
+            return
+
+        if not torch.cuda.is_available():
+            return
+
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # GB
+
+        entry = {
+            "operation": self.current_operation,
+            "label": label or self.current_operation,
+            "allocated_gb": allocated,
+            "reserved_gb": reserved,
+            "max_allocated_gb": max_allocated,
+        }
+        self.memory_log.append(entry)
+
+        if force or (label and "OOM" in label.upper()):
+            utils.print_rank_0(
+                f"[GPU-MEM] {entry['label']}: "
+                f"alloc={allocated:.2f}GB, reserved={reserved:.2f}GB, max={max_allocated:.2f}GB"
+            )
+
+    def get_memory_summary(self) -> str:
+        """Get a summary of memory usage for OOM diagnosis."""
+        if not torch.cuda.is_available():
+            return "CUDA not available"
+
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+
+        # Get device properties
+        device = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device)
+        total_memory = props.total_memory / 1024**3
+
+        summary = [
+            f"\n{'='*60}",
+            f"GPU MEMORY ANALYSIS (OOM occurred during: {self.current_operation})",
+            f"{'='*60}",
+            f"  Device: {props.name} (GPU {device})",
+            f"  Total GPU Memory: {total_memory:.2f} GB",
+            f"  Currently Allocated: {allocated:.2f} GB ({allocated/total_memory*100:.1f}%)",
+            f"  Reserved by PyTorch: {reserved:.2f} GB ({reserved/total_memory*100:.1f}%)",
+            f"  Peak Allocated: {max_allocated:.2f} GB ({max_allocated/total_memory*100:.1f}%)",
+            f"  Free (estimated): {total_memory - reserved:.2f} GB",
+            f"{'='*60}",
+        ]
+
+        # Add recent memory log
+        if self.memory_log:
+            summary.append("Recent Memory Usage:")
+            for entry in self.memory_log[-10:]:  # Last 10 entries
+                summary.append(
+                    f"  [{entry['operation']}] {entry['label']}: {entry['allocated_gb']:.2f}GB"
+                )
+            summary.append(f"{'='*60}")
+
+        return "\n".join(summary)
+
+    def reset_peak(self):
+        """Reset peak memory stats."""
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+
+# Global memory tracker instance
+_memory_tracker = GPUMemoryTracker()
+
+
+def get_memory_tracker() -> GPUMemoryTracker:
+    """Get the global memory tracker instance."""
+    return _memory_tracker
+
+
+def log_gpu_memory(label: str = None, force: bool = False):
+    """Convenience function to log GPU memory."""
+    _memory_tracker.log_memory(label, force)
+
+
+def set_current_operation(operation: str):
+    """Set the current operation for OOM tracking."""
+    _memory_tracker.set_operation(operation)
+
+
 def _is_oom_error(exception: BaseException) -> bool:
     """Check if an exception is a CUDA out of memory error."""
     return isinstance(exception, RuntimeError) and (
@@ -67,6 +173,9 @@ def handle_adaptive_tile_oom(
     scene: Scene,
     iteration: int,
     log_file,
+    num_cameras: int = 0,
+    total_pixels: int = 0,
+    total_cameras_in_tile: int = 0,
 ):
     """
     Handle OOM in adaptive tile mode by splitting the tile and saving state.
@@ -84,6 +193,9 @@ def handle_adaptive_tile_oom(
         scene: Scene object with tile_bbox
         iteration: Current iteration
         log_file: Log file handle
+        num_cameras: Number of cameras in current batch
+        total_pixels: Total pixels across all cameras in batch
+        total_cameras_in_tile: Total number of cameras for this tile (C)
     """
     if not getattr(args, "adaptive_tile_enabled", False):
         return False  # Not in adaptive tile mode
@@ -93,11 +205,88 @@ def handle_adaptive_tile_oom(
         return False
 
     tile_id = getattr(args, "tile_id", "unknown")
-    tile_output_dir = Path(getattr(args, "tile_output_dir", args.model_path))
+    tile_output_dir = getattr(args, "tile_output_dir", "") or args.model_path
+    tile_output_dir = Path(tile_output_dir)
     tile_output_dir.mkdir(parents=True, exist_ok=True)
 
-    utils.print_rank_0(f"\n[adaptive-tile] OOM detected on tile {tile_id} at iteration {iteration}")
+    # Get memory tracker for detailed analysis
+    memory_tracker = get_memory_tracker()
+
+    utils.print_rank_0("\n" + "!" * 60)
+    utils.print_rank_0("!!!  GPU OOM DETECTED  !!!")
+    utils.print_rank_0("!" * 60)
+
+    # Print memory analysis
+    utils.print_rank_0(memory_tracker.get_memory_summary())
+
+    utils.print_rank_0(f"[adaptive-tile] Tile: {tile_id}, Iteration: {iteration}")
     log_file.write(f"[adaptive-tile] OOM detected on tile {tile_id} at iteration {iteration}\n")
+    log_file.write(memory_tracker.get_memory_summary() + "\n")
+
+    # Show current tile info
+    dx = tile_bbox.x_max - tile_bbox.x_min
+    dy = tile_bbox.y_max - tile_bbox.y_min
+    dz = tile_bbox.z_max - tile_bbox.z_min
+    utils.print_rank_0(f"[adaptive-tile] Current tile size: X={dx:.2f}, Y={dy:.2f}, Z={dz:.2f}")
+
+    # Show OOM cause analysis
+    num_gaussians = gaussians.get_xyz.shape[0] if gaussians.get_xyz is not None else 0
+    utils.print_rank_0(f"\n[OOM Cause Analysis]")
+    utils.print_rank_0(f"  Failed during: {memory_tracker.current_operation}")
+    utils.print_rank_0(f"  Iteration: {iteration}")
+    utils.print_rank_0(f"  Gaussians: {num_gaussians:,}")
+    if num_cameras > 0:
+        utils.print_rank_0(f"  Cameras in batch: {num_cameras}")
+        utils.print_rank_0(f"  Total cameras (C): {num_cameras}")
+    if total_pixels > 0:
+        utils.print_rank_0(f"  Total pixels: {total_pixels:,} ({total_pixels/1e6:.1f}M)")
+        # Estimate memory for rendered image (float32 RGB)
+        estimated_img_mem = total_pixels * 3 * 4 / 1024**3  # GB
+        utils.print_rank_0(f"  Estimated image memory: {estimated_img_mem:.2f} GB")
+    # Estimate gaussian memory (rough: ~200 bytes per gaussian for all attributes)
+    estimated_gauss_mem = num_gaussians * 200 / 1024**3  # GB
+    utils.print_rank_0(f"  Estimated gaussian memory: {estimated_gauss_mem:.2f} GB")
+
+    # Analyze likely OOM cause based on iteration vs camera count and densification
+    densify_from = getattr(args, 'densify_from_iter', 500)
+    densify_interval = getattr(args, 'densification_interval', 100)
+    first_densify_iter = densify_from + densify_interval
+    C = total_cameras_in_tile if total_cameras_in_tile > 0 else num_cameras
+
+    utils.print_rank_0(f"\n[OOM Cause Diagnosis]")
+    utils.print_rank_0(f"  Iteration: {iteration}")
+    utils.print_rank_0(f"  Total cameras in tile (C): {C}")
+    utils.print_rank_0(f"  First densification at: ~{first_densify_iter}")
+
+    if C > 0 and iteration <= C:
+        # First cycle through cameras
+        likely_cause = "SSIM on large image (first pass through cameras)"
+        utils.print_rank_0(f"  Iteration({iteration}) <= C({C}): Still in first camera cycle")
+        utils.print_rank_0(f"  --> Likely cause: {likely_cause}")
+    elif iteration <= first_densify_iter:
+        # After first cycle but before densification
+        likely_cause = "Memory fragmentation or leak (same images succeeded before, no densification yet)"
+        utils.print_rank_0(f"  C({C}) < Iteration({iteration}) <= first_densify({first_densify_iter}): Before densification")
+        utils.print_rank_0(f"  --> Likely cause: {likely_cause}")
+    else:
+        # After densification started
+        likely_cause = "Increased gaussians from densification"
+        utils.print_rank_0(f"  Iteration({iteration}) > first_densify({first_densify_iter}): Densification has occurred")
+        utils.print_rank_0(f"  --> Likely cause: {likely_cause}")
+
+    # Determine split axis
+    if dx >= dy and dx >= dz:
+        split_axis = "X"
+        mid = (tile_bbox.x_min + tile_bbox.x_max) / 2
+        utils.print_rank_0(f"[adaptive-tile] Splitting along {split_axis} axis (longest): mid={mid:.2f}")
+    elif dy >= dz:
+        split_axis = "Y"
+        mid = (tile_bbox.y_min + tile_bbox.y_max) / 2
+        utils.print_rank_0(f"[adaptive-tile] Splitting along {split_axis} axis (longest): mid={mid:.2f}")
+    else:
+        split_axis = "Z"
+        mid = (tile_bbox.z_min + tile_bbox.z_max) / 2
+        utils.print_rank_0(f"[adaptive-tile] Splitting along {split_axis} axis (longest): mid={mid:.2f}")
 
     # Split the tile
     tile_a, tile_b = tile_bbox.split()
@@ -124,9 +313,9 @@ def handle_adaptive_tile_oom(
     tile_b_id = f"tile_{tile_num * 2 + 2:04d}"
 
     # Save tile A gaussians as PLY (this half is "done" for now)
-    ply_dir = tile_output_dir / "tiles"
-    ply_dir.mkdir(parents=True, exist_ok=True)
-    ply_path_a = ply_dir / f"{tile_a_id}.ply"
+    # tile_output_dir is already the tiles directory
+    tile_output_dir.mkdir(parents=True, exist_ok=True)
+    ply_path_a = tile_output_dir / f"{tile_a_id}.ply"
 
     # Create a filtered gaussian model for tile A and save
     # Note: This is a simplified save - may need refinement for full state
@@ -135,7 +324,8 @@ def handle_adaptive_tile_oom(
         gaussians.save_ply_masked(str(ply_path_a), mask_a)
 
     # Save state for wrapper script to handle
-    state_file = Path(getattr(args, "tile_state_file", tile_output_dir / "adaptive_tile_state.json"))
+    state_file = getattr(args, "tile_state_file", "") or (tile_output_dir / "adaptive_tile_state.json")
+    state_file = Path(state_file)
 
     oom_state = {
         "oom_occurred": True,
@@ -443,11 +633,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     utils.log_cpu_memory_usage("at the beginning of training")
     start_from_this_iteration = 1
 
+    # Initialize memory tracker
+    memory_tracker = get_memory_tracker()
+    set_current_operation("scene_initialization")
+    log_gpu_memory("training_start", force=True)
+
     # Init parameterized scene
     gaussians = GaussianModel(dataset_args.sh_degree)
 
     with torch.no_grad():
+        set_current_operation("scene_loading")
         scene = Scene(args, gaussians)
+        log_gpu_memory("after_scene_load", force=True)
 
         if args.start_checkpoint != "":
             model_params, start_from_this_iteration = utils.load_checkpoint(args)
@@ -522,6 +719,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             start_from_this_iteration, opt_args.iterations + 1, args.bsz
         ):
             current_iteration = iteration
+            # Debug logging for first few iterations
+            debug_first_iters = iteration <= 3
+
+            # Reset operation tracker for this iteration
+            set_current_operation("iteration_start")
+
+            if debug_first_iters:
+                utils.print_rank_0(f"\n[DEBUG] ===== Iteration {iteration} START =====")
+                # Print key stats for OOM diagnosis
+                num_gaussians = gaussians.get_xyz.shape[0] if gaussians.get_xyz is not None else 0
+                utils.print_rank_0(f"[DEBUG] [{iteration}] Gaussians: {num_gaussians:,}")
+
             # Step Initialization
             tile_loss_raw = None
             tile_info = tile_manager.prepare_for_iteration(iteration, gaussians, opt_args)
@@ -538,7 +747,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 })
             if iteration // args.bsz % 30 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-            progress_bar.update(args.bsz)
+            # NOTE: progress_bar.update() moved to end of iteration (after backward pass succeeds)
             utils.set_cur_iter(iteration)
             gaussians.update_learning_rate(iteration)
             num_trained_batches += 1
@@ -573,22 +782,63 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             else:
                 batched_cameras = train_dataset.get_batched_cameras(args.bsz)
 
+            # Set image size for current camera(s) - critical for adaptive tile with varying crop sizes
+            # All ranks must call this with the same values to stay synchronized
+            if len(batched_cameras) == 1:
+                cam = batched_cameras[0]
+                utils.set_img_size(cam.image_height, cam.image_width)
+            elif len(batched_cameras) > 1:
+                # For batch size > 1, verify all cameras have same dimensions
+                first_cam = batched_cameras[0]
+                for cam in batched_cameras[1:]:
+                    if cam.image_width != first_cam.image_width or cam.image_height != first_cam.image_height:
+                        raise RuntimeError(
+                            f"Batch contains cameras with different sizes: "
+                            f"{first_cam.image_name}={first_cam.image_width}x{first_cam.image_height} vs "
+                            f"{cam.image_name}={cam.image_width}x{cam.image_height}. "
+                            f"Use --bsz 1 for adaptive tile training with varying crop sizes."
+                        )
+                utils.set_img_size(first_cam.image_height, first_cam.image_width)
+
+            # Track camera info for OOM analysis
+            current_num_cameras = len(batched_cameras)
+            current_total_pixels = sum(c.image_width * c.image_height for c in batched_cameras)
+
             with torch.no_grad():
                 # Prepare Workload division strategy
+                set_current_operation("prepare_strategies")
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] Preparing strategies...")
                 timers.start("prepare_strategies")
                 batched_strategies, gpuid2tasks = start_strategy_final(
                     batched_cameras, strategy_history
                 )
                 timers.stop("prepare_strategies")
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] Strategies prepared")
 
                 # Load ground-truth images to GPU
+                set_current_operation("load_images_to_gpu")
+                log_gpu_memory("before_load_images")
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] Loading cameras to GPU...")
+                    for i, cam in enumerate(batched_cameras):
+                        utils.print_rank_0(f"[DEBUG] [{iteration}]   Camera {i}: {cam.image_name} {cam.image_width}x{cam.image_height}")
                 timers.start("load_cameras")
                 load_camera_from_cpu_to_all_gpu(
                     batched_cameras, batched_strategies, gpuid2tasks
                 )
                 timers.stop("load_cameras")
+                log_gpu_memory("after_load_images")
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] Cameras loaded to GPU")
+
+            if debug_first_iters:
+                utils.print_rank_0(f"[DEBUG] [{iteration}] Starting rendering (backend={args.backend})...")
 
             if args.backend == "gsplat":
+                set_current_operation("gsplat_preprocess")
+                log_gpu_memory("before_gsplat_preprocess")
                 batched_screenspace_pkg = (
                     gsplat_distributed_preprocess3dgs_and_all2all_final(
                         batched_cameras,
@@ -599,14 +849,24 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         mode="train",
                     )
                 )
+                log_gpu_memory("after_gsplat_preprocess")
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] gsplat preprocess done, rendering...")
+                set_current_operation("gsplat_render")
+                log_gpu_memory("before_gsplat_render")
                 batched_image, batched_compute_locally = gsplat_render_final(
                     batched_screenspace_pkg, batched_strategies
                 )
+                log_gpu_memory("after_gsplat_render")
                 batch_statistic_collector = [
                     cuda_args["stats_collector"]
                     for cuda_args in batched_screenspace_pkg["batched_cuda_args"]
                 ]
             else:
+                set_current_operation("default_preprocess")
+                log_gpu_memory("before_preprocess")
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] About to call distributed_preprocess3dgs_and_all2all_final...")
                 batched_screenspace_pkg = distributed_preprocess3dgs_and_all2all_final(
                     batched_cameras,
                     gaussians,
@@ -615,14 +875,25 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     batched_strategies=batched_strategies,
                     mode="train",
                 )
+                log_gpu_memory("after_preprocess")
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] preprocess done, rendering...")
+                set_current_operation("default_render")
+                log_gpu_memory("before_render")
                 batched_image, batched_compute_locally = render_final(
                     batched_screenspace_pkg, batched_strategies
                 )
+                log_gpu_memory("after_render")
                 batch_statistic_collector = [
                     cuda_args["stats_collector"]
                     for cuda_args in batched_screenspace_pkg["batched_cuda_args"]
                 ]
 
+            if debug_first_iters:
+                utils.print_rank_0(f"[DEBUG] [{iteration}] Rendering done, computing loss...")
+
+            set_current_operation("loss_computation (L1+SSIM)")
+            log_gpu_memory("before_loss")
             loss_sum, batched_losses = batched_loss_computation(
                 batched_image,
                 batched_cameras,
@@ -630,15 +901,29 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 batched_strategies,
                 batch_statistic_collector,
             )
+            log_gpu_memory("after_loss")
 
+            if debug_first_iters:
+                utils.print_rank_0(f"[DEBUG] [{iteration}] Loss computed: {loss_sum.item():.6f}, starting backward...")
+
+            set_current_operation("backward")
+            log_gpu_memory("before_backward")
             timers.start("backward")
             loss_sum.backward()
             timers.stop("backward")
+            log_gpu_memory("after_backward")
             utils.check_initial_gpu_memory_usage("after backward")
+
+            if debug_first_iters:
+                utils.print_rank_0(f"[DEBUG] [{iteration}] Backward done")
 
             with torch.no_grad():
                 # Adjust workload division strategy.
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] Syncing for timer...")
                 globally_sync_for_timer()
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] Finishing strategy...")
                 timers.start("finish_strategy_final")
                 finish_strategy_final(
                     batched_cameras,
@@ -649,6 +934,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 timers.stop("finish_strategy_final")
 
                 # Sync losses in the batch
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] Syncing losses...")
                 timers.start("sync_loss_and_log")
                 batched_losses = torch.tensor(batched_losses, device="cuda")
                 if utils.DEFAULT_GROUP.size() > 1:
@@ -677,6 +964,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 log_file.write(log_string)
                 timers.stop("sync_loss_and_log")
 
+                if debug_first_iters:
+                    utils.print_rank_0(f"[DEBUG] [{iteration}] ===== Iteration {iteration} COMPLETE =====")
+
                 # Evaluation
                 end2end_timers.stop()
                 training_report(
@@ -692,12 +982,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
                 # Densification
                 if not tile_manager.enabled:
+                    set_current_operation("densification")
+                    log_gpu_memory("before_densification")
                     if args.backend == "gsplat":
                         gsplat_densification(
                             iteration, scene, gaussians, batched_screenspace_pkg
                         )
                     else:
                         densification(iteration, scene, gaussians, batched_screenspace_pkg)
+                    log_gpu_memory("after_densification")
 
                 if tile_loss_scheduler.enabled:
                     # Release heavy training buffers before running the auxiliary render.
@@ -804,6 +1097,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
             # Optimizer step
             if iteration < opt_args.iterations:
+                set_current_operation("optimizer_step")
+                log_gpu_memory("before_optimizer_step")
                 timers.start("optimizer_step")
 
                 if (
@@ -817,6 +1112,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 timers.stop("optimizer_step")
+                log_gpu_memory("after_optimizer_step")
                 utils.check_initial_gpu_memory_usage("after optimizer step")
 
             # Finish a iteration and clean up
@@ -829,6 +1125,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 nvtx.range_pop()
             if utils.check_enable_python_timer():
                 timers.printTimers(iteration, mode="sum")
+
+            # Update progress bar only after successful iteration (backward pass completed)
+            progress_bar.update(args.bsz)
             log_file.flush()
 
     except Exception as e:
@@ -841,15 +1140,35 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             gc.collect()
             torch.cuda.empty_cache()
 
+            # Get camera info if available
+            try:
+                oom_num_cameras = current_num_cameras
+                oom_total_pixels = current_total_pixels
+            except NameError:
+                oom_num_cameras = 0
+                oom_total_pixels = 0
+
+            # Get total cameras in tile from train_dataset
+            try:
+                oom_total_cameras_in_tile = len(train_dataset.cameras)
+            except (NameError, AttributeError):
+                oom_total_cameras_in_tile = 0
+
             # Handle the OOM by splitting tile
             handled = handle_adaptive_tile_oom(
-                gaussians, args, scene, current_iteration, log_file
+                gaussians, args, scene, current_iteration, log_file,
+                num_cameras=oom_num_cameras,
+                total_pixels=oom_total_pixels,
+                total_cameras_in_tile=oom_total_cameras_in_tile,
             )
 
             if handled:
                 utils.print_rank_0(f"[adaptive-tile] Exiting with code {EXIT_CODE_OOM} for wrapper to handle")
                 log_file.flush()
                 tile_manager.finalize(gaussians)
+                # Clear and close progress bar silently (don't print final state on OOM)
+                progress_bar.clear()
+                progress_bar.disable = True
                 progress_bar.close()
                 sys.exit(EXIT_CODE_OOM)
 
