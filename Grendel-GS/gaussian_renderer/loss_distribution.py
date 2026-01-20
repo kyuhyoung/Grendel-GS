@@ -2582,6 +2582,29 @@ def final_system_loss_computation(
         "local_loss_computation"
     )  # measure time before allreduce, so that we can get the real local time.
 
+    # DEBUG: Print loss details
+    cur_iter = utils.get_cur_iter()
+    total_loss = (1.0 - args.lambda_dssim) * Ll1 + args.lambda_dssim * (1.0 - ssim_loss)
+
+    # Print every 500 iterations OR when loss is suspicious (close to 0.2)
+    should_print = (cur_iter is not None and cur_iter % 500 == 0) or \
+                   (abs(total_loss.item() - 0.2) < 0.01)  # Loss ~ 0.2
+
+    if should_print and utils.LOCAL_RANK == 0:
+        render_min = local_image_rect.min().item()
+        render_max = local_image_rect.max().item()
+        render_mean = local_image_rect.mean().item()
+        render_nonzero = (local_image_rect > 0.001).sum().item()
+        render_total = local_image_rect.numel()
+        gt_min = local_image_rect_gt.min().item()
+        gt_max = local_image_rect_gt.max().item()
+        gt_mean = local_image_rect_gt.mean().item()
+        print(f"[loss-debug] iter={cur_iter} cam={viewpoint_cam.image_name}:", flush=True)
+        print(f"  L1={Ll1.item():.6f}, SSIM={ssim_loss.item():.6f}, Total={total_loss.item():.6f}", flush=True)
+        print(f"  Rendered: min={render_min:.4f}, max={render_max:.4f}, mean={render_mean:.4f}, nonzero={render_nonzero}/{render_total} ({100*render_nonzero/render_total:.1f}%)", flush=True)
+        print(f"  GT:       min={gt_min:.4f}, max={gt_max:.4f}, mean={gt_mean:.4f}", flush=True)
+        print(f"  Image size: {local_image_rect.shape}", flush=True)
+
     return Ll1, ssim_loss
 
 
@@ -2614,12 +2637,22 @@ def batched_loss_computation(
             batched_statistic_collector,
         )
     ):
+        # DEBUG: Print why Loss=0.2 occurs
+        cur_iter = utils.get_cur_iter()
+        if utils.LOCAL_RANK == 0 and cur_iter is not None and cur_iter % 100 == 0:
+            img_info = f"None" if image is None else (f"scalar" if len(image.shape) == 0 else f"shape={image.shape}")
+            print(f"[batched-loss-debug] iter={cur_iter} cam={camera.image_name}: image={img_info}, compute_locally={compute_locally}", flush=True)
+
         if image is None:  # This image is not rendered locally.
             loss = 0
             batched_losses.append([0.0, 0.0])
+            if utils.LOCAL_RANK == 0:
+                print(f"[loss-zero] iter={cur_iter} cam={camera.image_name}: image is None - Loss will be 0.2!", flush=True)
         elif len(image.shape) == 0:  # This image is not rendered locally.
             loss = image * 0
             batched_losses.append([loss, 0.0])
+            if utils.LOCAL_RANK == 0:
+                print(f"[loss-zero] iter={cur_iter} cam={camera.image_name}: image is scalar - Loss will be 0.2!", flush=True)
         else:
             Ll1, ssim_loss = final_system_loss_computation(
                 image, camera, compute_locally, strategy, statistic_collector

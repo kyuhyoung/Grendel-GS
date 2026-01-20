@@ -355,6 +355,8 @@ int CudaRasterizer::Rasterizer::preprocessForward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	bool debug,//raster_settings
+	const float proj_offset_x,  // off-center projection offset (2 * P[0,2])
+	const float proj_offset_y,  // off-center projection offset (2 * P[1,2])
 	const pybind11::dict &args)
 {
 	auto [global_rank, world_size, iteration, log_interval, device, zhx_debug, zhx_time, mode, dist_division_mode, log_folder] = prepareArgs(args);
@@ -408,7 +410,9 @@ int CudaRasterizer::Rasterizer::preprocessForward(
 		conic_opacity,
 		tile_grid,
 		tiles_touched_temp_buffer,
-		prefiltered
+		prefiltered,
+		proj_offset_x,
+		proj_offset_y
 	), debug)
 	timer.stop("10 preprocess");
 

@@ -588,6 +588,8 @@ def rasterization_inria_wrapper(
             campos=camera_center,
             prefiltered=False,
             debug=False,
+            proj_offset_x=0.0,  # centered projection (no crop)
+            proj_offset_y=0.0,
         )
 
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)

@@ -70,7 +70,14 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, cro
         FovY = 2 * math.atan(crop.height / (2 * focal_y))
 
     # may use cam_info.uid
-    if (
+    # If decompressed_image is already provided (from multiprocess loading), skip file I/O
+    if decompressed_image is not None:
+        gt_image = decompressed_image[:3, ...].contiguous()
+        loaded_mask = None
+        # Debug: confirm we're using the fast path (no file I/O)
+        if id == 0:
+            utils.print_rank_0(f"[loadCam] Using pre-loaded image (skipping file I/O), shape={tuple(gt_image.shape)}")
+    elif (
         (
             args.local_sampling
             and args.distributed_dataset_storage
@@ -98,7 +105,7 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, cro
             utils.print_rank_0(f"[loadCam] Camera {id+1}: orig={orig_size}, crop=({crop.x_min},{crop.y_min})-({crop.x_max},{crop.y_max}), after_crop={image.size}, resolution={resolution} (worker {worker_num})")
 
         resized_image_rgb = PILtoTorch(
-            image, resolution, args, log_file, decompressed_image=decompressed_image
+            image, resolution, args, log_file, decompressed_image=None
         )
         if args.time_image_loading:
             log_file.write(f"PILtoTorch image in {time.time() - start_time} seconds\n")
@@ -129,6 +136,8 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, cro
         uid=id,
         image_width=resolution[0],  # Pass explicit size for distributed storage
         image_height=resolution[1],
+        cx=getattr(cam_info, 'cx', None),  # Principal point from COLMAP
+        cy=getattr(cam_info, 'cy', None),
     )
 
 
@@ -285,6 +294,7 @@ def cameraList_from_camInfos(cam_infos, args, crops=None):
         decompressed_images = [None for _ in cam_infos]
 
     camera_list = []
+    camera_creation_start = time.time()
     for id, c in tqdm(
         enumerate(cam_infos), total=len(cam_infos), disable=(utils.LOCAL_RANK != 0),
         desc="Creating Camera objects"
@@ -302,6 +312,8 @@ def cameraList_from_camInfos(cam_infos, args, crops=None):
                 crop=crop,
             )
         )
+    camera_creation_elapsed = time.time() - camera_creation_start
+    utils.print_rank_0(f"[cameraList] Created {len(camera_list)} Camera objects in {camera_creation_elapsed:.2f}s ({camera_creation_elapsed/len(camera_list):.3f}s per camera)")
 
     if utils.DEFAULT_GROUP.size() > 1:
         torch.distributed.barrier(group=utils.DEFAULT_GROUP)

@@ -22,6 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 import utils.general_utils as utils
 import torch.distributed as dist
+from scene.adaptive_tile_utils import TileBBox
 
 lr_scale_fns = {
     "linear": lambda x: x,
@@ -416,13 +417,39 @@ class GaussianModel:
         return l
 
     def save_ply(
-        self, path
+        self, path, filter_bbox=None, local_only=False
     ):  # here, we should be in torch.no_grad() context. train.py ensures that.
+        # filter_bbox: optional TileBBox to save only gaussians within the bbox (applied after gather, or on local data if local_only)
+        # local_only: if True, skip distributed gather and save only this rank's local gaussians
+        #             (used during OOM recovery when other ranks may not be synchronized)
         args = utils.get_args()
         _xyz = _features_dc = _features_rest = _opacity = _scaling = _rotation = None
         utils.log_cpu_memory_usage("start save_ply")
         group = utils.DEFAULT_GROUP
-        if args.gaussians_distribution and not args.distributed_save:
+
+        # Log local gaussian count before gather
+        local_count = self._xyz.shape[0]
+        if filter_bbox is not None:
+            print(f"[save_ply] rank={group.rank()}, local gaussians={local_count:,}, filter_bbox={filter_bbox.to_string()}, local_only={local_only}", flush=True)
+        else:
+            print(f"[save_ply] rank={group.rank()}, local gaussians={local_count:,}, local_only={local_only}", flush=True)
+
+        # Local-only mode: skip gather and save each rank's local data independently
+        # Used during OOM recovery when distributed sync is not possible
+        if local_only:
+            _xyz = self._xyz
+            _features_dc = self._features_dc
+            _features_rest = self._features_rest
+            _opacity = self._opacity
+            _scaling = self._scaling
+            _rotation = self._rotation
+            # Add rank suffix to path for each rank's output
+            if path.endswith(".ply"):
+                path = path[:-4] + f"_rank{group.rank()}.ply"
+            else:
+                path = path + f"_rank{group.rank()}.ply"
+            print(f"[save_ply] LOCAL_ONLY mode: rank {group.rank()} saving to {path}", flush=True)
+        elif args.gaussians_distribution and not args.distributed_save:
             # gather all gaussians at rank 0
             def gather_uneven_tensors(tensor):
                 # gather size of tensors on different ranks
@@ -468,7 +495,11 @@ class GaussianModel:
             _rotation = gather_uneven_tensors(self._rotation)
 
             if group.rank() != 0:
-                return
+                return 0  # Only rank 0 saves and returns actual count
+
+            # Log gathered total (rank 0 only)
+            gathered_count = _xyz.shape[0]
+            print(f"[save_ply] rank=0 gathered total: {gathered_count:,} gaussians from {group.size()} GPUs", flush=True)
 
         elif args.gaussians_distribution and args.distributed_save:
             assert (
@@ -491,7 +522,7 @@ class GaussianModel:
                 )
         elif not args.gaussians_distribution:
             if group.rank() != 0:
-                return
+                return 0  # Only rank 0 saves and returns actual count
             _xyz = self._xyz
             _features_dc = self._features_dc
             _features_rest = self._features_rest
@@ -532,6 +563,21 @@ class GaussianModel:
         scale = _scaling.detach().cpu().numpy()
         rotation = _rotation.detach().cpu().numpy()
 
+        # Apply filter_bbox if provided (for saving subset of gaussians within a spatial region)
+        # This is computed after gather, so it works correctly with distributed training
+        if filter_bbox is not None:
+            before_filter = xyz.shape[0]
+            mask = filter_bbox.contains_points(xyz)
+            xyz = xyz[mask]
+            normals = normals[mask]
+            f_dc = f_dc[mask]
+            f_rest = f_rest[mask]
+            opacities = opacities[mask]
+            scale = scale[mask]
+            rotation = rotation[mask]
+            after_filter = xyz.shape[0]
+            print(f"[save_ply] filter_bbox applied: {before_filter:,} -> {after_filter:,} gaussians", flush=True)
+
         utils.log_cpu_memory_usage("after change gpu tensor to cpu numpy")
 
         dtype_full = [
@@ -551,57 +597,8 @@ class GaussianModel:
         PlyData([el]).write(path)
         utils.log_cpu_memory_usage("finish write ply file")
         # remark: max_radii2D, xyz_gradient_accum and denom are not saved here; they are save elsewhere.
-
-    def save_ply_masked(self, path, mask):
-        """
-        Save a subset of gaussians to PLY file based on a boolean mask.
-
-        Args:
-            path: Output PLY file path
-            mask: Boolean numpy array of shape (N,) indicating which gaussians to save
-        """
-        mkdir_p(os.path.dirname(path))
-
-        # Convert mask to numpy if needed
-        if isinstance(mask, torch.Tensor):
-            mask = mask.cpu().numpy()
-
-        with torch.no_grad():
-            xyz = self._xyz[mask].detach().cpu().numpy()
-            normals = np.zeros_like(xyz)
-            f_dc = (
-                self._features_dc[mask]
-                .detach()
-                .transpose(1, 2)
-                .flatten(start_dim=1)
-                .contiguous()
-                .cpu()
-                .numpy()
-            )
-            f_rest = (
-                self._features_rest[mask]
-                .detach()
-                .transpose(1, 2)
-                .flatten(start_dim=1)
-                .contiguous()
-                .cpu()
-                .numpy()
-            )
-            opacities = self._opacity[mask].detach().cpu().numpy()
-            scale = self._scaling[mask].detach().cpu().numpy()
-            rotation = self._rotation[mask].detach().cpu().numpy()
-
-        dtype_full = [
-            (attribute, "f4") for attribute in self.construct_list_of_attributes()
-        ]
-
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate(
-            (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
-        )
-        elements[:] = list(map(tuple, attributes))
-        el = PlyElement.describe(elements, "vertex")
-        PlyData([el]).write(path)
+        print(f"[save_ply] wrote {xyz.shape[0]:,} gaussians to {path}", flush=True)
+        return xyz.shape[0]  # Return the number of gaussians saved
 
     def reset_opacity(self):
         utils.LOG_FILE.write("Resetting opacity to 0.01\n")
@@ -746,16 +743,11 @@ class GaussianModel:
         # The above computation/memory is replicated on all ranks. Because initialization is small, it's ok.
         # Split the point cloud across the ranks.
 
+        total_gaussians = xyz.shape[0]
         if args.gaussians_distribution and utils.WORLD_SIZE > 1:
             chunk = xyz.shape[0] // utils.WORLD_SIZE + 1
             point_ind_l = chunk * utils.LOCAL_RANK
             point_ind_r = min(chunk * (utils.LOCAL_RANK + 1), xyz.shape[0])
-            # xyz = xyz[point_ind_l:point_ind_r].contiguous()
-            # features_dc = features_dc[point_ind_l:point_ind_r].contiguous()
-            # features_extra = features_extra[point_ind_l:point_ind_r].contiguous()
-            # scales = scales[point_ind_l:point_ind_r].contiguous()
-            # rots = rots[point_ind_l:point_ind_r].contiguous()
-            # opacities = opacities[point_ind_l:point_ind_r].contiguous()
 
             xyz = np.ascontiguousarray(xyz[point_ind_l:point_ind_r])
             features_dc = np.ascontiguousarray(features_dc[point_ind_l:point_ind_r])
@@ -765,6 +757,12 @@ class GaussianModel:
             scales = np.ascontiguousarray(scales[point_ind_l:point_ind_r])
             rots = np.ascontiguousarray(rots[point_ind_l:point_ind_r])
             opacities = np.ascontiguousarray(opacities[point_ind_l:point_ind_r])
+
+            local_gaussians = xyz.shape[0]
+            print(f"[load_raw_ply] rank={utils.LOCAL_RANK}, total={total_gaussians:,}, "
+                  f"chunk=[{point_ind_l:,}:{point_ind_r:,}], local={local_gaussians:,}", flush=True)
+        else:
+            print(f"[load_raw_ply] rank={utils.LOCAL_RANK}, total={total_gaussians:,} (no distribution)", flush=True)
 
         if args.drop_initial_3dgs_p > 0.0:
             # drop each point with probability args.drop_initial_3dgs_p
@@ -778,8 +776,12 @@ class GaussianModel:
 
         return xyz, features_dc, features_extra, opacities, scales, rots
 
-    def one_file_load_ply(self, folder):
-        path = os.path.join(folder, "point_cloud.ply")
+    def one_file_load_ply(self, folder, is_file_path=False):
+        if is_file_path:
+            path = folder  # folder is actually a direct file path
+        else:
+            path = os.path.join(folder, "point_cloud.ply")
+        print(f"[one_file_load_ply] rank={utils.LOCAL_RANK}, loading from: {path}", flush=True)
         xyz, features_dc, features_extra, opacities, scales, rots = self.load_raw_ply(
             path
         )
@@ -812,12 +814,29 @@ class GaussianModel:
         )
 
         self.active_sh_degree = self.max_sh_degree
+        print(f"[one_file_load_ply] rank={utils.LOCAL_RANK}, initialized {self._xyz.shape[0]:,} gaussians on GPU", flush=True)
 
-    def load_ply(self, path):
-        if os.path.exists(os.path.join(path, "point_cloud.ply")):
+    def load_ply(self, path, init_training_tensors=False):
+        """Load gaussians from PLY file(s).
+
+        Args:
+            path: Either a folder path (loads point_cloud.ply or distributed files)
+                  or a direct .ply file path
+            init_training_tensors: If True, initialize max_radii2D and sum_visible_count_in_one_batch
+                                   (needed for resuming training from a PLY file)
+        """
+        if path.endswith(".ply") and os.path.isfile(path):
+            # Direct PLY file path
+            self.one_file_load_ply(path, is_file_path=True)
+        elif os.path.exists(os.path.join(path, "point_cloud.ply")):
             self.one_file_load_ply(path)
         else:
             self.distributed_load_ply(path)
+
+        if init_training_tensors:
+            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+            self.sum_visible_count_in_one_batch = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+            print(f"[load_ply] rank={utils.LOCAL_RANK}, initialized training tensors (max_radii2D, sum_visible_count)", flush=True)
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}

@@ -274,6 +274,8 @@ class AdaptiveTileParams(ParamGroup):
         self.tile_bbox = ""
         # Tile identifier
         self.tile_id = ""
+        # Tile level (0 = full scene, higher = smaller tiles)
+        self.tile_level = 0
         # Output directory for tile results (PLY, checkpoint)
         self.tile_output_dir = ""
         # Enable adaptive tile mode
@@ -287,6 +289,9 @@ class AdaptiveTileParams(ParamGroup):
         # Pre-computed visible camera names (comma-separated)
         # If provided, Scene will use this instead of recomputing visibility
         self.visible_cameras = ""
+        # Path to pre-trained gaussians PLY file (for Category 3 OOM resume)
+        # If provided, Scene will initialize gaussians from this PLY instead of SfM points
+        self.pretrained_ply = ""
         super().__init__(parser, "Adaptive Tile Parameters")
 
 

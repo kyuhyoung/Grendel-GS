@@ -45,7 +45,9 @@ namespace FORWARD
 		float4* conic_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered,
+		const float proj_offset_x,  // off-center projection offset (2 * P[0,2])
+		const float proj_offset_y); // off-center projection offset (2 * P[1,2])
 
 	// Main rasterization method.
 	void render(

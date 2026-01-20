@@ -35,6 +35,67 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "Grendel-GS"))
 
+# OOM signal file (must match train_internal.py)
+OOM_SIGNAL_FILENAME = "oom_signal.json"
+
+
+def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str) -> int:
+    """
+    Merge multiple PLY files from distributed training into a single file.
+
+    When OOM occurs during distributed training, each rank saves its local gaussians
+    to separate files: {ply_prefix}_rank0.ply, {ply_prefix}_rank1.ply, etc.
+    This function merges them into a single PLY file.
+
+    Args:
+        ply_prefix: Path prefix for rank files (without _rank{N}.ply suffix)
+        num_ranks: Number of ranks that saved files
+        output_path: Path for the merged output file
+
+    Returns:
+        Total number of gaussians in merged file
+    """
+    try:
+        from plyfile import PlyData, PlyElement
+    except ImportError:
+        print("[merge_ply] ERROR: plyfile not installed, cannot merge PLY files", flush=True)
+        return 0
+
+    all_vertices = []
+    total_count = 0
+
+    for rank in range(num_ranks):
+        rank_file = f"{ply_prefix}_rank{rank}.ply"
+        if not Path(rank_file).exists():
+            print(f"[merge_ply] WARNING: Rank {rank} file not found: {rank_file}", flush=True)
+            continue
+
+        try:
+            plydata = PlyData.read(rank_file)
+            vertices = plydata['vertex']
+            count = len(vertices.data)
+            all_vertices.append(vertices.data)
+            total_count += count
+            print(f"[merge_ply] Read rank {rank}: {count:,} gaussians from {rank_file}", flush=True)
+        except Exception as e:
+            print(f"[merge_ply] ERROR reading {rank_file}: {e}", flush=True)
+            continue
+
+    if not all_vertices:
+        print("[merge_ply] ERROR: No valid rank files found", flush=True)
+        return 0
+
+    # Merge all vertices
+    merged_data = np.concatenate(all_vertices)
+    merged_element = PlyElement.describe(merged_data, 'vertex')
+
+    # Write merged file
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    PlyData([merged_element]).write(output_path)
+    print(f"[merge_ply] Merged {total_count:,} gaussians -> {output_path}", flush=True)
+
+    return total_count
+
 
 @dataclass
 class BBox:
@@ -81,9 +142,11 @@ class TileInfo:
     """Information about a tile."""
     tile_id: str
     bbox: BBox
-    status: str  # pending, in_progress, completed, split
+    status: str  # pending, in_progress, completed, split, failed, skipped
     fail_iter: Optional[int] = None  # Iteration at which tile failed/split
     num_cameras: Optional[int] = None  # Number of visible cameras
+    ply_path: Optional[str] = None  # Path to pre-trained gaussians PLY (for Category 3 OOM resume)
+    oom_type: Optional[str] = None  # "gpu" (exit 42) or "ram" (exit -9)
 
 
 class AdaptiveTileTrainer:
@@ -105,8 +168,15 @@ class AdaptiveTileTrainer:
 
         self.grendel_dir = ROOT / "Grendel-GS"
         self.state_file = self.output_path / "adaptive_state.json"
-        self.tiles_dir = self.output_path / "tiles"
-        self.tiles_dir.mkdir(parents=True, exist_ok=True)
+        self.ply_dir = self.output_path / "ply"
+        self.ply_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clear and recreate debug_images folder on each run
+        self.debug_images_dir = self.output_path / "debug_images"
+        if self.debug_images_dir.exists():
+            import shutil
+            shutil.rmtree(self.debug_images_dir)
+        self.debug_images_dir.mkdir(parents=True, exist_ok=True)
 
         # Load scene info
         self.scene_bbox, self.num_points = self._load_scene_info()
@@ -118,10 +188,9 @@ class AdaptiveTileTrainer:
         self.vis_counter = 0  # Counter for visualization filenames
         self.min_successful_level = None  # Track minimum level (smallest = largest tile) that completed successfully
         self.initial_area = None  # Area of the initial tile (level 0)
-        if self.state_file.exists() and args.resume:
-            self._load_state()
-        else:
-            self._init_tiles()
+        # Always start fresh: clear all output folders
+        self._clear_output_folders()
+        self._init_tiles()
 
     def _load_scene_info(self) -> Tuple[BBox, int]:
         """Load point cloud and compute scene bounding box."""
@@ -314,6 +383,22 @@ class AdaptiveTileTrainer:
         vis_dir.mkdir(parents=True, exist_ok=True)
         self.vis_counter = 0  # Reset counter
 
+    def _clear_output_folders(self):
+        """Clear all output folders when not resuming (fresh start)."""
+        import shutil
+        folders_to_clear = ["models", "logs", "ply", "visualizations"]
+        for folder_name in folders_to_clear:
+            folder_path = self.output_path / folder_name
+            if folder_path.exists():
+                shutil.rmtree(folder_path)
+                print(f"[Init] Cleared folder: {folder_path}")
+        # Also remove state file if exists
+        if self.state_file.exists():
+            self.state_file.unlink()
+            print(f"[Init] Removed state file: {self.state_file}")
+        # Mark visualizations as cleared to prevent redundant clear later
+        self._vis_cleared = True
+
     def _init_tiles(self):
         """Initialize with single tile covering entire scene."""
         margin = self.args.scene_margin
@@ -377,41 +462,15 @@ class AdaptiveTileTrainer:
                     "bbox": t.bbox.to_string(),
                     "status": t.status,
                     "fail_iter": t.fail_iter,
-                    "num_cameras": t.num_cameras
+                    "num_cameras": t.num_cameras,
+                    "ply_path": t.ply_path,
+                    "oom_type": t.oom_type
                 }
                 for tid, t in self.tiles.items()
             }
         }
         with open(self.state_file, "w") as f:
             json.dump(state, f, indent=2)
-
-    def _load_state(self):
-        """Load state from file."""
-        with open(self.state_file, "r") as f:
-            state = json.load(f)
-
-        self.tile_counter = state["tile_counter"]
-        self.vis_counter = state.get("vis_counter", 0)  # Default to 0 for old state files
-        self.initial_area = state.get("initial_area")
-        self.min_successful_level = state.get("min_successful_level")
-        self.tiles = {}
-        for tid, t in state["tiles"].items():
-            self.tiles[tid] = TileInfo(
-                tile_id=t["tile_id"],
-                bbox=BBox.from_string(t["bbox"]),
-                status=t["status"],
-                fail_iter=t.get("fail_iter"),
-                num_cameras=t.get("num_cameras")
-            )
-        print(f"[Resume] Loaded {len(self.tiles)} tiles from state")
-        # If initial_area is not in state (old state file), compute from scene_bbox
-        if self.initial_area is None:
-            margin = self.args.scene_margin
-            dx, dy, dz = self.scene_bbox.size
-            self.initial_area = (dx * (1 + 2 * margin)) * (dy * (1 + 2 * margin))
-            print(f"[Resume] Computed initial_area from scene_bbox: {self.initial_area:.1f}")
-        if self.min_successful_level is not None:
-            print(f"[Resume] Min successful level: {self.min_successful_level}")
 
     def _visualize_tile_map(self, current_tile_id: str = None):
         """
@@ -421,41 +480,29 @@ class AdaptiveTileTrainer:
             current_tile_id: The tile currently being processed (highlighted)
         """
         # Status colors (for status indicator circles)
-        # Note: "split" is further divided into "split_oom" and "split_preemptive" based on fail_iter
+        # Note: "split" is further divided based on fail_iter and oom_type
         status_colors = {
             "completed": "#4CAF50",       # Green
             "in_progress": "#2196F3",     # Blue
             "pending": "#9E9E9E",         # Gray
-            "split_oom": "#FF9800",       # Orange - OOM split (tried and failed)
+            "split_gpu_oom": "#FF9800",   # Orange - GPU OOM (exit 42)
+            "split_ram_oom": "#E91E63",   # Pink - RAM OOM (exit -9)
             "split_preemptive": "#9C27B0", # Purple - Preemptive split (skipped without trying)
             "split": "#FF9800",           # Orange - fallback for old data
             "failed": "#F44336",          # Red
             "skipped": "#795548",         # Brown
         }
 
-        # Tile border/label colors (high contrast, distinguishable)
-        tile_colors = [
-            "#FF0000",  # Red
-            "#0000FF",  # Blue
-            "#00AA00",  # Green
-            "#FF00FF",  # Magenta
-            "#00CCCC",  # Cyan
-            "#FF8800",  # Orange
-            "#8800FF",  # Purple
-            "#888800",  # Olive
-            "#FF0088",  # Pink
-            "#0088FF",  # Sky blue
-            "#00FF88",  # Spring green
-            "#880000",  # Dark red
-            "#000088",  # Dark blue
-            "#008800",  # Dark green
-            "#880088",  # Dark magenta
-            "#008888",  # Dark cyan
-            "#884400",  # Brown
-            "#440088",  # Indigo
-            "#448800",  # Dark olive
-            "#004488",  # Navy
-        ]
+        # Generate tile colors using golden ratio for better distribution
+        # This ensures adjacent tile numbers get visually distinct colors
+        def generate_tile_color(tile_num: int) -> str:
+            """Generate a distinct color for a tile using golden ratio hue distribution."""
+            golden_ratio = 0.618033988749895
+            hue = (tile_num * golden_ratio) % 1.0
+            # Convert HSV to RGB (saturation=0.7, value=0.9 for vibrant but not harsh colors)
+            import colorsys
+            r, g, b = colorsys.hsv_to_rgb(hue, 0.7, 0.9)
+            return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
 
         fig, ax = plt.subplots(1, 1, figsize=(14, 12))
 
@@ -477,21 +524,25 @@ class AdaptiveTileTrainer:
                               key=lambda x: x[1].bbox.size[0] * x[1].bbox.size[1],
                               reverse=True)
 
-        # Collect for legend
-        status_drawn = set()
+        # Collect for legend (with counts)
+        display_status_counts = {}
         text_labels = []  # Store text labels to draw last
 
         # Draw all tiles (largest first)
         for idx, (tile_id, tile) in enumerate(sorted_tiles):
             bbox = tile.bbox
-            tile_color = tile_colors[idx % len(tile_colors)]
+            # Use tile number for consistent color (not affected by other tiles being added)
+            tile_num = int(tile_id.split("_")[-1]) if "_" in tile_id else idx
+            tile_color = generate_tile_color(tile_num)
 
-            # Determine status color (split into oom vs preemptive)
+            # Determine status color (split into gpu_oom, ram_oom, preemptive)
             if tile.status == "split":
                 if tile.fail_iter == 0:
                     display_status = "split_preemptive"
+                elif tile.oom_type == "ram":
+                    display_status = "split_ram_oom"
                 else:
-                    display_status = "split_oom"
+                    display_status = "split_gpu_oom"  # default for gpu or unknown
             else:
                 display_status = tile.status
             status_color = status_colors.get(display_status, "#9E9E9E")
@@ -541,7 +592,9 @@ class AdaptiveTileTrainer:
                     if tile.fail_iter == 0:
                         info_parts.append("preemptive")
                     else:
-                        info_parts.append(f"OOM@{tile.fail_iter}")
+                        # Show OOM type (GPU/RAM) if available
+                        oom_prefix = "RAM" if tile.oom_type == "ram" else "GPU"
+                        info_parts.append(f"{oom_prefix}@{tile.fail_iter}")
                 if tile.num_cameras is not None:
                     info_parts.append(f"C{tile.num_cameras}")
                 label_text += f"\n({', '.join(info_parts)})"
@@ -549,8 +602,8 @@ class AdaptiveTileTrainer:
             text_labels.append((center_x, center_y, label_text, font_size,
                                tile_id == current_tile_id, tile_color, status_color, display_status))
 
-            # Track status for legend (use display_status to distinguish split types)
-            status_drawn.add(display_status)
+            # Track status counts for legend (use display_status to distinguish split types)
+            display_status_counts[display_status] = display_status_counts.get(display_status, 0) + 1
 
         # Draw all text labels last (on top)
         for center_x, center_y, label_text, font_size, is_current, tile_color, status_color, status in text_labels:
@@ -614,11 +667,13 @@ class AdaptiveTileTrainer:
 
         ax.set_title(f'Tile Map - {status_summary}{current_info}', fontsize=14, fontweight='bold')
 
-        # Add legend for status colors (draw last, on top)
+        # Add legend for status colors with counts (draw last, on top)
         legend_handles = []
         for status, color in status_colors.items():
-            if status in status_drawn:
-                handle = patches.Patch(facecolor=color, edgecolor='white', label=status.capitalize())
+            if status in display_status_counts:
+                count = display_status_counts[status]
+                handle = patches.Patch(facecolor=color, edgecolor='white',
+                                       label=f"{status.capitalize()} ({count})")
                 legend_handles.append(handle)
         legend = ax.legend(handles=legend_handles, loc='upper right', fontsize=10)
         legend.set_zorder(200)
@@ -642,6 +697,53 @@ class AdaptiveTileTrainer:
 
         print(f"  [Visualization] Saved: {save_path}", flush=True)
 
+    def _save_completed_ply(self, tile: TileInfo, tile_level: int):
+        """Copy completed tile PLY to ply folder with informative name."""
+        import shutil
+        import glob
+
+        # Find the source PLY (in models folder)
+        model_dir = self.output_path / "models" / tile.tile_id / "point_cloud"
+        if not model_dir.exists():
+            print(f"  [Warning] Model dir not found: {model_dir}")
+            return
+
+        # Find the latest iteration folder
+        iter_folders = sorted(model_dir.glob("iteration_*"), key=lambda x: int(x.name.split("_")[1]))
+        if not iter_folders:
+            print(f"  [Warning] No iteration folders found in {model_dir}")
+            return
+
+        latest_iter_folder = iter_folders[-1]
+        iteration = int(latest_iter_folder.name.split("_")[1])
+        source_ply = latest_iter_folder / "point_cloud.ply"
+
+        if not source_ply.exists():
+            print(f"  [Warning] Source PLY not found: {source_ply}")
+            return
+
+        # Count gaussians (by reading first line of PLY or checking file size)
+        try:
+            with open(source_ply, 'rb') as f:
+                # Read header to find vertex count
+                for line in f:
+                    line = line.decode('ascii', errors='ignore').strip()
+                    if line.startswith('element vertex'):
+                        gaussian_count = int(line.split()[-1])
+                        break
+                else:
+                    gaussian_count = 0
+        except:
+            gaussian_count = 0
+
+        # Create informative filename: {tile_id}_L{level}_completed_iter{iteration}_{count}gs.ply
+        ply_name = f"{tile.tile_id}_L{tile_level}_completed_iter{iteration}_{gaussian_count}gs.ply"
+        dest_ply = self.ply_dir / ply_name
+
+        # Copy PLY to ply folder
+        shutil.copy2(source_ply, dest_ply)
+        print(f"  [PLY] Saved: {dest_ply}")
+
     def _get_next_tile(self) -> Optional[TileInfo]:
         """Get next pending tile."""
         for tile in self.tiles.values():
@@ -656,6 +758,26 @@ class AdaptiveTileTrainer:
         tile_model_path.mkdir(parents=True, exist_ok=True)
         tile_log_path.mkdir(parents=True, exist_ok=True)
 
+        # Clear any leftover OOM signal and done files from previous runs
+        signal_file = self.ply_dir / OOM_SIGNAL_FILENAME
+        if signal_file.exists():
+            signal_file.unlink()
+            print(f"  [Cleared leftover OOM signal file]")
+        # Clear done files
+        for done_file in self.ply_dir.glob("oom_done_rank*.json"):
+            done_file.unlink()
+            print(f"  [Cleared leftover done file: {done_file.name}]")
+
+        # Calculate tile level
+        tile_area = tile.bbox.size[0] * tile.bbox.size[1]
+        tile_level = self._get_tile_level(tile_area)
+
+        # Ensure densify_from_iter is at least 2x the number of visible cameras
+        num_visible = len(visible_cameras) if visible_cameras else 1
+        effective_densify_from = max(self.args.densify_from_iter, 2 * num_visible)
+        if effective_densify_from != self.args.densify_from_iter:
+            print(f"  [Adjusted densify_from_iter: {self.args.densify_from_iter} -> {effective_densify_from} (2 x {num_visible} cameras)]")
+
         cmd = [
             "torchrun",
             f"--nproc_per_node={self.args.num_gpus}",
@@ -669,38 +791,96 @@ class AdaptiveTileTrainer:
             "--adaptive_tile_enabled",
             f"--tile_bbox={tile.bbox.to_string()}",
             "--tile_id", tile.tile_id,
-            "--tile_output_dir", str(self.tiles_dir),
+            "--tile_level", str(tile_level),
+            "--tile_output_dir", str(self.ply_dir),
             "--tile_crop_margin", str(self.args.tile_crop_margin),
             "--ndc_limit", str(self.args.ndc_limit),
+            "--densify_from_iter", str(effective_densify_from),
+            "--densification_interval", str(self.args.densification_interval),
+            "--densify_grad_threshold", str(self.args.densify_grad_threshold),
+            "--test_iterations", "999999999",  # Disable testing during adaptive training
         ]
 
         # Add visible cameras
         if visible_cameras:
             cmd.extend(["--visible_cameras", ",".join(visible_cameras)])
 
+        # Add pre-trained gaussians PLY path for Category 3 OOM resume
+        if tile.ply_path:
+            cmd.extend(["--pretrained_ply", tile.ply_path])
+
         print(f"\n[Tile {tile.tile_id}] Running torchrun...")
         print(f"  BBox: {tile.bbox.to_string()}")
         print(f"  Visible cameras: {len(visible_cameras)}")
+        if tile.ply_path:
+            print(f"  *** RESUME MODE: Using pre-trained gaussians ***")
+            print(f"  Pre-trained PLY: {tile.ply_path}")
+        else:
+            print(f"  Starting from scratch (SfM points)")
 
         result = subprocess.run(cmd, cwd=str(ROOT))
 
+        print(f"  [torchrun returned exit_code={result.returncode}]", flush=True)
+
         # Check for OOM via state file (torchrun returns 1 even when worker exits with 42)
-        state_file = self.tiles_dir / "adaptive_tile_state.json"
-        oom_iteration = None
+        state_file = self.ply_dir / "adaptive_tile_state.json"
+        signal_file = self.ply_dir / OOM_SIGNAL_FILENAME
+        oom_info = None
+
+        # First, check adaptive_tile_state.json (written by Category 3 OOM with full info)
         if state_file.exists():
             try:
                 with open(state_file) as f:
                     oom_state = json.load(f)
                 if oom_state.get("oom_occurred"):
-                    oom_iteration = oom_state.get("iteration")
-                    print(f"  [OOM detected via state file at iteration {oom_iteration}]")
+                    oom_info = {
+                        "iteration": oom_state.get("iteration"),
+                        "oom_category": oom_state.get("oom_category"),
+                        "oom_cause": oom_state.get("oom_cause"),
+                        "tile_a": oom_state.get("tile_a"),
+                        "tile_b": oom_state.get("tile_b"),
+                        "num_ranks": oom_state.get("num_ranks", 1),  # For Category 3 PLY merge
+                    }
+                    print(f"  [OOM detected via state file at iteration {oom_info['iteration']}]")
+                    print(f"  [OOM category: {oom_info['oom_category']}, cause: {oom_info['oom_cause']}]")
                     # Remove the state file after reading
                     state_file.unlink()
-                    return self.EXIT_CODE_OOM, oom_iteration
+                    # Also clear OOM signal file
+                    if signal_file.exists():
+                        signal_file.unlink()
+                        print(f"  [Cleared OOM signal file]")
+                    # Clear done files
+                    for done_file in self.ply_dir.glob("oom_done_rank*.json"):
+                        done_file.unlink()
+                        print(f"  [Cleared done file: {done_file.name}]")
+                    return self.EXIT_CODE_OOM, oom_info
             except (json.JSONDecodeError, IOError) as e:
                 print(f"  [Warning] Failed to read OOM state file: {e}")
 
-        return result.returncode, oom_iteration
+        # Second, check oom_signal.json (written by Category 1/2 OOM, no gaussians saved)
+        # This happens when OOM occurs early (before densification) - no state file is written
+        if signal_file.exists() and oom_info is None:
+            try:
+                with open(signal_file) as f:
+                    signal_data = json.load(f)
+                category = signal_data.get("category", 1)
+                iteration = signal_data.get("iteration", 0)
+                print(f"  [OOM detected via signal file: category={category}, iter={iteration}]", flush=True)
+                oom_info = {
+                    "iteration": iteration,
+                    "oom_category": category,
+                    "oom_cause": "gpu",
+                    "tile_a": None,
+                    "tile_b": None,
+                    "num_ranks": 1,
+                }
+                signal_file.unlink()
+                print(f"  [Cleared OOM signal file]")
+                return self.EXIT_CODE_OOM, oom_info
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"  [Warning] Failed to read OOM signal file: {e}")
+
+        return result.returncode, oom_info
 
     def run(self):
         """Main training loop."""
@@ -837,7 +1017,13 @@ class AdaptiveTileTrainer:
             self._save_state()
 
             # Run training
-            exit_code, oom_iteration = self._run_torchrun(tile, visible_cameras)
+            exit_code, oom_info = self._run_torchrun(tile, visible_cameras)
+
+            # Log exit code for debugging
+            print(f"\n[Tile {tile.tile_id}] torchrun exit_code = {exit_code}", flush=True)
+            print(f"  oom_info = {oom_info}", flush=True)
+            print(f"  EXIT_CODE_OOM = {self.EXIT_CODE_OOM}", flush=True)
+            print(f"  Recognized OOM codes: {self.EXIT_CODE_OOM}, -9, 143, -15, 137", flush=True)
 
             if exit_code == self.EXIT_CODE_SUCCESS:
                 tile.status = "completed"
@@ -851,13 +1037,60 @@ class AdaptiveTileTrainer:
                 completed += 1
                 print(f"[Tile {tile.tile_id}] Completed successfully (level {tile_level}).")
 
-            elif exit_code == self.EXIT_CODE_OOM:
+                # Copy completed PLY to ply folder with informative name
+                self._save_completed_ply(tile, tile_level)
+
+            elif exit_code == self.EXIT_CODE_OOM or exit_code == -9 or exit_code in (143, -15, 137):
+                # exit_code meanings:
+                #   42: EXIT_CODE_OOM (explicit OOM handling)
+                #   -9: SIGKILL (OS killed due to RAM OOM)
+                #   143: SIGTERM (128+15, torchrun shutdown - likely OOM from another rank)
+                #   -15: SIGTERM (negative signal)
+                #   137: SIGKILL (128+9, torchrun shutdown)
+                # Determine OOM type
+                is_ram_oom = (exit_code == -9)
+                is_sigterm = (exit_code in (143, -15, 137))
+                if is_sigterm:
+                    print(f"[Tile {tile.tile_id}] SIGTERM/SIGKILL exit ({exit_code}) - treating as OOM", flush=True)
+                oom_type_str = "RAM" if is_ram_oom else "GPU"
+
+                # RAM OOM: wait for OS to reclaim memory from dead processes
+                if is_ram_oom:
+                    import gc
+                    import time
+                    import psutil
+
+                    gc.collect()  # Force Python garbage collection
+
+                    # Wait until RAM usage drops below 70%
+                    max_wait = 300  # Maximum wait time: 5 minutes
+                    waited = 0
+                    mem = psutil.virtual_memory()
+                    print(f"\n[RAM OOM] Current RAM usage: {mem.percent:.1f}%", flush=True)
+
+                    while mem.percent > 70 and waited < max_wait:
+                        print(f"[RAM OOM] RAM usage {mem.percent:.1f}% > 70%, waiting... ({waited}s/{max_wait}s)", flush=True)
+                        time.sleep(10)
+                        waited += 10
+                        gc.collect()
+                        mem = psutil.virtual_memory()
+
+                    if mem.percent > 70:
+                        print(f"[RAM OOM] WARNING: RAM still at {mem.percent:.1f}% after {max_wait}s, proceeding anyway...", flush=True)
+                    else:
+                        print(f"[RAM OOM] RAM usage dropped to {mem.percent:.1f}%, resuming.", flush=True)
+
+                oom_iteration = oom_info.get("iteration") if oom_info else None
+                oom_category = oom_info.get("oom_category") if oom_info else None
+
                 print("\n" + "#" * 60, flush=True)
-                print("###  OOM DETECTED - SPLITTING TILE  ###", flush=True)
+                print(f"###  {oom_type_str} OOM DETECTED - SPLITTING TILE  ###", flush=True)
                 print("#" * 60, flush=True)
+                tile_area = tile.bbox.size[0] * tile.bbox.size[1]
                 tile_level = self._get_tile_level(tile_area)
-                print(f"[Tile {tile.tile_id}] OOM at iteration {oom_iteration}, level={tile_level}, splitting...", flush=True)
+                print(f"[Tile {tile.tile_id}] {oom_type_str} OOM at iteration {oom_iteration}, level={tile_level}, splitting...", flush=True)
                 tile.fail_iter = oom_iteration
+                tile.oom_type = "ram" if is_ram_oom else "gpu"
 
                 # Check minimum tile size before splitting
                 MIN_TILE_SIZE = 50.0  # Minimum size in world units
@@ -876,8 +1109,25 @@ class AdaptiveTileTrainer:
 
                 # Split tile
                 bbox_a, bbox_b = tile.bbox.split()
-                tile_a_id = self._next_tile_id()
-                tile_b_id = self._next_tile_id()
+
+                # Use tile IDs from state file if available (ensures PLY filename matches tile ID)
+                # Note: use "or {}" because get() returns None if key exists but value is None
+                tile_a_info = (oom_info.get("tile_a") or {}) if oom_info else {}
+                tile_b_info = (oom_info.get("tile_b") or {}) if oom_info else {}
+
+                if tile_a_info.get("tile_id") and tile_b_info.get("tile_id"):
+                    # Use IDs from train_internal.py to match PLY filenames
+                    tile_a_id = tile_a_info["tile_id"]
+                    tile_b_id = tile_b_info["tile_id"]
+                    # Update counter to avoid future collisions
+                    a_num = int(tile_a_id.split("_")[-1]) if "_" in tile_a_id else 0
+                    b_num = int(tile_b_id.split("_")[-1]) if "_" in tile_b_id else 0
+                    self.tile_counter = max(self.tile_counter, a_num + 1, b_num + 1)
+                    print(f"  [Using tile IDs from state: {tile_a_id}, {tile_b_id}]", flush=True)
+                else:
+                    # Fallback to sequential counter
+                    tile_a_id = self._next_tile_id()
+                    tile_b_id = self._next_tile_id()
 
                 # Calculate sizes for display
                 size_a = bbox_a.size
@@ -895,13 +1145,73 @@ class AdaptiveTileTrainer:
                 print(f"  Split into:", flush=True)
                 print(f"    {tile_a_id}: size=({size_a[0]:.1f}, {size_a[1]:.1f}, {size_a[2]:.1f}), level={level_a}", flush=True)
                 print(f"    {tile_b_id}: size=({size_b[0]:.1f}, {size_b[1]:.1f}, {size_b[2]:.1f}), level={level_b}", flush=True)
+
+                # For Category 3 OOM (increased gaussians), use saved PLY for resume
+                ply_path_a = None
+                ply_path_b = None
+                if oom_category == 3 and oom_info:
+                    print(f"\n  >>> CATEGORY 3 OOM: Pre-trained gaussians will be used <<<", flush=True)
+                    tile_a_info = oom_info.get("tile_a") or {}
+                    tile_b_info = oom_info.get("tile_b") or {}
+                    num_ranks = oom_info.get("num_ranks", 1)
+
+                    # Check if PLY files need to be merged (distributed save with local_only=True)
+                    ply_prefix_a = tile_a_info.get("ply_path")
+                    ply_prefix_b = tile_b_info.get("ply_path")
+                    is_prefix_a = tile_a_info.get("ply_is_prefix", False)
+                    is_prefix_b = tile_b_info.get("ply_is_prefix", False)
+
+                    # Merge rank files if needed
+                    if ply_prefix_a and is_prefix_a and num_ranks > 1:
+                        print(f"  [Merging] Tile A: {num_ranks} rank files...", flush=True)
+                        merged_path_a = f"{ply_prefix_a}_merged.ply"
+                        count_a = merge_ply_files(ply_prefix_a, num_ranks, merged_path_a)
+                        if count_a > 0:
+                            ply_path_a = merged_path_a
+                            print(f"    Merged {count_a:,} gaussians -> {merged_path_a}", flush=True)
+                        else:
+                            print(f"    [WARNING] Merge failed, no valid PLY for tile A", flush=True)
+                    elif ply_prefix_a and not is_prefix_a:
+                        # Single file path (legacy or single-GPU)
+                        if Path(ply_prefix_a).exists():
+                            ply_path_a = ply_prefix_a
+                        else:
+                            print(f"    [WARNING] PLY file not found: {ply_prefix_a}", flush=True)
+
+                    if ply_prefix_b and is_prefix_b and num_ranks > 1:
+                        print(f"  [Merging] Tile B: {num_ranks} rank files...", flush=True)
+                        merged_path_b = f"{ply_prefix_b}_merged.ply"
+                        count_b = merge_ply_files(ply_prefix_b, num_ranks, merged_path_b)
+                        if count_b > 0:
+                            ply_path_b = merged_path_b
+                            print(f"    Merged {count_b:,} gaussians -> {merged_path_b}", flush=True)
+                        else:
+                            print(f"    [WARNING] Merge failed, no valid PLY for tile B", flush=True)
+                    elif ply_prefix_b and not is_prefix_b:
+                        # Single file path (legacy or single-GPU)
+                        if Path(ply_prefix_b).exists():
+                            ply_path_b = ply_prefix_b
+                        else:
+                            print(f"    [WARNING] PLY file not found: {ply_prefix_b}", flush=True)
+
+                    if ply_path_a or ply_path_b:
+                        print(f"  [Category 3 Resume] Child tiles will load pre-trained gaussians:", flush=True)
+                        if ply_path_a:
+                            print(f"    {tile_a_id} -> {ply_path_a}", flush=True)
+                        if ply_path_b:
+                            print(f"    {tile_b_id} -> {ply_path_b}", flush=True)
+                    else:
+                        print(f"  [WARNING] Category 3 but no valid PLY files found after merge!", flush=True)
+                else:
+                    print(f"  Category {oom_category} OOM: Child tiles will start from scratch", flush=True)
+
                 print("#" * 60 + "\n", flush=True)
 
                 # Insert split tiles at the beginning so they are processed immediately
                 # Rebuild tiles dict with split tiles first
                 new_tiles = {}
-                new_tiles[tile_a_id] = TileInfo(tile_a_id, bbox_a, "pending")
-                new_tiles[tile_b_id] = TileInfo(tile_b_id, bbox_b, "pending")
+                new_tiles[tile_a_id] = TileInfo(tile_a_id, bbox_a, "pending", ply_path=ply_path_a)
+                new_tiles[tile_b_id] = TileInfo(tile_b_id, bbox_b, "pending", ply_path=ply_path_b)
                 for tid, t in self.tiles.items():
                     new_tiles[tid] = t
                 self.tiles = new_tiles
@@ -954,18 +1264,72 @@ def parse_args():
                         help="Scene bbox margin ratio (e.g., 0.1 = 10%%)")
     parser.add_argument("--ndc_limit", type=float, default=1.0,
                         help="NDC limit for projection filtering (default: 1.0)")
-
-    # Resume
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from existing state")
+    parser.add_argument("--densify_from_iter", type=int, default=500,
+                        help="Start densification from this iteration (default: 500)")
+    parser.add_argument("--densification_interval", type=int, default=100,
+                        help="Densification interval (default: 100)")
+    parser.add_argument("--densify_grad_threshold", type=float, default=0.0002,
+                        help="Gradient threshold for densification (default: 0.0002, lower=faster growth)")
 
     return parser.parse_args()
 
 
+class TeeOutput:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path, stdout):
+        self.file = open(file_path, 'a', buffering=1)  # Line buffered
+        self.stdout = stdout
+
+    def write(self, text):
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+
+    def flush(self):
+        self.stdout.flush()
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
 def main():
     args = parse_args()
-    trainer = AdaptiveTileTrainer(args)
-    trainer.run()
+
+    # Set up logging to file
+    log_file = Path(args.output_path) / "train_adaptive.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Tee stdout and stderr to both console and file
+    import datetime
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    tee_stdout = TeeOutput(log_file, original_stdout)
+    tee_stderr = TeeOutput(log_file, original_stderr)
+
+    sys.stdout = tee_stdout
+    sys.stderr = tee_stderr
+
+    print(f"\n{'='*60}")
+    print(f"[{datetime.datetime.now().isoformat()}] train_adaptive.py started")
+    print(f"Log file: {log_file}")
+    print(f"{'='*60}\n")
+
+    try:
+        trainer = AdaptiveTileTrainer(args)
+        trainer.run()
+    except Exception as e:
+        import traceback
+        print(f"\n[ERROR] Exception occurred:", flush=True)
+        traceback.print_exc()
+        raise
+    finally:
+        print(f"\n[{datetime.datetime.now().isoformat()}] train_adaptive.py finished")
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        tee_stdout.close()
+        tee_stderr.close()
 
 
 if __name__ == "__main__":

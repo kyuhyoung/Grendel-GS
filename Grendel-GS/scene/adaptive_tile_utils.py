@@ -543,62 +543,131 @@ def compute_visible_cameras_and_crops(tile_bbox: TileBBox,
 
 def apply_crop_to_camera(camera, crop: CropRegion):
     """
-    Modify camera to use crop region instead of full image.
+    Update camera's projection matrix for off-center principal point after cropping.
 
-    This modifies the camera's:
-    - image dimensions
-    - FoVx/FoVy (adjusted to maintain correct focal length)
-    - ground truth image (if loaded)
+    IMPORTANT: This function assumes the camera was already loaded with cropped image
+    and adjusted FoV by loadCam(). It ONLY updates the projection matrix to account
+    for the shifted principal point.
 
-    The key insight: when cropping, we must maintain the same focal length.
-    Original: focal_x = orig_width / (2 * tan(FoVx/2))
-    After crop: focal_x stays same, so new_FoVx = 2 * atan(crop_width / (2 * focal_x))
+    When an image is cropped, the principal point (which was at the center of the
+    original image) shifts relative to the cropped region. This shift must be
+    reflected in the projection matrix, otherwise gaussians will project to
+    completely wrong pixel locations!
 
     Args:
-        camera: Camera object to modify
-        crop: Crop region to apply
+        camera: Camera object (already has cropped FoV and dimensions from loadCam)
+        crop: Crop region that was applied
+
+    Requires:
+        camera._original_width, camera._original_height: Original image dimensions
+        (must be set before calling this function)
     """
     import math
 
-    # Store original dimensions
-    if not hasattr(camera, '_original_width'):
-        camera._original_width = camera.image_width
-        camera._original_height = camera.image_height
-        camera._crop_region = crop
+    # Get original dimensions (must be set by caller before calling this function)
+    if not hasattr(camera, '_original_width') or not hasattr(camera, '_original_height'):
+        print(f"[crop-projection] WARNING: _original_width/_original_height not set for camera {camera.image_name}!")
+        print(f"[crop-projection] Skipping projection matrix update - this may cause rendering issues!")
+        return
 
     orig_width = camera._original_width
     orig_height = camera._original_height
+    camera._crop_region = crop
 
-    # Compute original focal lengths from FoV
-    if hasattr(camera, 'FoVx') and hasattr(camera, 'FoVy'):
+    # NOTE: FoV and image dimensions are already adjusted by loadCam(), don't modify again!
+    # camera.FoVx, camera.FoVy = crop-adjusted FoV
+    # camera.image_width, camera.image_height = crop dimensions
+
+    # ============================================
+    # CRITICAL: Update projection matrix for off-center principal point
+    # ============================================
+    # When cropping, the principal point shifts relative to the cropped image.
+    # Original principal point: (orig_width/2, orig_height/2)
+    # New principal point in crop coords: (orig_cx - crop.x_min, orig_cy - crop.y_min)
+    #
+    # The projection matrix must account for this offset, otherwise gaussians
+    # will project to completely wrong pixel locations!
+
+    if hasattr(camera, 'projection_matrix'):
+        # Get original principal point from camera intrinsics (from COLMAP)
+        # If not available, fall back to image center
+        orig_cx = getattr(camera, '_cx', None)
+        orig_cy = getattr(camera, '_cy', None)
+        if orig_cx is None:
+            orig_cx = orig_width / 2.0
+        if orig_cy is None:
+            orig_cy = orig_height / 2.0
+
+        # New principal point in cropped image coordinates
+        # Formula from diagram: Cx_new = Cx - crop.x_min, Cy_new = Cy - crop.y_min
+        new_cx = orig_cx - crop.x_min
+        new_cy = orig_cy - crop.y_min
+
+        # Offset from center of cropped image (in pixels)
+        offset_x = new_cx - (crop.width / 2.0)
+        offset_y = new_cy - (crop.height / 2.0)
+
+        # Compute focal lengths from FoV (for debug output)
         tanfovx = math.tan(camera.FoVx / 2)
         tanfovy = math.tan(camera.FoVy / 2)
-        focal_x = orig_width / (2 * tanfovx)
-        focal_y = orig_height / (2 * tanfovy)
+        # Focal length in pixels: f = (size/2) / tan(fov/2)
+        focal_x = (crop.width / 2.0) / tanfovx
+        focal_y = (crop.height / 2.0) / tanfovy
 
-        # Compute new FoV for cropped dimensions (maintaining same focal length)
-        new_tanfovx = crop.width / (2 * focal_x)
-        new_tanfovy = crop.height / (2 * focal_y)
-        camera.FoVx = 2 * math.atan(new_tanfovx)
-        camera.FoVy = 2 * math.atan(new_tanfovy)
+        # Compute frustum bounds for off-center projection
+        # Using OpenGL-style frustum: the principal point determines where the
+        # optical axis intersects the image plane
+        znear = camera.znear
+        zfar = camera.zfar
 
-    # Update dimensions
-    camera.image_width = crop.width
-    camera.image_height = crop.height
+        # For off-center projection, we need asymmetric frustum bounds
+        # The principal point (new_cx, new_cy) should map to NDC (0, 0)
+        # Standard: image center maps to NDC (0, 0)
+        # Off-center: shift the frustum so that (new_cx, new_cy) maps to NDC (0, 0)
 
-    # Crop the ground truth image if loaded
-    if hasattr(camera, 'original_image') and camera.original_image is not None:
-        img = camera.original_image
-        if isinstance(img, torch.Tensor):
-            # Assuming CHW format
-            camera.original_image = img[:, crop.y_min:crop.y_max, crop.x_min:crop.x_max]
-        else:
-            camera.original_image = img[crop.y_min:crop.y_max, crop.x_min:crop.x_max]
+        # Frustum bounds at znear plane:
+        # right = (crop.width - new_cx) / focal_x * znear
+        # left = -new_cx / focal_x * znear
+        # top = (crop.height - new_cy) / focal_y * znear
+        # bottom = -new_cy / focal_y * znear
+        right = (crop.width - new_cx) / focal_x * znear
+        left = -new_cx / focal_x * znear
+        top = (crop.height - new_cy) / focal_y * znear
+        bottom = -new_cy / focal_y * znear
 
-    # Also crop backup image if exists
-    if hasattr(camera, 'original_image_backup') and camera.original_image_backup is not None:
-        img = camera.original_image_backup
-        if isinstance(img, torch.Tensor):
-            camera.original_image_backup = img[:, crop.y_min:crop.y_max, crop.x_min:crop.x_max]
-        else:
-            camera.original_image_backup = img[crop.y_min:crop.y_max, crop.x_min:crop.x_max]
+        # Debug print for principal point adjustment
+        cx_source = "COLMAP" if getattr(camera, '_cx', None) is not None else "center"
+        cy_source = "COLMAP" if getattr(camera, '_cy', None) is not None else "center"
+        print(f"[crop-projection] Camera {camera.image_name}:", flush=True)
+        print(f"  Original image: {orig_width}x{orig_height}", flush=True)
+        print(f"  Principal point: ({orig_cx:.1f}, {orig_cy:.1f}) [cx:{cx_source}, cy:{cy_source}]", flush=True)
+        print(f"  Crop: ({crop.x_min}, {crop.y_min}) - ({crop.x_max}, {crop.y_max}) = {crop.width}x{crop.height}", flush=True)
+        print(f"  New principal point (in crop coords): ({new_cx:.1f}, {new_cy:.1f})", flush=True)
+        print(f"  Focal length: fx={focal_x:.1f}, fy={focal_y:.1f}", flush=True)
+        print(f"  Frustum bounds: L={left:.4f}, R={right:.4f}, B={bottom:.4f}, T={top:.4f}", flush=True)
+
+        # Note: We allow extreme off-center projections now that the rasterizer
+        # properly supports proj_offset_x and proj_offset_y parameters.
+        # The old check was too conservative and prevented off-center projection
+        # from working in many valid cases.
+
+        # Build projection matrix using exact getProjectionMatrix formula
+        P = torch.zeros(4, 4)
+        P[0, 0] = 2.0 * znear / (right - left)
+        P[1, 1] = 2.0 * znear / (top - bottom)
+        P[0, 2] = (right + left) / (right - left)
+        P[1, 2] = (top + bottom) / (top - bottom)
+        P[2, 2] = zfar / (zfar - znear)
+        P[2, 3] = -(zfar * znear) / (zfar - znear)
+        P[3, 2] = 1.0
+
+        print(f"  Projection: P[0,2]={P[0,2]:.4f}, P[1,2]={P[1,2]:.4f}", flush=True)
+
+        camera.projection_matrix = P.transpose(0, 1).cuda()
+
+        # Update full_proj_transform
+        camera.full_proj_transform = (
+            camera.world_view_transform.unsqueeze(0).bmm(
+                camera.projection_matrix.unsqueeze(0)
+            )
+        ).squeeze(0)

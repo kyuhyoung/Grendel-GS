@@ -34,6 +34,8 @@ class Camera(nn.Module):
         scale=1.0,
         image_width=None,  # Explicit size (for distributed storage where some ranks don't load image)
         image_height=None,
+        cx=None,  # Principal point X (None = use width/2)
+        cy=None,  # Principal point Y (None = use height/2)
     ):
         super(Camera, self).__init__()
 
@@ -44,6 +46,8 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self._cx = cx  # Store original principal point (None = centered)
+        self._cy = cy
 
         args = get_args()
         log_file = get_log_file()

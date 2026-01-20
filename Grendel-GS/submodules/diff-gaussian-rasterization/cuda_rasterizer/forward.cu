@@ -178,7 +178,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	const float proj_offset_x,  // off-center projection offset (2 * P[0,2])
+	const float proj_offset_y)  // off-center projection offset (2 * P[1,2])
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -227,12 +229,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
-	// rectangle covers 0 tiles. 
+	// rectangle covers 0 tiles.
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
-	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	// Apply off-center projection offset to NDC before converting to pixels
+	// For centered projection: proj_offset_x = proj_offset_y = 0
+	// For off-center projection: offset = 2 * P[0,2] or 2 * P[1,2] from projection matrix
+	float2 point_image = { ndc2Pix(p_proj.x - proj_offset_x, W), ndc2Pix(p_proj.y - proj_offset_y, H) };
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
@@ -466,7 +471,9 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	const float proj_offset_x,
+	const float proj_offset_y)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + ONE_DIM_BLOCK_SIZE - 1) / ONE_DIM_BLOCK_SIZE, ONE_DIM_BLOCK_SIZE >> > (
 		P, D, M,
@@ -479,7 +486,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		clamped,
 		cov3D_precomp,
 		colors_precomp,
-		viewmatrix, 
+		viewmatrix,
 		projmatrix,
 		cam_pos,
 		W, H,
@@ -493,6 +500,8 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		proj_offset_x,
+		proj_offset_y
 		);
 }

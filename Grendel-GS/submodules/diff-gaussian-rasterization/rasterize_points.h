@@ -39,7 +39,7 @@ PreprocessGaussiansCUDA(
 	const float scale_modifier,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
     const int image_height,
     const int image_width,
@@ -47,6 +47,8 @@ PreprocessGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,//raster_settings
 	const bool debug,
+	const float proj_offset_x,  // off-center projection offset x (2 * P[0,2])
+	const float proj_offset_y,  // off-center projection offset y (2 * P[1,2])
 	const pybind11::dict &args);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -72,6 +74,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& dL_dcolors,//gradients of output of this operator
 	const int R,
 	const bool debug,
+	const float proj_offset_x,  // off-center projection offset x (2 * P[0,2])
+	const float proj_offset_y,  // off-center projection offset y (2 * P[1,2])
 	const pybind11::dict &args);
 
 

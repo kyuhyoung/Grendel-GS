@@ -70,7 +70,7 @@ PreprocessGaussiansCUDA(
 	const float scale_modifier,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
     const int image_height,
     const int image_width,
@@ -78,6 +78,8 @@ PreprocessGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,//raster_settings
 	const bool debug,
+	const float proj_offset_x,  // off-center projection offset x (2 * P[0,2])
+	const float proj_offset_y,  // off-center projection offset y (2 * P[1,2])
 	const pybind11::dict &args) {
 
 	if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
@@ -128,15 +130,17 @@ PreprocessGaussiansCUDA(
 			scales.contiguous().data_ptr<float>(),
 			rotations.contiguous().data_ptr<float>(),
 			sh.contiguous().data_ptr<float>(),
-			opacity.contiguous().data<float>(), 
+			opacity.contiguous().data<float>(),
 			scale_modifier,
-			viewmatrix.contiguous().data<float>(), 
+			viewmatrix.contiguous().data<float>(),
 			projmatrix.contiguous().data<float>(),
 			campos.contiguous().data<float>(),
 			tan_fovx,
 			tan_fovy,
 			prefiltered,
 			debug,
+			proj_offset_x,
+			proj_offset_y,
 			args);
 	}
 	return std::make_tuple(rendered, means2D, depths, radii, cov3D, conic_opacity, rgb, clamped);
@@ -166,6 +170,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& dL_dcolors,//gradients of output of this operator
 	const int R,
 	const bool debug,
+	const float proj_offset_x,  // off-center projection offset x (2 * P[0,2])
+	const float proj_offset_y,  // off-center projection offset y (2 * P[1,2])
 	const pybind11::dict &args)
 {
   const int P = means3D.size(0);

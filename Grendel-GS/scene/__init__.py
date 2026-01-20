@@ -29,7 +29,78 @@ from scene.adaptive_tile_utils import (
     compute_visible_caminfos,
     compute_visible_cameras_and_crops,
     ProjectionDebugInfo,
+    apply_crop_to_camera,
 )
+
+
+def check_gaussians_visibility(gaussian_xyz, cameras, verbose=True):
+    """
+    Check how many gaussians project into at least one camera's view.
+
+    Args:
+        gaussian_xyz: Tensor or array of shape (N, 3) - gaussian 3D positions
+        cameras: List of Camera objects with projection matrices
+        verbose: Print debug info
+
+    Returns:
+        (num_visible, total): Number of visible gaussians and total gaussians
+    """
+    if isinstance(gaussian_xyz, torch.Tensor):
+        xyz = gaussian_xyz.detach().cpu().numpy()
+    else:
+        xyz = np.asarray(gaussian_xyz)
+
+    N = len(xyz)
+    visible_mask = np.zeros(N, dtype=bool)
+
+    for cam in cameras:
+        # Get camera matrices
+        W = cam.image_width
+        H = cam.image_height
+
+        # World to camera transformation
+        R = cam.R.T  # Camera rotation (transpose for world-to-cam)
+        T = cam.T    # Camera translation
+
+        # Project points to camera space
+        # cam_xyz = R @ (world_xyz - cam_pos)
+        # But in gaussian splatting convention: cam_xyz = R @ world_xyz + T
+        xyz_cam = xyz @ R.T + T.reshape(1, 3)
+
+        # Filter by depth (must be in front of camera)
+        valid_depth = xyz_cam[:, 2] > 0.1  # Positive z = in front
+
+        if not np.any(valid_depth):
+            continue
+
+        # Get intrinsics from FoV
+        fx = W / (2 * np.tan(cam.FoVx / 2))
+        fy = H / (2 * np.tan(cam.FoVy / 2))
+        cx = W / 2
+        cy = H / 2
+
+        # Project to 2D
+        x_2d = (xyz_cam[:, 0] / xyz_cam[:, 2]) * fx + cx
+        y_2d = (xyz_cam[:, 1] / xyz_cam[:, 2]) * fy + cy
+
+        # Check if within image bounds (the camera has already been cropped)
+        in_bounds = (
+            valid_depth &
+            (x_2d >= 0) & (x_2d < W) &
+            (y_2d >= 0) & (y_2d < H)
+        )
+
+        visible_mask |= in_bounds
+
+        if verbose:
+            num_in_this_cam = np.sum(in_bounds)
+            if num_in_this_cam > 0:
+                utils.print_rank_0(
+                    f"[visibility-check] Camera {cam.image_name}: {num_in_this_cam} gaussians visible"
+                )
+
+    num_visible = np.sum(visible_mask)
+    return num_visible, N
 
 
 class Scene:
@@ -338,6 +409,23 @@ class Scene:
 
         # Now load images only for visible/selected cameras
         self.train_cameras = cameraList_from_camInfos(train_cam_infos, args, crops=load_crops)
+
+        # CRITICAL: Apply off-center projection matrix for cropped cameras
+        # The image is cropped, but the projection matrix still assumes centered principal point.
+        # This causes gaussians to project to wrong pixel locations!
+        # apply_crop_to_camera updates the projection matrix to account for the principal point shift.
+        if visible_cam_crops and self.train_cameras:
+            utils.print_rank_0(f"[adaptive-tile] Applying off-center projection for {len(visible_cam_crops)} cropped cameras...")
+            for idx, crop, debug in visible_cam_crops:
+                if idx < len(self.train_cameras):
+                    camera = self.train_cameras[idx]
+                    cam_info = train_cam_infos[idx]
+                    # Store original dimensions before crop (needed for projection matrix calculation)
+                    camera._original_width = cam_info.width
+                    camera._original_height = cam_info.height
+                    # Apply off-center projection matrix
+                    apply_crop_to_camera(camera, crop)
+
         # output the number of cameras in the training set and image size to the log file
         log_file.write(
             "Number of local training cameras: {}\n".format(len(self.train_cameras))
@@ -406,6 +494,63 @@ class Scene:
             )
         elif hasattr(args, "load_ply_path") and args.load_ply_path:
             self.gaussians.load_ply(args.load_ply_path)
+        elif getattr(args, "pretrained_ply", "") and os.path.exists(args.pretrained_ply):
+            # Load pre-trained gaussians from PLY file (for Category 3 OOM resume)
+            print(f"\n{'='*60}", flush=True)
+            print(f"[Category 3 Resume] Loading pre-trained gaussians", flush=True)
+            print(f"{'='*60}", flush=True)
+            print(f"  PLY file: {args.pretrained_ply}", flush=True)
+            import os as _os
+            ply_size = _os.path.getsize(args.pretrained_ply) / 1024 / 1024
+            print(f"  File size: {ply_size:.2f} MB", flush=True)
+            self.gaussians.load_ply(args.pretrained_ply, init_training_tensors=True)
+            num_gaussians_local = self.gaussians.get_xyz.shape[0]
+            # Compute total across all GPUs
+            local_count = torch.tensor([num_gaussians_local], device="cuda", dtype=torch.long)
+            torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
+            num_gaussians_total = local_count.item()
+            print(f"  Loaded gaussians: TOTAL {num_gaussians_total:,} (local: {num_gaussians_local:,})", flush=True)
+
+            # Check if any gaussians are visible in the camera crop regions
+            use_pretrained = True
+            if self.train_cameras and num_gaussians_local > 0:
+                num_visible, total = check_gaussians_visibility(
+                    self.gaussians.get_xyz, self.train_cameras, verbose=True
+                )
+                print(f"  Visibility check: {num_visible}/{total} gaussians visible in crop regions", flush=True)
+
+                if num_visible == 0:
+                    print(f"\n{'!'*60}", flush=True)
+                    print(f"  WARNING: NO gaussians visible in camera crop regions!", flush=True)
+                    print(f"  This can happen when parent tile gaussians drifted away from", flush=True)
+                    print(f"  the child tile's crop regions during training.", flush=True)
+                    print(f"  -> Falling back to SfM point initialization", flush=True)
+                    print(f"{'!'*60}\n", flush=True)
+                    use_pretrained = False
+
+            if use_pretrained:
+                print(f"  (Training will RESUME from pre-trained state, NOT from scratch)", flush=True)
+                print(f"{'='*60}\n", flush=True)
+            else:
+                # Fallback: Initialize from SfM points instead
+                pcd = scene_info.point_cloud
+                if tile_bbox is not None:
+                    filtered_points, filtered_colors, filtered_normals = filter_point_cloud(
+                        np.asarray(pcd.points),
+                        np.asarray(pcd.colors),
+                        np.asarray(pcd.normals),
+                        tile_bbox
+                    )
+                    utils.print_rank_0(
+                        f"[fallback] Filtered SfM points: {len(pcd.points)} -> {len(filtered_points)}"
+                    )
+                    pcd = BasicPointCloud(
+                        points=filtered_points,
+                        colors=filtered_colors,
+                        normals=filtered_normals
+                    )
+                self.gaussians.create_from_pcd(pcd, self.cameras_extent)
+                utils.print_rank_0(f"[fallback] Initialized {len(pcd.points)} gaussians from SfM")
         elif getattr(args, "tile_scene_root", ""):
             utils.print_rank_0(
                 "[tile-ooc] Skipping initial point cloud loading; tiles will be streamed on demand"

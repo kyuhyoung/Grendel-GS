@@ -31,6 +31,38 @@ import utils.general_utils as utils
 import torch.distributed.nn.functional as dist_func
 
 
+def get_proj_offsets(camera, verbose=False):
+    """
+    Compute off-center projection offsets from camera's projection matrix.
+
+    For off-center projection (asymmetric frustum after cropping), the projection
+    matrix has non-zero P[0,2] and P[1,2] values. The NDC coordinates need to be
+    adjusted by subtracting 2*P[0,2] and 2*P[1,2] before converting to pixels.
+
+    Returns:
+        proj_offset_x: 2 * P[0,2] (0.0 for centered projection)
+        proj_offset_y: 2 * P[1,2] (0.0 for centered projection)
+    """
+    if hasattr(camera, 'projection_matrix'):
+        # projection_matrix is stored transposed: P.T
+        # So P[0,2] is at projection_matrix[2, 0]
+        # and P[1,2] is at projection_matrix[2, 1]
+        proj_matrix = camera.projection_matrix
+        p02 = proj_matrix[2, 0].item()  # P[0,2]
+        p12 = proj_matrix[2, 1].item()  # P[1,2]
+        offset_x, offset_y = 2.0 * p02, 2.0 * p12
+
+        # Log if off-center (non-zero offsets)
+        if verbose or (abs(offset_x) > 1e-6 or abs(offset_y) > 1e-6):
+            cam_name = getattr(camera, 'image_name', 'unknown')
+            print(f"[off-center] Camera {cam_name}: proj_offset=({offset_x:.6f}, {offset_y:.6f}), P[0,2]={p02:.6f}, P[1,2]={p12:.6f}")
+
+        return offset_x, offset_y
+    else:
+        # No projection matrix available, assume centered projection
+        return 0.0, 0.0
+
+
 def get_cuda_args(strategy, mode="train"):  # "test"
     args = utils.get_args()
     iteration = utils.get_cur_iter()
@@ -91,6 +123,9 @@ def replicated_preprocess3dgs(
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
+    # Get off-center projection offsets (for cropped images with shifted principal point)
+    proj_offset_x, proj_offset_y = get_proj_offsets(viewpoint_camera)
+
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -104,6 +139,8 @@ def replicated_preprocess3dgs(
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
+        proj_offset_x=proj_offset_x,
+        proj_offset_y=proj_offset_y,
     )
 
     # # print raster_settings in a json format
@@ -336,6 +373,9 @@ def distributed_preprocess3dgs_and_all2all(
         tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
         tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
+        # Get off-center projection offsets (for cropped images with shifted principal point)
+        proj_offset_x, proj_offset_y = get_proj_offsets(viewpoint_camera)
+
         raster_settings = GaussianRasterizationSettings(
             image_height=int(viewpoint_camera.image_height),
             image_width=int(viewpoint_camera.image_width),
@@ -349,6 +389,8 @@ def distributed_preprocess3dgs_and_all2all(
             campos=viewpoint_camera.camera_center,
             prefiltered=False,
             debug=pipe.debug,
+            proj_offset_x=proj_offset_x,
+            proj_offset_y=proj_offset_y,
         )
 
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -979,6 +1021,9 @@ def distributed_preprocess3dgs_and_all2all_final(
         tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
         tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
+        # Get off-center projection offsets (for cropped images with shifted principal point)
+        proj_offset_x, proj_offset_y = get_proj_offsets(viewpoint_camera)
+
         raster_settings = GaussianRasterizationSettings(
             image_height=int(viewpoint_camera.image_height),
             image_width=int(viewpoint_camera.image_width),
@@ -992,6 +1037,8 @@ def distributed_preprocess3dgs_and_all2all_final(
             campos=viewpoint_camera.camera_center,
             prefiltered=False,
             debug=pipe.debug,
+            proj_offset_x=proj_offset_x,
+            proj_offset_y=proj_offset_y,
         )
 
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -1104,6 +1151,16 @@ def distributed_preprocess3dgs_and_all2all_final(
         "batched_depths_redistributed": batched_depths_redistributed,
         "gpui_to_gpuj_imgk_size": gpui_to_gpuj_imgk_size,
     }
+
+    # DEBUG: Print gaussian counts for diagnosing Loss=0.2 issue
+    cur_iter = utils.get_cur_iter()
+    if cur_iter is not None and cur_iter % 500 == 0 and utils.LOCAL_RANK == 0:
+        for idx, (radii, means2D_redist) in enumerate(zip(batched_radii, batched_means2D_redistributed)):
+            visible_local = (radii > 0).sum().item() if radii is not None else 0
+            total_local = radii.shape[0] if radii is not None else 0
+            redist_count = means2D_redist.shape[0] if means2D_redist is not None else 0
+            cam_name = batched_viewpoint_cameras[idx].image_name if idx < len(batched_viewpoint_cameras) else "?"
+            print(f"[gaussian-debug] iter={cur_iter} cam={cam_name}: visible_local={visible_local}/{total_local}, redistributed={redist_count}", flush=True)
 
     return batched_screenspace_pkg
 

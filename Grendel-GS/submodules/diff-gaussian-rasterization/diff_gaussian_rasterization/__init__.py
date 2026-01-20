@@ -74,6 +74,8 @@ class _PreprocessGaussians(torch.autograd.Function):
             raster_settings.campos,
             raster_settings.prefiltered,
             raster_settings.debug,#raster_settings
+            raster_settings.proj_offset_x,  # off-center projection offset x
+            raster_settings.proj_offset_y,  # off-center projection offset y
             cuda_args
         )
 
@@ -113,9 +115,9 @@ class _PreprocessGaussians(torch.autograd.Function):
                 clamped,#the above are all per-Gaussian intemediate results.
                 means3D,
                 scales,
-                rotations, 
+                rotations,
                 sh, #input of this operator
-                raster_settings.scale_modifier, 
+                raster_settings.scale_modifier,
                 raster_settings.viewmatrix,
                 raster_settings.projmatrix,
                 raster_settings.tanfovx,
@@ -129,6 +131,8 @@ class _PreprocessGaussians(torch.autograd.Function):
                 grad_rgb,#gradients of output of this operator
                 num_rendered,
                 raster_settings.debug,
+                raster_settings.proj_offset_x,  # off-center projection offset x
+                raster_settings.proj_offset_y,  # off-center projection offset y
                 cuda_args)
 
         dL_dmeans3D, dL_dscales, dL_drotations, dL_dsh, dL_dopacity = _C.preprocess_gaussians_backward(*args)
@@ -292,7 +296,7 @@ class _RenderGaussians(torch.autograd.Function):
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     bg : torch.Tensor
@@ -303,6 +307,11 @@ class GaussianRasterizationSettings(NamedTuple):
     campos : torch.Tensor
     prefiltered : bool
     debug : bool
+    # Off-center projection offsets (for asymmetric frustum after cropping)
+    # These are 2 * P[0,2] and 2 * P[1,2] from the projection matrix
+    # Default 0.0 for centered projection
+    proj_offset_x : float = 0.0
+    proj_offset_y : float = 0.0
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

@@ -46,6 +46,8 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    cx: float = None  # Principal point X (None = use width/2)
+    cy: float = None  # Principal point Y (None = use height/2)
 
 
 class SceneInfo(NamedTuple):
@@ -99,29 +101,40 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
+        # Default: principal point at image center
+        cx, cy = None, None
+
         if intr.model == "SIMPLE_PINHOLE":
+            # params: [f]
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model == "PINHOLE":
+            # params: [fx, fy]
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model == "OPENCV":
-            # we're ignoring the 4 distortion
+            # params: [fx, fy, cx, cy, k1, k2, p1, p2]
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
+            cx = intr.params[2]
+            cy = intr.params[3]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model == "SIMPLE_RADIAL":
-            # params: f, cx, cy, k1
+            # params: [f, cx, cy, k1]
             focal_length_x = intr.params[0]
+            cx = intr.params[1]
+            cy = intr.params[2]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model == "RADIAL":
-            # params: f, cx, cy, k1, k2
+            # params: [f, cx, cy, k1, k2]
             focal_length_x = intr.params[0]
+            cx = intr.params[1]
+            cy = intr.params[2]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         else:
@@ -147,6 +160,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             image_name=image_name,
             width=width,
             height=height,
+            cx=cx,
+            cy=cy,
         )
 
         # release memory

@@ -27,6 +27,19 @@ ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
 # Install pytorch3d
 RUN conda run -n citygs-x conda install -y pytorch3d -c pytorch3d -c conda-forge
 
+# Reinstall PyTorch and torchvision (pytorch3d conda install may have overwritten them)
+RUN conda run -n citygs-x pip install --force-reinstall torch==2.0.0+cu118 torchvision==0.15.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+
+# Verify torch and torchvision CUDA versions match
+RUN conda run -n citygs-x python -c "\
+import torch; \
+import torchvision; \
+print(f'PyTorch version: {torch.__version__}'); \
+print(f'torchvision version: {torchvision.__version__}'); \
+print(f'PyTorch CUDA: {torch.version.cuda}'); \
+assert 'cu118' in torch.__version__ or torch.version.cuda == '11.8', f'PyTorch CUDA mismatch: {torch.version.cuda}'; \
+print('OK: torch and torchvision CUDA versions match')"
+
 # Install torch-scatter
 RUN conda run -n citygs-x pip install torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
 

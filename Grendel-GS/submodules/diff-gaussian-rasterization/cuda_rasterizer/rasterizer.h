@@ -63,6 +63,8 @@ namespace CudaRasterizer
 			const float tan_fovx, float tan_fovy,
 			const bool prefiltered,
 			bool debug,//raster_settings
+			const float proj_offset_x,  // off-center projection offset (2 * P[0,2])
+			const float proj_offset_y,  // off-center projection offset (2 * P[1,2])
 			const pybind11::dict &args);
 
 		static void preprocessBackward(
