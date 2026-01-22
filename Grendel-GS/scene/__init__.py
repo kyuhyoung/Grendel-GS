@@ -76,8 +76,14 @@ def check_gaussians_visibility(gaussian_xyz, cameras, verbose=True):
         # Get intrinsics from FoV
         fx = W / (2 * np.tan(cam.FoVx / 2))
         fy = H / (2 * np.tan(cam.FoVy / 2))
-        cx = W / 2
-        cy = H / 2
+        # Use actual principal point if available (for off-center/cropped cameras)
+        cx = cam._cx if hasattr(cam, '_cx') and cam._cx is not None else W / 2
+        cy = cam._cy if hasattr(cam, '_cy') and cam._cy is not None else H / 2
+
+        if verbose and utils.GLOBAL_RANK == 0:
+            is_offcenter = (hasattr(cam, '_cx') and cam._cx is not None)
+            if is_offcenter:
+                print(f"[visibility-check] Camera {cam.image_name}: W={W}, H={H}, cx={cx:.1f}, cy={cy:.1f} (off-center)", flush=True)
 
         # Project to 2D
         x_2d = (xyz_cam[:, 0] / xyz_cam[:, 2]) * fx + cx

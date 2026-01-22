@@ -136,7 +136,7 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, cro
         uid=id,
         image_width=resolution[0],  # Pass explicit size for distributed storage
         image_height=resolution[1],
-        cx=getattr(cam_info, 'cx', None),  # Principal point from COLMAP
+        cx=getattr(cam_info, 'cx', None),  # Original principal point (will be adjusted by apply_crop_to_camera)
         cy=getattr(cam_info, 'cy', None),
     )
 

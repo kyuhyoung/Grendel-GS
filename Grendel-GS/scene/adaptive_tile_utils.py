@@ -603,6 +603,10 @@ def apply_crop_to_camera(camera, crop: CropRegion):
         new_cx = orig_cx - crop.x_min
         new_cy = orig_cy - crop.y_min
 
+        # CRITICAL: Update camera._cx and _cy with adjusted values for visibility check
+        camera._cx = new_cx
+        camera._cy = new_cy
+
         # Offset from center of cropped image (in pixels)
         offset_x = new_cx - (crop.width / 2.0)
         offset_y = new_cy - (crop.height / 2.0)
