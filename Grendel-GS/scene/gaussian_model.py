@@ -242,6 +242,12 @@ class GaussianModel:
             self._opacity,
         ]
 
+    def parameters(self):
+        """Yield all trainable parameters (similar to nn.Module.parameters())"""
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                yield param
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -576,7 +582,10 @@ class GaussianModel:
             scale = scale[mask]
             rotation = rotation[mask]
             after_filter = xyz.shape[0]
-            print(f"[save_ply] filter_bbox applied: {before_filter:,} -> {after_filter:,} gaussians", flush=True)
+            # Extract filename from path for clearer logging
+            filename = os.path.basename(path)
+            pct = 100.0 * after_filter / before_filter if before_filter > 0 else 0
+            print(f"[save_ply] rank={group.rank()} filter_bbox: {before_filter:,} -> {after_filter:,} ({pct:.1f}%) -> {filename}", flush=True)
 
         utils.log_cpu_memory_usage("after change gpu tensor to cpu numpy")
 

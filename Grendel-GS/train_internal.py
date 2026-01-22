@@ -2,6 +2,9 @@ import os
 import sys
 import gc
 import signal
+import time
+import threading
+import _thread
 import torch
 import json
 import random
@@ -47,6 +50,12 @@ from src.image_loss_utils import (
 from src.tile_storage import TileStorage
 from src.tile_training_utils import load_tiles_as_tensors, write_back_tiles
 from scene.adaptive_tile_utils import TileBBox
+from datetime import datetime
+
+
+def _ts():
+    """Get current timestamp string for logging (HH:MM:SS.mmm)"""
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
 # Exit codes for adaptive tile training
@@ -63,6 +72,7 @@ _SIGTERM_GAUSSIANS = None  # Reference to GaussianModel
 _SIGTERM_ARGS = None       # Reference to training args
 _SIGTERM_LOG_FILE = None   # Reference to log file
 _SIGTERM_ITERATION = 0     # Current iteration
+_OOM_SAVE_IN_PROGRESS = False  # Flag to prevent duplicate saves
 
 
 def register_sigterm_state(gaussians, args, log_file, iteration: int):
@@ -80,22 +90,43 @@ def _sigterm_handler(signum, frame):
     When another rank catches OOM and exits, torchrun terminates other ranks.
     This handler checks if OOM signal file exists and saves gaussians before exit.
     """
-    global _SIGTERM_GAUSSIANS, _SIGTERM_ARGS, _SIGTERM_LOG_FILE, _SIGTERM_ITERATION
+    global _SIGTERM_GAUSSIANS, _SIGTERM_ARGS, _SIGTERM_LOG_FILE, _SIGTERM_ITERATION, _OOM_SAVE_IN_PROGRESS
 
     rank = utils.GLOBAL_RANK if hasattr(utils, 'GLOBAL_RANK') else 0
 
     # IMMEDIATE log write - this is the first thing we do
     # If this doesn't appear in log, SIGTERM handler was never called
+    ts = _ts()
     if _SIGTERM_LOG_FILE:
         try:
             _SIGTERM_LOG_FILE.write(f"\n{'='*60}\n")
-            _SIGTERM_LOG_FILE.write(f"[SIGTERM] HANDLER CALLED! Rank {rank} at iter {_SIGTERM_ITERATION}\n")
+            _SIGTERM_LOG_FILE.write(f"[{ts}] [SIGTERM] HANDLER CALLED! Rank {rank} at iter {_SIGTERM_ITERATION}\n")
             _SIGTERM_LOG_FILE.write(f"{'='*60}\n")
             _SIGTERM_LOG_FILE.flush()
         except:
             pass
 
-    print(f"\n[SIGTERM] Rank {rank} received SIGTERM signal!", flush=True)
+    print(f"\n[{ts}] [SIGTERM] Rank {rank} received SIGTERM signal!", flush=True)
+
+    # Check if save is already in progress (via signal check in main loop)
+    # If so, let that save complete - don't try to save again
+    if _OOM_SAVE_IN_PROGRESS:
+        print(f"[SIGTERM] Rank {rank}: Save already in progress, waiting for completion...", flush=True)
+        if _SIGTERM_LOG_FILE:
+            try:
+                _SIGTERM_LOG_FILE.write(f"[SIGTERM] Rank {rank}: Save in progress, exiting without duplicate save\n")
+                _SIGTERM_LOG_FILE.flush()
+            except:
+                pass
+        # Wait briefly for save to complete (up to 60s)
+        # This gives the main save process time to finish
+        import time
+        for _ in range(60):
+            if not _OOM_SAVE_IN_PROGRESS:
+                print(f"[SIGTERM] Rank {rank}: Save completed, exiting", flush=True)
+                break
+            time.sleep(1)
+        sys.exit(EXIT_CODE_OOM)
 
     if _SIGTERM_GAUSSIANS is None or _SIGTERM_ARGS is None:
         print(f"[SIGTERM] Rank {rank}: No gaussian state registered, exiting immediately", flush=True)
@@ -161,6 +192,12 @@ def _sigterm_handler(signum, frame):
         except:
             pass
 
+    # Write ack file (even though we received SIGTERM, write it for logging)
+    try:
+        write_oom_ack(_SIGTERM_ARGS, rank)
+    except Exception:
+        pass
+
     try:
         handled = handle_oom_signal_from_other_rank(
             signal_data, _SIGTERM_GAUSSIANS, _SIGTERM_ARGS, _SIGTERM_ITERATION,
@@ -205,6 +242,144 @@ def install_sigterm_handler():
 # this signal at each iteration start and enter the save-and-exit path.
 
 OOM_SIGNAL_FILENAME = "oom_signal.json"
+
+# Global OOM signal monitor instance (set by training function)
+_oom_signal_monitor: Optional["OOMSignalMonitor"] = None
+
+
+class OOMSignalMonitor:
+    """Background thread that monitors for OOM signals from other ranks.
+
+    This solves the problem where ranks are stuck in collective operations
+    (like all_reduce) and cannot check for OOM signals in the main loop.
+    The monitor thread runs independently and can detect signals even when
+    the main thread is blocked.
+
+    For Category 3 OOM (where PLY saving is needed), the monitor will
+    interrupt the main thread using _thread.interrupt_main() to force it
+    out of blocking collective operations.
+    """
+
+    def __init__(self, args, rank: int, world_size: int):
+        self.args = args
+        self.rank = rank
+        self.world_size = world_size
+        self.signal_detected = False
+        self.detected_signal_data: Optional[dict] = None
+        self.stop_event = threading.Event()
+        self.ack_written = False
+        self.main_thread_interrupted = False
+        self.thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        """Start the monitor thread."""
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+        print(f"[oom-monitor] Rank {self.rank} started OOM signal monitor thread", flush=True)
+
+    def stop(self):
+        """Stop the monitor thread."""
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+        print(f"[oom-monitor] Rank {self.rank} stopped OOM signal monitor thread", flush=True)
+
+    def _monitor_loop(self):
+        """Main monitoring loop - runs in background thread."""
+        signal_path = get_oom_signal_path(self.args)
+        check_interval = 0.5  # Check every 0.5 seconds
+
+        while not self.stop_event.is_set():
+            try:
+                if signal_path.exists() and not self.signal_detected:
+                    with open(signal_path, "r") as f:
+                        signal_data = json.load(f)
+
+                    signaling_rank = signal_data.get("signaling_rank")
+
+                    # Only respond to signals from OTHER ranks
+                    if signaling_rank is not None and signaling_rank != self.rank:
+                        with self._lock:
+                            if not self.signal_detected:  # Double-check under lock
+                                self.signal_detected = True
+                                self.detected_signal_data = signal_data
+                                category = signal_data.get("category", "?")
+                                iteration = signal_data.get("iteration", "?")
+                                print(f"\n[oom-monitor] Rank {self.rank} detected OOM signal from rank {signaling_rank} (cat={category}, iter={iteration})", flush=True)
+
+                                # Write ack immediately
+                                self._write_ack()
+
+                                # For Category 3, interrupt main thread to force PLY saving
+                                if category == 3 and not self.main_thread_interrupted:
+                                    print(f"[oom-monitor] Rank {self.rank} Category 3 OOM - interrupting main thread for PLY save", flush=True)
+                                    self.main_thread_interrupted = True
+                                    # Small delay to ensure ack is written
+                                    time.sleep(0.2)
+                                    try:
+                                        _thread.interrupt_main()
+                                        print(f"[oom-monitor] Rank {self.rank} sent interrupt to main thread", flush=True)
+                                    except Exception as e:
+                                        print(f"[oom-monitor] Rank {self.rank} failed to interrupt main thread: {e}", flush=True)
+            except (json.JSONDecodeError, IOError, KeyError):
+                pass  # Ignore transient file read errors
+
+            # Sleep in small increments to respond to stop_event quickly
+            for _ in range(int(check_interval * 10)):
+                if self.stop_event.is_set():
+                    break
+                time.sleep(0.1)
+
+    def _write_ack(self):
+        """Write acknowledgment file."""
+        if self.ack_written:
+            return
+
+        try:
+            ack_path = get_oom_ack_path(self.args, self.rank)
+            ack_data = {
+                "rank": self.rank,
+                "timestamp": time.time(),
+                "from_monitor_thread": True,
+            }
+            temp_path = ack_path.with_suffix(".tmp")
+            with open(temp_path, "w") as f:
+                json.dump(ack_data, f)
+            temp_path.rename(ack_path)
+            self.ack_written = True
+            print(f"[oom-monitor] Rank {self.rank} wrote ack file (from monitor thread)", flush=True)
+        except Exception as e:
+            print(f"[oom-monitor] Rank {self.rank} failed to write ack: {e}", flush=True)
+
+    def check_and_get_signal(self) -> Optional[dict]:
+        """Check if signal was detected (called from main thread).
+
+        Returns:
+            Signal data if detected, None otherwise.
+        """
+        with self._lock:
+            if self.signal_detected:
+                return self.detected_signal_data
+            return None
+
+    def clear_signal(self):
+        """Clear the detected signal (after handling)."""
+        with self._lock:
+            self.signal_detected = False
+            self.detected_signal_data = None
+            self.ack_written = False
+
+
+def get_oom_signal_monitor() -> Optional["OOMSignalMonitor"]:
+    """Get the global OOM signal monitor instance."""
+    return _oom_signal_monitor
+
+
+def set_oom_signal_monitor(monitor: Optional["OOMSignalMonitor"]):
+    """Set the global OOM signal monitor instance."""
+    global _oom_signal_monitor
+    _oom_signal_monitor = monitor
 
 
 def get_oom_signal_path(args) -> Path:
@@ -254,9 +429,21 @@ def write_oom_signal(args, iteration: int, oom_cause: str, category: int):
 def check_oom_signal(args) -> Optional[dict]:
     """Check if OOM signal file exists and return its contents.
 
+    This function first checks the monitor thread (if running) for signals
+    detected while the main thread was blocked in collective operations.
+    Then falls back to checking the file directly.
+
     Returns:
         Signal data dict if signal exists, None otherwise.
     """
+    # First check the monitor thread (it can detect signals even when main thread is blocked)
+    monitor = get_oom_signal_monitor()
+    if monitor is not None:
+        signal_data = monitor.check_and_get_signal()
+        if signal_data is not None:
+            return signal_data
+
+    # Fall back to checking the file directly
     signal_path = get_oom_signal_path(args)
     if signal_path.exists():
         try:
@@ -282,12 +469,22 @@ def get_oom_done_path(args, rank: int) -> Path:
     return signal_path.parent / f"oom_done_rank{rank}.json"
 
 
-def write_oom_done(args, rank: int, gaussians_saved: int):
-    """Write OOM done file to indicate this rank has finished saving."""
+def write_oom_done(args, rank: int, gaussians_saved: int, count_a: int = 0, count_b: int = 0):
+    """Write OOM done file to indicate this rank has finished saving.
+
+    Args:
+        args: Training arguments
+        rank: Rank ID
+        gaussians_saved: Total gaussians saved by this rank
+        count_a: Gaussians saved for Child A (for validation)
+        count_b: Gaussians saved for Child B (for validation)
+    """
     done_path = get_oom_done_path(args, rank)
     done_data = {
         "rank": rank,
         "gaussians_saved": gaussians_saved,
+        "count_a": count_a,  # For merge validation
+        "count_b": count_b,  # For merge validation
         "done": True,
     }
     temp_path = done_path.with_suffix(".tmp")
@@ -297,41 +494,52 @@ def write_oom_done(args, rank: int, gaussians_saved: int):
     print(f"[oom-signal] Rank {rank} wrote done file: {done_path}", flush=True)
 
 
-def check_all_ranks_done(args, world_size: int, timeout: float = 120.0) -> bool:
-    """Wait for all ranks to write their done files.
+def check_all_ranks_done(args, world_size: int, timeout: float = 120.0, target_ranks: list = None) -> bool:
+    """Wait for specific ranks to write their done files.
 
     Args:
         args: Training arguments
-        world_size: Total number of ranks
+        world_size: Total number of ranks (used if target_ranks is None)
         timeout: Maximum seconds to wait
+        target_ranks: List of specific ranks to wait for. If None, wait for all ranks.
 
     Returns:
-        True if all ranks done, False if timeout
+        True if all target ranks done, False if timeout
     """
-    import time
     start_time = time.time()
     check_interval = 0.5  # Check every 0.5 seconds
 
+    # If target_ranks not specified, wait for all ranks
+    if target_ranks is None:
+        target_ranks = list(range(world_size))
+
+    if not target_ranks:
+        print(f"[oom-signal] No target ranks to wait for", flush=True)
+        return True
+
+    print(f"[oom-signal] Waiting for done files from ranks: {target_ranks}", flush=True)
+
     while time.time() - start_time < timeout:
         all_done = True
-        for rank in range(world_size):
+        for rank in target_ranks:
             done_path = get_oom_done_path(args, rank)
             if not done_path.exists():
                 all_done = False
                 break
 
         if all_done:
-            print(f"[oom-signal] All {world_size} ranks have completed saving!", flush=True)
+            elapsed = time.time() - start_time
+            print(f"[oom-signal] All {len(target_ranks)} target ranks completed in {elapsed:.1f}s!", flush=True)
             return True
 
         time.sleep(check_interval)
         elapsed = time.time() - start_time
         if int(elapsed) % 2 == 0 and int(elapsed) > 0:  # Print every 2 seconds
-            missing = [r for r in range(world_size) if not get_oom_done_path(args, r).exists()]
-            print(f"[oom-signal] Waiting for ranks {missing} to complete... ({elapsed:.0f}s)", flush=True)
+            missing = [r for r in target_ranks if not get_oom_done_path(args, r).exists()]
+            print(f"[oom-signal] Waiting for ranks {missing} to complete... ({elapsed:.0f}s/{timeout:.0f}s)", flush=True)
 
-    missing = [r for r in range(world_size) if not get_oom_done_path(args, r).exists()]
-    print(f"[oom-signal] TIMEOUT after {timeout}s! Missing ranks: {missing}", flush=True)
+    missing = [r for r in target_ranks if not get_oom_done_path(args, r).exists()]
+    print(f"[oom-signal] TIMEOUT after {timeout:.0f}s! Missing ranks: {missing}", flush=True)
     return False
 
 
@@ -343,6 +551,151 @@ def clear_oom_done_files(args, world_size: int):
             done_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def get_oom_ack_path(args, rank: int) -> Path:
+    """Get the path to the OOM acknowledgment file for a specific rank."""
+    signal_path = get_oom_signal_path(args)
+    return signal_path.parent / f"oom_ack_rank{rank}.json"
+
+
+def write_oom_ack(args, rank: int):
+    """Write OOM ack file to indicate this rank has seen the signal.
+
+    This is called IMMEDIATELY when a rank detects the signal, BEFORE
+    it starts saving gaussians. This allows the OOM rank to know that
+    this rank will NOT enter backward() and get stuck in all_reduce.
+    """
+    ack_path = get_oom_ack_path(args, rank)
+    ack_data = {
+        "rank": rank,
+        "acked": True,
+        "timestamp": time.time(),
+    }
+    temp_path = ack_path.with_suffix(".tmp")
+    with open(temp_path, "w") as f:
+        json.dump(ack_data, f)
+    temp_path.rename(ack_path)
+    print(f"[{_ts()}] [oom-signal] Rank {rank} wrote ack file: {ack_path.name}", flush=True)
+
+
+def wait_for_all_acks(args, world_size: int, signaling_rank: int, timeout: float = 60.0) -> tuple:
+    """Wait for all OTHER ranks to acknowledge the OOM signal.
+
+    This is called by the OOM rank after writing the signal file.
+    It waits until all other ranks have seen the signal (and thus won't
+    enter backward() and get stuck in all_reduce).
+
+    Args:
+        args: Training arguments
+        world_size: Total number of ranks
+        signaling_rank: The rank that wrote the signal (don't wait for itself)
+        timeout: Maximum seconds to wait
+
+    Returns:
+        Tuple of (all_acked: bool, acked_ranks: list)
+        - all_acked: True if all ranks acknowledged within timeout
+        - acked_ranks: List of ranks that acknowledged (for done-file waiting)
+    """
+    start_time = time.time()
+    check_interval = 0.5  # Check every 0.5 seconds
+
+    # We wait for all ranks except the signaling rank
+    expected_ranks = [r for r in range(world_size) if r != signaling_rank]
+
+    if not expected_ranks:
+        print(f"[oom-signal] No other ranks to wait for (world_size={world_size})", flush=True)
+        return True, []
+
+    print(f"[oom-signal] Rank {signaling_rank} waiting for acks from ranks {expected_ranks}...", flush=True)
+
+    prev_acked_set = set()
+    last_progress_print = 0
+
+    while time.time() - start_time < timeout:
+        acked_ranks = []
+        missing_ranks = []
+
+        for rank in expected_ranks:
+            ack_path = get_oom_ack_path(args, rank)
+            if ack_path.exists():
+                acked_ranks.append(rank)
+            else:
+                missing_ranks.append(rank)
+
+        if not missing_ranks:
+            elapsed = time.time() - start_time
+            print(f"[oom-signal] SUCCESS: All {len(expected_ranks)} ranks acknowledged in {elapsed:.1f}s!", flush=True)
+            return True, acked_ranks
+
+        # Print when a NEW ack is received (not every iteration)
+        current_acked_set = set(acked_ranks)
+        new_acks = current_acked_set - prev_acked_set
+        if new_acks:
+            elapsed = time.time() - start_time
+            # Check if ack came from monitor thread
+            for new_rank in sorted(new_acks):
+                ack_path = get_oom_ack_path(args, new_rank)
+                from_monitor = False
+                try:
+                    with open(ack_path, "r") as f:
+                        ack_data = json.load(f)
+                        from_monitor = ack_data.get("from_monitor_thread", False)
+                except:
+                    pass
+                source = " (from monitor thread)" if from_monitor else ""
+                print(f"[oom-signal] +++ Rank {new_rank} acked!{source} ({len(acked_ranks)}/{len(expected_ranks)}) [{elapsed:.1f}s]", flush=True)
+            prev_acked_set = current_acked_set
+
+        time.sleep(check_interval)
+        elapsed = time.time() - start_time
+        elapsed_int = int(elapsed)
+        if elapsed_int >= last_progress_print + 5:  # Print every 5 seconds
+            last_progress_print = elapsed_int
+            print(f"[oom-signal] Waiting: {len(acked_ranks)}/{len(expected_ranks)} acks, missing={missing_ranks} ({elapsed_int}s/{int(timeout)}s)", flush=True)
+
+    # Timeout - some ranks didn't ack (probably stuck in all_reduce)
+    acked_ranks = [r for r in expected_ranks if get_oom_ack_path(args, r).exists()]
+    missing_ranks = [r for r in expected_ranks if r not in acked_ranks]
+    elapsed = time.time() - start_time
+    print(f"[oom-signal] TIMEOUT after {elapsed:.0f}s! Ranks {missing_ranks} didn't ack (probably in all_reduce)", flush=True)
+    print(f"[oom-signal] Acked ranks: {acked_ranks} - will wait for their done files", flush=True)
+    print(f"[oom-signal] Non-acked ranks: {missing_ranks} - will save via SIGTERM handler after exit", flush=True)
+    return False, acked_ranks
+
+
+def clear_oom_ack_files(args, world_size: int):
+    """Remove all OOM ack files."""
+    for rank in range(world_size):
+        ack_path = get_oom_ack_path(args, rank)
+        try:
+            ack_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def get_acked_ranks(args, world_size: int, signaling_rank: int) -> list:
+    """Get list of ranks that have acknowledged the OOM signal.
+
+    This reads existing ack files to determine which ranks are NOT stuck
+    in backward() and will be saving gaussians.
+
+    Args:
+        args: Training arguments
+        world_size: Total number of ranks
+        signaling_rank: The rank that triggered OOM (won't have ack file)
+
+    Returns:
+        List of rank IDs that have acknowledged (excluding signaling_rank)
+    """
+    acked = []
+    for rank in range(world_size):
+        if rank == signaling_rank:
+            continue  # OOM rank doesn't write ack
+        ack_path = get_oom_ack_path(args, rank)
+        if ack_path.exists():
+            acked.append(rank)
+    return acked
 
 
 def handle_oom_signal_from_other_rank(
@@ -384,6 +737,11 @@ def handle_oom_signal_from_other_rank(
     log_file.write(f"[oom-signal] Category 3 - will save gaussians\n")
     log_file.flush()
 
+    # Set flag to prevent duplicate saves from SIGTERM handler
+    global _OOM_SAVE_IN_PROGRESS
+    _OOM_SAVE_IN_PROGRESS = True
+    print(f"[oom-signal] Rank {utils.GLOBAL_RANK}: Save started (flag set)", flush=True)
+
     # Get tile info for saving
     tile_bbox_str = getattr(args, "tile_bbox", "")
     if not tile_bbox_str:
@@ -406,49 +764,118 @@ def handle_oom_signal_from_other_rank(
     # Use the signal iteration for file naming (matches signaling rank's files)
     use_iteration = signal_iteration
 
-    print(f"[oom-signal] Rank {utils.GLOBAL_RANK} saving local gaussians for tile split...", flush=True)
+    print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} saving local gaussians for tile split...", flush=True)
     print(f"  Parent tile: {tile_id}, level: {parent_level} -> child level: {child_level}", flush=True)
     print(f"  Child tile A: {tile_a_id}, bbox: {tile_a.to_string()}", flush=True)
     print(f"  Child tile B: {tile_b_id}, bbox: {tile_b.to_string()}", flush=True)
     print(f"  Output dir: {tile_output_dir}", flush=True)
 
-    # Save tile A
-    temp_path_a = tile_output_dir / f"{tile_a_id}_L{child_level}_temp.ply"
-    count_a = gaussians.save_ply(str(temp_path_a), filter_bbox=tile_a, local_only=True)
+    # IMPORTANT: Save tile B FIRST, then tile A
+    # Reason: Child B tends to be larger due to non-uniform gaussian distribution.
+    # If SIGKILL arrives during save, we want the larger tile (B) to be saved first.
+    # This way, SIGTERM-triggered ranks have a better chance of saving both tiles,
+    # or at least the larger/more important one.
 
-    # Rename to final path
-    actual_path_a = tile_output_dir / f"{tile_a_id}_L{child_level}_temp_rank{utils.GLOBAL_RANK}.ply"
-    final_path_a = tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{use_iteration}_rank{utils.GLOBAL_RANK}.ply"
-    if actual_path_a.exists() and count_a > 0:
-        actual_path_a.rename(final_path_a)
-        print(f"  [SAVED] Tile A rank{utils.GLOBAL_RANK}: {count_a:,} gaussians", flush=True)
-        print(f"          -> {final_path_a}", flush=True)
-    elif actual_path_a.exists():
-        actual_path_a.unlink(missing_ok=True)
-        print(f"  [SKIP] Tile A rank{utils.GLOBAL_RANK}: 0 gaussians (file deleted)", flush=True)
+    # CRITICAL: Aggressively clear GPU memory before saving PLY
+    import gc
 
-    # Save tile B
-    temp_path_b = tile_output_dir / f"{tile_b_id}_L{child_level}_temp.ply"
-    count_b = gaussians.save_ply(str(temp_path_b), filter_bbox=tile_b, local_only=True)
+    # Clear gradients on all gaussian parameters
+    for param in gaussians.parameters():
+        if param.grad is not None:
+            param.grad = None
 
-    # Rename to final path
-    actual_path_b = tile_output_dir / f"{tile_b_id}_L{child_level}_temp_rank{utils.GLOBAL_RANK}.ply"
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    print(f"  [GPU cleanup] Cleared gradients and cache. Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB", flush=True)
+
+    # Save tile B first - directly to final path (no temp file to avoid race condition)
+    # Note: save_ply with local_only=True appends _rank{N} to the path
+    print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} >>> STARTING Child B save...", flush=True)
+    final_base_b = tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{use_iteration}.ply"
+    count_b = gaussians.save_ply(str(final_base_b), filter_bbox=tile_b, local_only=True)
     final_path_b = tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{use_iteration}_rank{utils.GLOBAL_RANK}.ply"
-    if actual_path_b.exists() and count_b > 0:
-        actual_path_b.rename(final_path_b)
-        print(f"  [SAVED] Tile B rank{utils.GLOBAL_RANK}: {count_b:,} gaussians", flush=True)
-        print(f"          -> {final_path_b}", flush=True)
-    elif actual_path_b.exists():
-        actual_path_b.unlink(missing_ok=True)
-        print(f"  [SKIP] Tile B rank{utils.GLOBAL_RANK}: 0 gaussians (file deleted)", flush=True)
+    if count_b > 0:
+        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} <<< COMPLETED Child B: {count_b:,} gaussians -> {final_path_b.name}", flush=True)
+    else:
+        if final_path_b.exists():
+            final_path_b.unlink(missing_ok=True)
+        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} <<< SKIP Child B: 0 gaussians", flush=True)
+
+    # Clear cache again before second save
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Save tile A second - directly to final path
+    print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} >>> STARTING Child A save...", flush=True)
+    final_base_a = tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{use_iteration}.ply"
+    count_a = gaussians.save_ply(str(final_base_a), filter_bbox=tile_a, local_only=True)
+    # Actual file created: {final_base_a}_rank{N}.ply
+    final_path_a = tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{use_iteration}_rank{utils.GLOBAL_RANK}.ply"
+    if count_a > 0:
+        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} <<< COMPLETED Child A: {count_a:,} gaussians -> {final_path_a.name}", flush=True)
+    else:
+        # Remove empty file
+        if final_path_a.exists():
+            final_path_a.unlink(missing_ok=True)
+        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} <<< SKIP Child A: 0 gaussians", flush=True)
 
     total_saved = count_a + count_b
-    print(f"[oom-signal] Rank {utils.GLOBAL_RANK} finished. Total saved: {total_saved:,} gaussians", flush=True)
+
+    # Print split comparison
+    if total_saved > 0:
+        pct_a = 100.0 * count_a / total_saved
+        pct_b = 100.0 * count_b / total_saved
+        print(f"[oom-signal] Rank {utils.GLOBAL_RANK} split summary:", flush=True)
+        print(f"  Child A ({tile_a_id}): {count_a:,} gaussians ({pct_a:.1f}%)", flush=True)
+        print(f"  Child B ({tile_b_id}): {count_b:,} gaussians ({pct_b:.1f}%)", flush=True)
+        print(f"  Total: {total_saved:,} gaussians", flush=True)
+    else:
+        print(f"[oom-signal] Rank {utils.GLOBAL_RANK} finished. Total saved: 0 gaussians", flush=True)
+
     log_file.write(f"[oom-signal] Rank {utils.GLOBAL_RANK} saved {total_saved:,} gaussians\n")
     log_file.flush()
 
     # Write done file to signal completion to the signaling rank
-    write_oom_done(args, utils.GLOBAL_RANK, total_saved)
+    # Include per-child counts for merge validation
+    write_oom_done(args, utils.GLOBAL_RANK, total_saved, count_a=count_a, count_b=count_b)
+
+    # Clear save-in-progress flag
+    _OOM_SAVE_IN_PROGRESS = False
+    print(f"[oom-signal] Rank {utils.GLOBAL_RANK}: Save completed (flag cleared)", flush=True)
+
+    # CRITICAL: Wait for ALL saving ranks to finish before exiting
+    # This includes:
+    # - acked_ranks: non-OOM ranks that detected signal and are saving
+    # - signaling_rank: the OOM rank that is also saving
+    # This prevents torchrun from killing ranks that are still saving
+    # when this rank exits first.
+    acked_ranks = get_acked_ranks(args, utils.WORLD_SIZE, signaling_rank)
+
+    # Include the signaling rank (OOM rank) in the wait list
+    # The OOM rank also saves gaussians and writes a done file
+    all_saving_ranks = list(set(acked_ranks + [signaling_rank]))
+    all_saving_ranks.sort()
+
+    if all_saving_ranks:
+        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} waiting for all saving ranks {all_saving_ranks} to complete...", flush=True)
+        # Wait indefinitely - no timeout. All ranks MUST complete saving.
+        # If a rank crashes, torchrun will eventually kill us via SIGTERM.
+        # Using a very long timeout (1 hour) as safety net, but this should never be reached.
+        all_done = check_all_ranks_done(args, utils.WORLD_SIZE, timeout=3600.0, target_ranks=all_saving_ranks)
+        if all_done:
+            print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK}: All saving ranks completed! Now safe to exit together.", flush=True)
+        else:
+            # This should never happen in normal operation
+            # If we reach here, something is seriously wrong
+            print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK}: FATAL - TIMEOUT after 1 hour waiting for saving ranks!", flush=True)
+            print(f"[oom-signal] This indicates a serious problem - some ranks may have crashed.", flush=True)
+            # Don't sys.exit here - let the process end naturally so torchrun can handle it
+    else:
+        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK}: No other saving ranks to wait for.", flush=True)
 
     return True
 
@@ -565,6 +992,39 @@ def _is_oom_error(exception: BaseException) -> bool:
         "out of memory" in str(exception).lower() or
         "CUDA" in str(exception) and "memory" in str(exception).lower()
     )
+
+
+def _is_nccl_timeout_error(exception: BaseException) -> bool:
+    """Check if an exception is a NCCL timeout error.
+
+    NCCL timeout errors occur when one rank fails to participate in a collective
+    operation within the timeout period. This typically happens when:
+    - One rank crashed (e.g., OOM)
+    - One rank exited early
+    - Network issues between ranks
+
+    Common error messages include:
+    - "Timed out initializing process group"
+    - "NCCL communicator was aborted"
+    - "Watchdog caught collective operation timeout"
+    - "NCCL error: unhandled system error"
+    - "Work ... timed out"
+    """
+    if not isinstance(exception, (RuntimeError, Exception)):
+        return False
+
+    error_msg = str(exception).lower()
+    timeout_indicators = [
+        "timed out",
+        "timeout",
+        "nccl communicator was aborted",
+        "watchdog caught collective operation",
+        "nccl error",
+        "unhandled system error",
+        "connection reset by peer",
+        "software caused connection abort",
+    ]
+    return any(indicator in error_msg for indicator in timeout_indicators)
 
 
 # ============================================================================
@@ -765,8 +1225,30 @@ def handle_adaptive_tile_oom(
     tile_output_dir = Path(tile_output_dir)
     tile_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # CRITICAL: Write OOM signal IMMEDIATELY to notify other ranks
-    # This must happen BEFORE any complex operations that might fail due to memory pressure
+    # CRITICAL: Check if another rank already wrote OOM signal
+    # If so, don't write our own signal - just ack and handle
+    existing_signal = check_oom_signal(args)
+    if existing_signal and existing_signal.get("signaling_rank") != utils.GLOBAL_RANK:
+        signaling_rank = existing_signal.get('signaling_rank')
+        signal_category = existing_signal.get('category', '?')
+        print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} OOM but signal already exists from rank {signaling_rank} (cat={signal_category})", flush=True)
+        print(f"[oom-signal] Rank {utils.GLOBAL_RANK} will ack and handle existing signal instead of writing new one", flush=True)
+        # Handle the existing signal (this will ack, save PLY if needed, and exit)
+        handled = handle_oom_signal_from_other_rank(
+            existing_signal, gaussians, args, iteration, log_file
+        )
+        print(f"[oom-signal] Rank {utils.GLOBAL_RANK} handle_oom_signal_from_other_rank returned: {handled}", flush=True)
+        if handled:
+            print(f"[oom-signal] Rank {utils.GLOBAL_RANK} exiting with code 42 (handled existing signal)", flush=True)
+            sys.exit(42)  # Exit with OOM code
+        else:
+            print(f"[oom-signal] Rank {utils.GLOBAL_RANK} handle returned False, will write own signal", flush=True)
+        # If not handled, fall through to write our own signal
+
+    # No existing signal (or it was ours), write new one
+    if not existing_signal:
+        print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} no existing signal found, will write new one", flush=True)
+
     # Calculate OOM category early for signal
     densify_from_early = getattr(args, 'densify_from_iter', 500)
     densify_interval_early = getattr(args, 'densification_interval', 100)
@@ -780,16 +1262,31 @@ def handle_adaptive_tile_oom(
     print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} IMMEDIATE signal write (iter={iteration}, cat={oom_category_early})", flush=True)
     write_oom_signal(args, iteration, early_cause, oom_category_early)
 
-    # Give other ranks time to check the signal file before we continue
-    # This is critical because other ranks may be in loss computation and will
-    # check for OOM signal before starting backward (which would cause them to block forever)
-    # Note: 20 seconds is needed because:
-    #   - Other ranks may be in loss computation (can take 5-10s for large images)
-    #   - They need to finish loss and reach pre-backward check point
-    #   - If they enter backward (all_reduce) before seeing signal, they'll block forever
-    print(f"[oom-signal] Rank {utils.GLOBAL_RANK} waiting 20s for other ranks to detect signal...", flush=True)
-    import time
-    time.sleep(20.0)
+    # Only wait for acks if Category 3 (need PLY saving from other ranks)
+    # Category 1/2: No PLY saving needed, other ranks are likely stuck in collective ops anyway
+    if oom_category_early == 3:
+        # Wait for other ranks to acknowledge the signal (dynamic waiting)
+        # This is CRITICAL: we wait until all other ranks have written ack files,
+        # which means they've seen the signal and will NOT enter backward() (all_reduce).
+        # If some ranks don't ack within timeout, they're probably stuck in backward()
+        # already and will be saved via SIGTERM handler after we exit.
+        #
+        # Timeout is 60s - should be enough for even the longest loss computation.
+        # We use dynamic ack-based waiting instead of fixed sleep because:
+        #   - Early/large tiles have long loss computation (20s was too short)
+        #   - Small tiles finish quickly (20s was wasteful)
+        #   - Ack-based waiting adapts to actual completion time
+        all_acked, acked_ranks = wait_for_all_acks(args, utils.WORLD_SIZE, utils.GLOBAL_RANK, timeout=60.0)
+
+        if all_acked:
+            print(f"[oom-signal] Proceeding with OOM handling - all ranks will save PLY.", flush=True)
+        else:
+            print(f"[oom-signal] Proceeding with OOM handling - stuck ranks will save via SIGTERM.", flush=True)
+            print(f"[oom-signal] Will wait for done files only from acked ranks: {acked_ranks}", flush=True)
+    else:
+        # Category 1/2: Skip ack waiting - no PLY saving needed
+        print(f"[oom-signal] Category {oom_category_early} OOM - skipping ack wait (no PLY saving needed)", flush=True)
+        all_acked, acked_ranks = False, []
 
     # Get memory tracker for detailed analysis
     memory_tracker = get_memory_tracker()
@@ -928,42 +1425,76 @@ def handle_adaptive_tile_oom(
         print(f"[adaptive-tile] >>> Category 3 OOM: Saving trained gaussians for resume <<<", flush=True)
         print(f"  Using LOCAL_ONLY mode (each rank saves independently)", flush=True)
 
-        # Each rank saves its local gaussians for tile A (with filter_bbox applied locally)
-        # Files will be named: {tile_id}_L{level}_temp_rank{rank}.ply
-        print(f"  Saving tile A ({tile_a_id}) - rank {utils.GLOBAL_RANK}...", flush=True)
-        temp_path_a = tile_output_dir / f"{tile_a_id}_L{child_level}_temp.ply"
-        count_a = gaussians.save_ply(str(temp_path_a), filter_bbox=tile_a, local_only=True)
-        print(f"  Rank {utils.GLOBAL_RANK} saved {count_a:,} gaussians for tile A", flush=True)
+        # CRITICAL: Aggressively clear GPU memory before saving PLY
+        # When OOM happens, GPU is nearly full. We need to free as much as possible:
+        # 1. Clear gradients on all gaussian parameters (frees gradient tensors)
+        # 2. Force Python garbage collection
+        # 3. Synchronize CUDA and clear PyTorch's memory cache
+        import gc
 
-        # Each rank saves its local gaussians for tile B
-        print(f"  Saving tile B ({tile_b_id}) - rank {utils.GLOBAL_RANK}...", flush=True)
-        temp_path_b = tile_output_dir / f"{tile_b_id}_L{child_level}_temp.ply"
-        count_b = gaussians.save_ply(str(temp_path_b), filter_bbox=tile_b, local_only=True)
-        print(f"  Rank {utils.GLOBAL_RANK} saved {count_b:,} gaussians for tile B", flush=True)
+        # Clear gradients - this frees the .grad tensors attached to parameters
+        for param in gaussians.parameters():
+            if param.grad is not None:
+                param.grad = None
 
-        # Record the PLY directory prefix (wrapper will find all rank files and merge them)
-        # Files are: {tile_id}_L{level}_temp_rank0.ply, {tile_id}_L{level}_temp_rank1.ply, etc.
+        # Force garbage collection to free any unreferenced tensors
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        # Report memory status
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"  [GPU cleanup] Cleared gradients and cache. Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB", flush=True)
+
+        # PLY prefix for wrapper to find all rank files
         ply_prefix_a = str(tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{iteration}")
         ply_prefix_b = str(tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{iteration}")
 
-        # Rename temp files on this rank
-        actual_path_a = tile_output_dir / f"{tile_a_id}_L{child_level}_temp_rank{utils.GLOBAL_RANK}.ply"
-        final_path_a = tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{iteration}_rank{utils.GLOBAL_RANK}.ply"
-        if actual_path_a.exists() and count_a > 0:
-            actual_path_a.rename(final_path_a)
-            print(f"  [SAVED] Tile A rank{utils.GLOBAL_RANK}: {count_a:,} gaussians -> {final_path_a.name}", flush=True)
-        elif actual_path_a.exists():
-            actual_path_a.unlink(missing_ok=True)
+        # IMPORTANT: Save tile B FIRST, then tile A
+        # Reason: Child B tends to be larger due to non-uniform gaussian distribution.
+        # If SIGKILL arrives during save, we want the larger tile (B) to be saved first.
 
-        actual_path_b = tile_output_dir / f"{tile_b_id}_L{child_level}_temp_rank{utils.GLOBAL_RANK}.ply"
+        # Save tile B first - directly to final path (no temp file to avoid race condition)
+        # save_ply with local_only=True appends _rank{N} to the path
+        print(f"  Saving tile B ({tile_b_id}) - rank {utils.GLOBAL_RANK}...", flush=True)
+        final_base_b = tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{iteration}.ply"
+        count_b = gaussians.save_ply(str(final_base_b), filter_bbox=tile_b, local_only=True)
         final_path_b = tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{iteration}_rank{utils.GLOBAL_RANK}.ply"
-        if actual_path_b.exists() and count_b > 0:
-            actual_path_b.rename(final_path_b)
+        if count_b > 0:
             print(f"  [SAVED] Tile B rank{utils.GLOBAL_RANK}: {count_b:,} gaussians -> {final_path_b.name}", flush=True)
-        elif actual_path_b.exists():
-            actual_path_b.unlink(missing_ok=True)
+        else:
+            if final_path_b.exists():
+                final_path_b.unlink(missing_ok=True)
+            print(f"  [SKIP] Tile B rank{utils.GLOBAL_RANK}: 0 gaussians", flush=True)
 
-        print(f"  Rank {utils.GLOBAL_RANK} finished saving. Total local: {count_a + count_b:,} gaussians", flush=True)
+        # Clear cache again before second save
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Save tile A second - directly to final path
+        print(f"  Saving tile A ({tile_a_id}) - rank {utils.GLOBAL_RANK}...", flush=True)
+        final_base_a = tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{iteration}.ply"
+        count_a = gaussians.save_ply(str(final_base_a), filter_bbox=tile_a, local_only=True)
+        final_path_a = tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{iteration}_rank{utils.GLOBAL_RANK}.ply"
+        if count_a > 0:
+            print(f"  [SAVED] Tile A rank{utils.GLOBAL_RANK}: {count_a:,} gaussians -> {final_path_a.name}", flush=True)
+        else:
+            if final_path_a.exists():
+                final_path_a.unlink(missing_ok=True)
+            print(f"  [SKIP] Tile A rank{utils.GLOBAL_RANK}: 0 gaussians", flush=True)
+
+        # Print split comparison
+        total_local = count_a + count_b
+        if total_local > 0:
+            pct_a = 100.0 * count_a / total_local
+            pct_b = 100.0 * count_b / total_local
+            print(f"\n[adaptive-tile] Rank {utils.GLOBAL_RANK} split summary:", flush=True)
+            print(f"  Child A ({tile_a_id}): {count_a:,} gaussians ({pct_a:.1f}%)", flush=True)
+            print(f"  Child B ({tile_b_id}): {count_b:,} gaussians ({pct_b:.1f}%)", flush=True)
+            print(f"  Total: {total_local:,} gaussians", flush=True)
+        else:
+            print(f"  Rank {utils.GLOBAL_RANK} finished saving. Total local: 0 gaussians", flush=True)
 
         # Set ply_path to the prefix (wrapper will look for *_rank*.ply files)
         ply_path_a = ply_prefix_a if count_a > 0 else None
@@ -1014,20 +1545,44 @@ def handle_adaptive_tile_oom(
     log_file.flush()
 
     # Write done file for this rank (even for Category 1/2, to unblock other ranks)
+    # Include per-child counts for merge validation
     total_saved = count_a + count_b
-    write_oom_done(args, utils.GLOBAL_RANK, total_saved)
+    write_oom_done(args, utils.GLOBAL_RANK, total_saved, count_a=count_a, count_b=count_b)
 
-    # Wait briefly for other ranks that may be actively checking signal
-    # Short timeout (10s): if other ranks are stuck in distributed collectives,
-    # they won't save until they receive SIGTERM after this rank exits
-    print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} waiting for other ranks (10s)...", flush=True)
-    print(f"[oom-signal] Note: Stuck ranks will save via SIGTERM handler after exit.", flush=True)
-    all_done = check_all_ranks_done(args, utils.WORLD_SIZE, timeout=10.0)
+    # Wait ONLY for acked ranks' done files (dynamic waiting, not fixed timeout)
+    #
+    # Key insight:
+    # - acked_ranks: saw signal before backward(), will save and write done files
+    # - non-acked_ranks: stuck in backward(), can ONLY save via SIGTERM after we exit
+    #
+    # We wait for acked_ranks because they WILL write done files (and quickly).
+    # We do NOT wait for non-acked_ranks because:
+    #   1. They can't write done files until they receive SIGTERM
+    #   2. SIGTERM is only sent AFTER we exit
+    #   3. Waiting for them would be waiting forever
+    #
+    # Timeline:
+    #   1. OOM rank: signal -> ack wait -> save -> done -> wait for acked ranks' done -> exit
+    #   2. Acked ranks: see signal -> ack -> save -> done -> exit (before OOM rank exits)
+    #   3. Stuck ranks: in backward() -> (OOM rank exits) -> SIGTERM -> save -> exit
+    #
+    # With this approach:
+    # - Acked ranks finish quickly, OOM rank proceeds without fixed delay
+    # - Stuck ranks get full SIGTERM grace period from torchrun (default ~30s)
 
-    if all_done:
-        print(f"[oom-signal] All ranks completed! Safe to exit.", flush=True)
+    if acked_ranks:
+        print(f"\n[oom-signal] Waiting for acked ranks {acked_ranks} to complete saving...", flush=True)
+        # Wait indefinitely for acked ranks - they MUST complete saving.
+        # Using 1 hour timeout as safety net, but should never be reached.
+        all_done = check_all_ranks_done(args, utils.WORLD_SIZE, timeout=3600.0, target_ranks=acked_ranks)
+        if all_done:
+            print(f"[oom-signal] All acked ranks completed! Safe to exit.", flush=True)
+        else:
+            print(f"[oom-signal] FATAL - TIMEOUT after 1 hour waiting for acked ranks!", flush=True)
+            print(f"[oom-signal] This indicates a serious problem - some ranks may have crashed.", flush=True)
     else:
-        print(f"[oom-signal] Some ranks not done yet - they will save via SIGTERM handler.", flush=True)
+        print(f"\n[oom-signal] No acked ranks to wait for (all stuck in backward())", flush=True)
+        print(f"[oom-signal] Stuck ranks will save via SIGTERM handler after exit.", flush=True)
 
     return True  # OOM was handled
 
@@ -1374,6 +1929,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     tile_loss_scheduler = TileImageLossScheduler(args, background)
 
+    # Start OOM signal monitor thread (for distributed OOM handling)
+    oom_monitor = None
+    if getattr(args, "adaptive_tile_enabled", False) and utils.WORLD_SIZE > 1:
+        oom_monitor = OOMSignalMonitor(args, utils.GLOBAL_RANK, utils.WORLD_SIZE)
+        oom_monitor.start()
+        set_oom_signal_monitor(oom_monitor)
+
     # Training Loop
     end2end_timers = End2endTimer(args)
     end2end_timers.start()
@@ -1418,8 +1980,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 oom_signal = check_oom_signal(args)
                 if oom_signal and oom_signal.get("signaling_rank") != utils.GLOBAL_RANK:
                     # Another rank caught OOM - save our gaussians and exit
-                    print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected OOM signal!", flush=True)
-                    log_file.write(f"[oom-signal] Rank {utils.GLOBAL_RANK} detected signal at iter {iteration}\n")
+                    print(f"\n[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected OOM signal! (iter_start)", flush=True)
+                    log_file.write(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} detected signal at iter {iteration} (iter_start)\n")
+
+                    # IMMEDIATELY write ack file - this tells the OOM rank we won't enter backward()
+                    write_oom_ack(args, utils.GLOBAL_RANK)
 
                     handled = handle_oom_signal_from_other_rank(
                         oom_signal, gaussians, args, iteration, log_file
@@ -1430,7 +1995,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         progress_bar.clear()
                         progress_bar.disable = True
                         progress_bar.close()
-                        print(f"[oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
+                        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
                         sys.exit(EXIT_CODE_OOM)
 
             if debug_first_iters:
@@ -1604,8 +2169,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             if adaptive_tile_mode:
                 oom_signal = check_oom_signal(args)
                 if oom_signal and oom_signal.get("signaling_rank") != utils.GLOBAL_RANK:
-                    print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected OOM signal (post-render)!", flush=True)
-                    log_file.write(f"[oom-signal] Rank {utils.GLOBAL_RANK} detected signal at iter {iteration} (post-render)\n")
+                    print(f"\n[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected OOM signal! (post-render)", flush=True)
+                    log_file.write(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} detected signal at iter {iteration} (post-render)\n")
+                    # IMMEDIATELY write ack file - this tells the OOM rank we won't enter backward()
+                    write_oom_ack(args, utils.GLOBAL_RANK)
                     handled = handle_oom_signal_from_other_rank(
                         oom_signal, gaussians, args, iteration, log_file
                     )
@@ -1615,7 +2182,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         progress_bar.clear()
                         progress_bar.disable = True
                         progress_bar.close()
-                        print(f"[oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
+                        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
                         sys.exit(EXIT_CODE_OOM)
 
             # Save debug images for off-center projection verification
@@ -1651,9 +2218,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     log_file.write(f"[oom-check] iter={iteration} pre-loss: signal={'YES' if oom_signal else 'no'}\n")
                     log_file.flush()
                 if oom_signal and oom_signal.get("signaling_rank") != utils.GLOBAL_RANK:
-                    print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected OOM signal (pre-loss)!", flush=True)
-                    log_file.write(f"[oom-signal] Rank {utils.GLOBAL_RANK} detected signal at iter {iteration} (pre-loss)\n")
+                    print(f"\n[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected OOM signal! (pre-loss)", flush=True)
+                    log_file.write(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} detected signal at iter {iteration} (pre-loss)\n")
                     log_file.flush()
+                    # IMMEDIATELY write ack file - this tells the OOM rank we won't enter backward()
+                    write_oom_ack(args, utils.GLOBAL_RANK)
                     handled = handle_oom_signal_from_other_rank(
                         oom_signal, gaussians, args, iteration, log_file
                     )
@@ -1663,7 +2232,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         progress_bar.clear()
                         progress_bar.disable = True
                         progress_bar.close()
-                        print(f"[oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
+                        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
                         sys.exit(EXIT_CODE_OOM)
 
             set_current_operation("loss_computation (L1+SSIM)")
@@ -1688,9 +2257,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     log_file.write(f"[oom-check] iter={iteration} pre-backward: signal={'YES' if oom_signal else 'no'}\n")
                     log_file.flush()
                 if oom_signal and oom_signal.get("signaling_rank") != utils.GLOBAL_RANK:
-                    print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected OOM signal (pre-backward)!", flush=True)
-                    log_file.write(f"[oom-signal] Rank {utils.GLOBAL_RANK} detected signal at iter {iteration} (pre-backward)\n")
+                    print(f"\n[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected OOM signal! (pre-backward)", flush=True)
+                    log_file.write(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} detected signal at iter {iteration} (pre-backward)\n")
                     log_file.flush()
+                    # IMMEDIATELY write ack file - this tells the OOM rank we won't enter backward()
+                    write_oom_ack(args, utils.GLOBAL_RANK)
                     handled = handle_oom_signal_from_other_rank(
                         oom_signal, gaussians, args, iteration, log_file
                     )
@@ -1700,7 +2271,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         progress_bar.clear()
                         progress_bar.disable = True
                         progress_bar.close()
-                        print(f"[oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
+                        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
                         sys.exit(EXIT_CODE_OOM)
 
             set_current_operation("backward")
@@ -1942,9 +2513,78 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             progress_bar.update(args.bsz)
             log_file.flush()
 
+    except KeyboardInterrupt:
+        # Handle KeyboardInterrupt from OOM signal monitor thread (_thread.interrupt_main())
+        # This is used to force the main thread out of blocking collective operations for PLY saving
+        if adaptive_tile_mode:
+            monitor = get_oom_signal_monitor()
+            if monitor and monitor.signal_detected and monitor.main_thread_interrupted:
+                signal_data = monitor.detected_signal_data
+                print(f"\n[{_ts()}] [oom-interrupt] Rank {utils.GLOBAL_RANK} received interrupt from OOM monitor", flush=True)
+                log_file.write(f"[{_ts()}] [oom-interrupt] Rank {utils.GLOBAL_RANK} handling interrupt from OOM monitor\n")
+
+                # Handle the OOM signal - this will save PLY for Category 3
+                handled = handle_oom_signal_from_other_rank(
+                    signal_data, gaussians, args, current_iteration, log_file
+                )
+                if handled:
+                    log_file.flush()
+                    tile_manager.finalize(gaussians)
+                    progress_bar.clear()
+                    progress_bar.disable = True
+                    progress_bar.close()
+                    print(f"[{_ts()}] [oom-interrupt] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
+                    sys.exit(EXIT_CODE_OOM)
+
+        # If not from OOM monitor, re-raise as normal KeyboardInterrupt
+        print(f"\n[{_ts()}] [interrupt] Rank {utils.GLOBAL_RANK} received KeyboardInterrupt (not from OOM monitor)", flush=True)
+        raise
+
     except Exception as e:
+        # Log exception details for debugging
+        print(f"\n[{_ts()}] [exception] Rank {utils.GLOBAL_RANK} caught exception: {type(e).__name__}", flush=True)
+        print(f"[exception] Message: {str(e)[:300]}", flush=True)
+        is_timeout = _is_nccl_timeout_error(e)
+        is_oom = _is_oom_error(e)
+        print(f"[exception] is_nccl_timeout={is_timeout}, is_oom={is_oom}, adaptive_tile_mode={adaptive_tile_mode}", flush=True)
+
+        # Handle NCCL timeout in adaptive tile mode
+        # This happens when another rank died (e.g., OOM) and this rank's collective operation timed out
+        if adaptive_tile_mode and is_timeout:
+            print(f"\n[{_ts()}] [nccl-timeout] Rank {utils.GLOBAL_RANK} caught NCCL timeout at iteration {current_iteration}", flush=True)
+            print(f"[nccl-timeout] Error: {str(e)[:200]}", flush=True)
+            log_file.write(f"[{_ts()}] [nccl-timeout] Rank {utils.GLOBAL_RANK} caught NCCL timeout: {str(e)[:200]}\n")
+
+            # Check if there's an OOM signal from another rank
+            oom_signal = check_oom_signal(args)
+            if oom_signal and oom_signal.get("signaling_rank") != utils.GLOBAL_RANK:
+                print(f"[nccl-timeout] Found OOM signal from rank {oom_signal.get('signaling_rank')}", flush=True)
+                log_file.write(f"[nccl-timeout] Found OOM signal from rank {oom_signal.get('signaling_rank')}\n")
+
+                # Write ack (in case monitor didn't)
+                write_oom_ack(args, utils.GLOBAL_RANK)
+
+                # Handle the OOM signal - this will save PLY for Category 3
+                handled = handle_oom_signal_from_other_rank(
+                    oom_signal, gaussians, args, current_iteration, log_file
+                )
+                if handled:
+                    log_file.flush()
+                    tile_manager.finalize(gaussians)
+                    progress_bar.clear()
+                    progress_bar.disable = True
+                    progress_bar.close()
+                    print(f"[{_ts()}] [nccl-timeout] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
+                    sys.exit(EXIT_CODE_OOM)
+            else:
+                # No OOM signal - this is a real NCCL error, re-raise
+                print(f"[nccl-timeout] No OOM signal found - this is a real NCCL error", flush=True)
+                log_file.write(f"[nccl-timeout] No OOM signal found - re-raising\n")
+                log_file.flush()
+                raise
+
         # Handle OOM in adaptive tile mode
-        if adaptive_tile_mode and _is_oom_error(e):
+        if adaptive_tile_mode and is_oom:
             utils.print_rank_0(f"\n[adaptive-tile] Caught OOM error at iteration {current_iteration}")
             log_file.write(f"[adaptive-tile] OOM error: {str(e)}\n")
 
@@ -1985,6 +2625,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 sys.exit(EXIT_CODE_OOM)
 
         # Re-raise if not OOM or not handled
+        print(f"[exception] Rank {utils.GLOBAL_RANK} re-raising unhandled exception: {type(e).__name__}", flush=True)
         raise
 
     # Finish training
@@ -2152,3 +2793,9 @@ def training_report(
                 )
 
         torch.cuda.empty_cache()
+
+    # Stop OOM signal monitor thread
+    _monitor = get_oom_signal_monitor()
+    if _monitor is not None:
+        _monitor.stop()
+        set_oom_signal_monitor(None)

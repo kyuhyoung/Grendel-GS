@@ -12,7 +12,7 @@
 import torch
 from torch import nn
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 import random
 import os
@@ -197,9 +197,15 @@ def init_distributed(args):
     LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
     WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
     if WORLD_SIZE > 1:
+        # Set timeout for NCCL operations (default is 30 minutes, we use 300 seconds)
+        # This ensures that if one rank dies (e.g., OOM), other ranks won't hang forever
+        # They will get a timeout exception which we can catch and handle gracefully
+        # Note: Image loading can take 2+ minutes, so we need at least 300s timeout
+        nccl_timeout = timedelta(seconds=300)
         torch.distributed.init_process_group(
-            "nccl", rank=GLOBAL_RANK, world_size=WORLD_SIZE
+            "nccl", rank=GLOBAL_RANK, world_size=WORLD_SIZE, timeout=nccl_timeout
         )
+        print(f"[distributed] Initialized with NCCL timeout={nccl_timeout.total_seconds()}s", flush=True)
         assert torch.cuda.is_available(), "Distributed mode requires CUDA"
         assert (
             torch.distributed.is_initialized()

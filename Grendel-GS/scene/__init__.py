@@ -501,6 +501,7 @@ class Scene:
             print(f"{'='*60}", flush=True)
             print(f"  PLY file: {args.pretrained_ply}", flush=True)
             import os as _os
+            import json as _json
             ply_size = _os.path.getsize(args.pretrained_ply) / 1024 / 1024
             print(f"  File size: {ply_size:.2f} MB", flush=True)
             self.gaussians.load_ply(args.pretrained_ply, init_training_tensors=True)
@@ -510,6 +511,22 @@ class Scene:
             torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
             num_gaussians_total = local_count.item()
             print(f"  Loaded gaussians: TOTAL {num_gaussians_total:,} (local: {num_gaussians_local:,})", flush=True)
+
+            # Validate against expected count from merge validation file
+            val_file = args.pretrained_ply.replace('.ply', '.validation.json')
+            if _os.path.exists(val_file):
+                try:
+                    with open(val_file) as f:
+                        val_data = _json.load(f)
+                    expected_count = val_data.get('expected_count', 0)
+                    if expected_count > 0:
+                        if num_gaussians_total == expected_count:
+                            print(f"  [Validation] ✓ Loaded count matches expected: {num_gaussians_total:,}", flush=True)
+                        else:
+                            print(f"  [Validation] ✗ Count mismatch! Loaded: {num_gaussians_total:,}, Expected: {expected_count:,}", flush=True)
+                            print(f"  [Validation]   Difference: {num_gaussians_total - expected_count:+,}", flush=True)
+                except Exception as e:
+                    print(f"  [Validation] Warning: Could not read validation file: {e}", flush=True)
 
             # Check if any gaussians are visible in the camera crop regions
             use_pretrained = True

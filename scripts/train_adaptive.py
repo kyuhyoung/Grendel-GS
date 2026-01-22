@@ -39,7 +39,53 @@ sys.path.insert(0, str(ROOT / "Grendel-GS"))
 OOM_SIGNAL_FILENAME = "oom_signal.json"
 
 
-def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str) -> int:
+def read_expected_counts_from_done_files(ply_dir: Path, num_ranks: int) -> dict:
+    """Read expected gaussian counts from done files.
+
+    Returns dict with:
+        - 'total': sum of all ranks' total saved
+        - 'count_a': sum of all ranks' Child A counts
+        - 'count_b': sum of all ranks' Child B counts
+        - 'per_rank': dict of {rank: {total, count_a, count_b}}
+    """
+    result = {
+        'total': 0,
+        'count_a': 0,
+        'count_b': 0,
+        'per_rank': {},
+        'ranks_found': 0,
+    }
+
+    for rank in range(num_ranks):
+        done_file = ply_dir / f"oom_done_rank{rank}.json"
+        if done_file.exists():
+            try:
+                with open(done_file) as f:
+                    data = json.load(f)
+                rank_total = data.get('gaussians_saved', 0)
+                rank_a = data.get('count_a', 0)
+                rank_b = data.get('count_b', 0)
+                result['total'] += rank_total
+                result['count_a'] += rank_a
+                result['count_b'] += rank_b
+                result['per_rank'][rank] = {
+                    'total': rank_total,
+                    'count_a': rank_a,
+                    'count_b': rank_b,
+                }
+                result['ranks_found'] += 1
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"[validation] Warning: Failed to read done file for rank {rank}: {e}")
+
+    return result
+
+
+class MergeError(Exception):
+    """Exception raised when PLY merge fails due to missing files."""
+    pass
+
+
+def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str, strict: bool = True) -> int:
     """
     Merge multiple PLY files from distributed training into a single file.
 
@@ -51,14 +97,36 @@ def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str) -> int:
         ply_prefix: Path prefix for rank files (without _rank{N}.ply suffix)
         num_ranks: Number of ranks that saved files
         output_path: Path for the merged output file
+        strict: If True, raise MergeError if any rank file is missing
 
     Returns:
         Total number of gaussians in merged file
+
+    Raises:
+        MergeError: If strict=True and any rank file is missing
     """
     try:
         from plyfile import PlyData, PlyElement
     except ImportError:
         print("[merge_ply] ERROR: plyfile not installed, cannot merge PLY files", flush=True)
+        if strict:
+            raise MergeError("plyfile not installed")
+        return 0
+
+    # First pass: check all files exist (strict mode)
+    missing_ranks = []
+    for rank in range(num_ranks):
+        rank_file = f"{ply_prefix}_rank{rank}.ply"
+        if not Path(rank_file).exists():
+            missing_ranks.append(rank)
+
+    if missing_ranks:
+        print(f"[merge_ply] FATAL: Missing rank files: {missing_ranks}", flush=True)
+        print(f"[merge_ply]   Expected {num_ranks} files with prefix: {ply_prefix}", flush=True)
+        for rank in missing_ranks:
+            print(f"[merge_ply]   Missing: {ply_prefix}_rank{rank}.ply", flush=True)
+        if strict:
+            raise MergeError(f"Missing {len(missing_ranks)} rank files: ranks {missing_ranks}")
         return 0
 
     all_vertices = []
@@ -66,10 +134,6 @@ def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str) -> int:
 
     for rank in range(num_ranks):
         rank_file = f"{ply_prefix}_rank{rank}.ply"
-        if not Path(rank_file).exists():
-            print(f"[merge_ply] WARNING: Rank {rank} file not found: {rank_file}", flush=True)
-            continue
-
         try:
             plydata = PlyData.read(rank_file)
             vertices = plydata['vertex']
@@ -79,10 +143,14 @@ def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str) -> int:
             print(f"[merge_ply] Read rank {rank}: {count:,} gaussians from {rank_file}", flush=True)
         except Exception as e:
             print(f"[merge_ply] ERROR reading {rank_file}: {e}", flush=True)
+            if strict:
+                raise MergeError(f"Failed to read {rank_file}: {e}")
             continue
 
     if not all_vertices:
         print("[merge_ply] ERROR: No valid rank files found", flush=True)
+        if strict:
+            raise MergeError("No valid rank files found")
         return 0
 
     # Merge all vertices
@@ -93,6 +161,13 @@ def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str) -> int:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     PlyData([merged_element]).write(output_path)
     print(f"[merge_ply] Merged {total_count:,} gaussians -> {output_path}", flush=True)
+
+    # Verify merged file was created
+    if not Path(output_path).exists():
+        print(f"[merge_ply] ERROR: Merged file was not created: {output_path}", flush=True)
+        if strict:
+            raise MergeError(f"Merged file was not created: {output_path}")
+        return 0
 
     return total_count
 
@@ -758,11 +833,15 @@ class AdaptiveTileTrainer:
         tile_model_path.mkdir(parents=True, exist_ok=True)
         tile_log_path.mkdir(parents=True, exist_ok=True)
 
-        # Clear any leftover OOM signal and done files from previous runs
+        # Clear any leftover OOM signal, ack, and done files from previous runs
         signal_file = self.ply_dir / OOM_SIGNAL_FILENAME
         if signal_file.exists():
             signal_file.unlink()
             print(f"  [Cleared leftover OOM signal file]")
+        # Clear ack files (used for dynamic waiting during OOM coordination)
+        for ack_file in self.ply_dir.glob("oom_ack_rank*.json"):
+            ack_file.unlink()
+            print(f"  [Cleared leftover ack file: {ack_file.name}]")
         # Clear done files
         for done_file in self.ply_dir.glob("oom_done_rank*.json"):
             done_file.unlink()
@@ -818,9 +897,36 @@ class AdaptiveTileTrainer:
         else:
             print(f"  Starting from scratch (SfM points)")
 
-        result = subprocess.run(cmd, cwd=str(ROOT))
+        # Run torchrun and capture output to train_adaptive.log via tee'd stdout
+        # Use Popen to stream output in real-time (so it goes through TeeOutput)
+        sys.stdout.flush()
+        sys.stderr.flush()
 
-        print(f"  [torchrun returned exit_code={result.returncode}]", flush=True)
+        # Set environment variables for better NCCL error handling
+        # TORCH_NCCL_ASYNC_ERROR_HANDLING=1: Store errors and throw as Python exceptions
+        # instead of calling std::terminate() which kills the process immediately
+        env = os.environ.copy()
+        env["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        # Also set NCCL debug level for better diagnostics
+        env["NCCL_DEBUG"] = "WARN"
+
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,  # Line buffered
+            env=env,
+        )
+        # Stream output line by line (this goes through TeeOutput -> train_adaptive.log)
+        for line in process.stdout:
+            print(line, end='', flush=True)
+        process.wait()
+        result_code = process.returncode
+        sys.stdout.flush()
+
+        print(f"  [torchrun returned exit_code={result_code}]", flush=True)
 
         # Check for OOM via state file (torchrun returns 1 even when worker exits with 42)
         state_file = self.ply_dir / "adaptive_tile_state.json"
@@ -849,6 +955,22 @@ class AdaptiveTileTrainer:
                     if signal_file.exists():
                         signal_file.unlink()
                         print(f"  [Cleared OOM signal file]")
+                    # Clear ack files (used for dynamic waiting during OOM coordination)
+                    for ack_file in self.ply_dir.glob("oom_ack_rank*.json"):
+                        ack_file.unlink()
+                        print(f"  [Cleared ack file: {ack_file.name}]")
+
+                    # Read expected counts from done files BEFORE clearing them
+                    # This is used for validation during merge
+                    num_ranks = oom_info.get("num_ranks", 1)
+                    expected_counts = read_expected_counts_from_done_files(self.ply_dir, num_ranks)
+                    if expected_counts['ranks_found'] > 0:
+                        print(f"  [Validation] Expected counts from {expected_counts['ranks_found']} rank(s):")
+                        print(f"    Child A: {expected_counts['count_a']:,} gaussians")
+                        print(f"    Child B: {expected_counts['count_b']:,} gaussians")
+                        print(f"    Total: {expected_counts['total']:,} gaussians")
+                        oom_info['expected_counts'] = expected_counts
+
                     # Clear done files
                     for done_file in self.ply_dir.glob("oom_done_rank*.json"):
                         done_file.unlink()
@@ -880,7 +1002,7 @@ class AdaptiveTileTrainer:
             except (json.JSONDecodeError, IOError) as e:
                 print(f"  [Warning] Failed to read OOM signal file: {e}")
 
-        return result.returncode, oom_info
+        return result_code, oom_info
 
     def run(self):
         """Main training loop."""
@@ -1162,37 +1284,69 @@ class AdaptiveTileTrainer:
                     is_prefix_b = tile_b_info.get("ply_is_prefix", False)
 
                     # Merge rank files if needed
+                    # Try BOTH tiles before failing - so we at least save what we can
+                    merge_errors = []
+                    count_a = 0
+                    count_b = 0
+
+                    # Try Tile A merge
                     if ply_prefix_a and is_prefix_a and num_ranks > 1:
                         print(f"  [Merging] Tile A: {num_ranks} rank files...", flush=True)
                         merged_path_a = f"{ply_prefix_a}_merged.ply"
-                        count_a = merge_ply_files(ply_prefix_a, num_ranks, merged_path_a)
-                        if count_a > 0:
+                        try:
+                            count_a = merge_ply_files(ply_prefix_a, num_ranks, merged_path_a, strict=True)
                             ply_path_a = merged_path_a
                             print(f"    Merged {count_a:,} gaussians -> {merged_path_a}", flush=True)
-                        else:
-                            print(f"    [WARNING] Merge failed, no valid PLY for tile A", flush=True)
+                        except MergeError as e:
+                            merge_errors.append(f"Tile A: {e}")
+                            print(f"    FAILED: {e}", flush=True)
                     elif ply_prefix_a and not is_prefix_a:
                         # Single file path (legacy or single-GPU)
                         if Path(ply_prefix_a).exists():
                             ply_path_a = ply_prefix_a
                         else:
-                            print(f"    [WARNING] PLY file not found: {ply_prefix_a}", flush=True)
+                            merge_errors.append(f"Tile A: PLY file not found: {ply_prefix_a}")
 
+                    # Try Tile B merge (even if Tile A failed)
                     if ply_prefix_b and is_prefix_b and num_ranks > 1:
                         print(f"  [Merging] Tile B: {num_ranks} rank files...", flush=True)
                         merged_path_b = f"{ply_prefix_b}_merged.ply"
-                        count_b = merge_ply_files(ply_prefix_b, num_ranks, merged_path_b)
-                        if count_b > 0:
+                        try:
+                            count_b = merge_ply_files(ply_prefix_b, num_ranks, merged_path_b, strict=True)
                             ply_path_b = merged_path_b
                             print(f"    Merged {count_b:,} gaussians -> {merged_path_b}", flush=True)
-                        else:
-                            print(f"    [WARNING] Merge failed, no valid PLY for tile B", flush=True)
+                        except MergeError as e:
+                            merge_errors.append(f"Tile B: {e}")
+                            print(f"    FAILED: {e}", flush=True)
                     elif ply_prefix_b and not is_prefix_b:
                         # Single file path (legacy or single-GPU)
                         if Path(ply_prefix_b).exists():
                             ply_path_b = ply_prefix_b
                         else:
-                            print(f"    [WARNING] PLY file not found: {ply_prefix_b}", flush=True)
+                            merge_errors.append(f"Tile B: PLY file not found: {ply_prefix_b}")
+
+                    # If any merge failed, report all errors and exit
+                    if merge_errors:
+                        print(f"\n{'!'*60}", flush=True)
+                        print(f"  FATAL ERROR: Category 3 OOM PLY merge failed!", flush=True)
+                        for err in merge_errors:
+                            print(f"  - {err}", flush=True)
+                        print(f"  ", flush=True)
+                        print(f"  This indicates that some GPU ranks did not complete saving.", flush=True)
+                        print(f"  Possible causes:", flush=True)
+                        print(f"    1. Ranks were killed before completing PLY save", flush=True)
+                        print(f"    2. Disk space or I/O error during save", flush=True)
+                        print(f"    3. SIGTERM timeout too short", flush=True)
+                        print(f"  ", flush=True)
+                        # Show which merges succeeded (if any)
+                        if ply_path_a:
+                            print(f"  [Partial success] Tile A merged: {ply_path_a}", flush=True)
+                        if ply_path_b:
+                            print(f"  [Partial success] Tile B merged: {ply_path_b}", flush=True)
+                        print(f"  ", flush=True)
+                        print(f"  Adaptive training cannot continue without ALL valid PLY files.", flush=True)
+                        print(f"{'!'*60}\n", flush=True)
+                        sys.exit(1)
 
                     if ply_path_a or ply_path_b:
                         print(f"  [Category 3 Resume] Child tiles will load pre-trained gaussians:", flush=True)
@@ -1200,8 +1354,54 @@ class AdaptiveTileTrainer:
                             print(f"    {tile_a_id} -> {ply_path_a}", flush=True)
                         if ply_path_b:
                             print(f"    {tile_b_id} -> {ply_path_b}", flush=True)
+
+                        # Validate merged counts against expected counts from done files
+                        expected_counts = oom_info.get('expected_counts')
+                        if expected_counts and expected_counts.get('ranks_found', 0) == num_ranks:
+                            print(f"\n  [Validation] Checking merged gaussian counts...")
+                            expected_a = expected_counts.get('count_a', 0)
+                            expected_b = expected_counts.get('count_b', 0)
+                            actual_a = count_a if (ply_prefix_a and is_prefix_a) else 0
+                            actual_b = count_b if (ply_prefix_b and is_prefix_b) else 0
+
+                            valid = True
+                            if expected_a > 0:
+                                if actual_a == expected_a:
+                                    print(f"    ✓ Child A: {actual_a:,} == expected {expected_a:,}")
+                                else:
+                                    print(f"    ✗ Child A: {actual_a:,} != expected {expected_a:,} (diff: {actual_a - expected_a:+,})")
+                                    valid = False
+                            if expected_b > 0:
+                                if actual_b == expected_b:
+                                    print(f"    ✓ Child B: {actual_b:,} == expected {expected_b:,}")
+                                else:
+                                    print(f"    ✗ Child B: {actual_b:,} != expected {expected_b:,} (diff: {actual_b - expected_b:+,})")
+                                    valid = False
+
+                            if valid:
+                                print(f"    [Validation PASSED] All gaussian counts match!")
+                                # Write validation info for load-time check
+                                if ply_path_a:
+                                    val_file_a = Path(ply_path_a).with_suffix('.validation.json')
+                                    with open(val_file_a, 'w') as f:
+                                        json.dump({'expected_count': actual_a, 'num_ranks': num_ranks}, f)
+                                if ply_path_b:
+                                    val_file_b = Path(ply_path_b).with_suffix('.validation.json')
+                                    with open(val_file_b, 'w') as f:
+                                        json.dump({'expected_count': actual_b, 'num_ranks': num_ranks}, f)
+                            else:
+                                print(f"    [Validation FAILED] Gaussian count mismatch detected!")
+                                print(f"    This may indicate incomplete saves or merge issues.")
+                        elif expected_counts:
+                            print(f"\n  [Validation] Skipped: only {expected_counts.get('ranks_found', 0)}/{num_ranks} done files found")
                     else:
-                        print(f"  [WARNING] Category 3 but no valid PLY files found after merge!", flush=True)
+                        # This should not happen - Category 3 OOM should always have PLY paths
+                        print(f"\n{'!'*60}", flush=True)
+                        print(f"  FATAL ERROR: Category 3 OOM but no PLY paths in oom_info!", flush=True)
+                        print(f"  tile_a_info: {tile_a_info}", flush=True)
+                        print(f"  tile_b_info: {tile_b_info}", flush=True)
+                        print(f"{'!'*60}\n", flush=True)
+                        sys.exit(1)
                 else:
                     print(f"  Category {oom_category} OOM: Child tiles will start from scratch", flush=True)
 
