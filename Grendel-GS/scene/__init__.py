@@ -543,37 +543,22 @@ class Scene:
                 print(f"  Visibility check: {num_visible}/{total} gaussians visible in crop regions", flush=True)
 
                 if num_visible == 0:
-                    print(f"\n{'!'*60}", flush=True)
-                    print(f"  WARNING: NO gaussians visible in camera crop regions!", flush=True)
-                    print(f"  This can happen when parent tile gaussians drifted away from", flush=True)
-                    print(f"  the child tile's crop regions during training.", flush=True)
-                    print(f"  -> Falling back to SfM point initialization", flush=True)
-                    print(f"{'!'*60}\n", flush=True)
-                    use_pretrained = False
+                    error_msg = (
+                        f"\n{'!'*60}\n"
+                        f"  FATAL ERROR: NO gaussians visible in camera crop regions!\n"
+                        f"  Loaded {total:,} pre-trained gaussians but 0 are visible.\n"
+                        f"  This indicates a bug in visibility check or projection matrix.\n"
+                        f"  (Likely off-center projection not handled correctly)\n"
+                        f"{'!'*60}\n"
+                    )
+                    print(error_msg, flush=True)
+                    raise RuntimeError(
+                        f"Visibility check failed: 0/{total} pre-trained gaussians visible. "
+                        f"This is a bug - check projection matrix handling for cropped cameras."
+                    )
 
-            if use_pretrained:
-                print(f"  (Training will RESUME from pre-trained state, NOT from scratch)", flush=True)
-                print(f"{'='*60}\n", flush=True)
-            else:
-                # Fallback: Initialize from SfM points instead
-                pcd = scene_info.point_cloud
-                if tile_bbox is not None:
-                    filtered_points, filtered_colors, filtered_normals = filter_point_cloud(
-                        np.asarray(pcd.points),
-                        np.asarray(pcd.colors),
-                        np.asarray(pcd.normals),
-                        tile_bbox
-                    )
-                    utils.print_rank_0(
-                        f"[fallback] Filtered SfM points: {len(pcd.points)} -> {len(filtered_points)}"
-                    )
-                    pcd = BasicPointCloud(
-                        points=filtered_points,
-                        colors=filtered_colors,
-                        normals=filtered_normals
-                    )
-                self.gaussians.create_from_pcd(pcd, self.cameras_extent)
-                utils.print_rank_0(f"[fallback] Initialized {len(pcd.points)} gaussians from SfM")
+            print(f"  (Training will RESUME from pre-trained state, NOT from scratch)", flush=True)
+            print(f"{'='*60}\n", flush=True)
         elif getattr(args, "tile_scene_root", ""):
             utils.print_rank_0(
                 "[tile-ooc] Skipping initial point cloud loading; tiles will be streamed on demand"
