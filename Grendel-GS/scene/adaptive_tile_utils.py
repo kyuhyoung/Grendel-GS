@@ -629,15 +629,23 @@ def apply_crop_to_camera(camera, crop: CropRegion):
         # Standard: image center maps to NDC (0, 0)
         # Off-center: shift the frustum so that (new_cx, new_cy) maps to NDC (0, 0)
 
-        # Frustum bounds at znear plane:
-        # right = (crop.width - new_cx) / focal_x * znear
-        # left = -new_cx / focal_x * znear
-        # top = (crop.height - new_cy) / focal_y * znear
-        # bottom = -new_cy / focal_y * znear
-        right = (crop.width - new_cx) / focal_x * znear
-        left = -new_cx / focal_x * znear
-        top = (crop.height - new_cy) / focal_y * znear
-        bottom = -new_cy / focal_y * znear
+        # Frustum bounds at znear plane (for off-center projection):
+        #
+        # Pinhole model: pixel_x = fx * X/Z + cx
+        # NDC: ndc_x = 2 * pixel_x / width - 1 = (2*fx/width) * X/Z + (2*cx - width)/width
+        #
+        # For P[0,2] = (right + left) / (right - left) = (2*cx - width) / width:
+        #   right = cx / fx * znear
+        #   left = -(width - cx) / fx * znear
+        #
+        # Verification (centered case, cx = width/2):
+        #   right = (width/2) / fx * znear = tan(fovX/2) * znear  ✓
+        #   left = -(width/2) / fx * znear = -tan(fovX/2) * znear  ✓
+        #
+        right = new_cx / focal_x * znear
+        left = -(crop.width - new_cx) / focal_x * znear
+        top = new_cy / focal_y * znear
+        bottom = -(crop.height - new_cy) / focal_y * znear
 
         # Debug print for principal point adjustment
         cx_source = "COLMAP" if getattr(camera, '_cx', None) is not None else "center"
