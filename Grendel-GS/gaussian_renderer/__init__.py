@@ -43,6 +43,20 @@ def get_proj_offsets(camera, verbose=False):
         proj_offset_x: 2 * P[0,2] (0.0 for centered projection)
         proj_offset_y: 2 * P[1,2] (0.0 for centered projection)
     """
+    # First check for explicit offsets (from cropping)
+    if hasattr(camera, '_proj_offset_x'):
+        offset_x = camera._proj_offset_x
+        offset_y = camera._proj_offset_y
+        
+        if verbose or (abs(offset_x) > 1e-6 or abs(offset_y) > 1e-6):
+            cam_name = getattr(camera, 'image_name', 'unknown')
+            p02 = offset_x / 2.0
+            p12 = offset_y / 2.0
+            print(f"[off-center] Camera {cam_name}: proj_offset=({offset_x:.6f}, {offset_y:.6f}), P[0,2]={p02:.6f}, P[1,2]={p12:.6f}")
+        
+        return offset_x, offset_y
+    
+    # Otherwise compute from projection matrix
     if hasattr(camera, 'projection_matrix'):
         # projection_matrix is stored transposed: P.T
         # So P[0,2] is at projection_matrix[2, 0]

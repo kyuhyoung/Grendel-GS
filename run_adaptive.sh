@@ -32,7 +32,8 @@ echo "============================================"
 # ============================================
 SOURCE_PATH="/data/dabeeo/samsung_dong_mini_30"
 OUTPUT_PATH="./output/adaptive_test"
-NUM_GPUS=4
+# Auto-detect number of available GPUs
+NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 GPU_IDS=""  # e.g., "0,1,2,3" or "4,5,6,7"
 ITERATIONS=1000
 BACKEND="default"
@@ -50,6 +51,11 @@ DENSIFY_GRAD_THRESHOLD=0.0002
 # Debug image saving (for off-center projection verification)
 # Set to comma-separated iterations, e.g., "1,100,500,1000" or empty to use defaults
 DEBUG_SAVE_ITERS="1"
+
+# Visual debugging for projection and crop
+VISUAL_DEBUG=false
+VISUAL_DEBUG_ONLY=false
+VISUAL_DEBUG_LEVEL=""  # Empty means level 0 (default)
 
 # ============================================
 # Parse arguments
@@ -73,6 +79,9 @@ print_usage() {
     echo "  --densify-grad-threshold N  Gradient threshold for densification (default: 0.0002, lower=faster growth)"
     echo "  --explosive-densification   Enable aggressive densification to trigger OOM from gaussian growth"
     echo "  --debug-save-iters ITERS    Comma-separated iterations to save debug GT/rendered images (default: 1,100,500,1000)"
+    echo "  --visual-debug              Enable visual debugging for projection and crop calculations"
+    echo "  --visual-debug-only         Run only visual debugging and exit (no training)"
+    echo "  --visual-debug-level N      Debug at specific tile level (default: 0, use higher for split tiles)"
     echo ""
 }
 
@@ -125,6 +134,19 @@ while [[ $# -gt 0 ]]; do
         --explosive-densification)
             EXPLOSIVE_DENSIFICATION=true
             shift
+            ;;
+        --visual-debug)
+            VISUAL_DEBUG=true
+            shift
+            ;;
+        --visual-debug-only)
+            VISUAL_DEBUG=true
+            VISUAL_DEBUG_ONLY=true
+            shift
+            ;;
+        --visual-debug-level)
+            VISUAL_DEBUG_LEVEL="$2"
+            shift 2
             ;;
         --debug-save-iters)
             DEBUG_SAVE_ITERS="$2"
@@ -233,10 +255,8 @@ fi
 if [[ -n "$GPU_IDS" ]]; then
     # Calculate NUM_GPUS from GPU_IDS (count commas + 1)
     GPU_COUNT=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
-    if [[ "$NUM_GPUS" == "4" ]]; then
-        # Default value, override with calculated count
-        NUM_GPUS=$GPU_COUNT
-    fi
+    # Always override NUM_GPUS with actual GPU count from GPU_IDS
+    NUM_GPUS=$GPU_COUNT
     export CUDA_VISIBLE_DEVICES="$GPU_IDS"
     echo "Setting CUDA_VISIBLE_DEVICES=${GPU_IDS}"
 fi
@@ -286,6 +306,21 @@ CMD+=" --ndc_limit ${NDC_LIMIT}"
 CMD+=" --densify_from_iter ${DENSIFY_FROM_ITER}"
 CMD+=" --densification_interval ${DENSIFICATION_INTERVAL}"
 CMD+=" --densify_grad_threshold ${DENSIFY_GRAD_THRESHOLD}"
+
+# Add visual debug flag if enabled
+if [[ "$VISUAL_DEBUG" == "true" ]]; then
+    CMD+=" --visual_debug"
+fi
+
+# Add visual debug only flag if enabled
+if [[ "$VISUAL_DEBUG_ONLY" == "true" ]]; then
+    CMD+=" --visual_debug_only"
+fi
+
+# Add visual debug level if specified
+if [[ -n "$VISUAL_DEBUG_LEVEL" ]]; then
+    CMD+=" --visual_debug_level ${VISUAL_DEBUG_LEVEL}"
+fi
 
 echo "Running: ${CMD}"
 echo ""

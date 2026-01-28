@@ -253,6 +253,14 @@ class AdaptiveTileTrainer:
             shutil.rmtree(self.debug_images_dir)
         self.debug_images_dir.mkdir(parents=True, exist_ok=True)
 
+        # Clear and recreate projection_debug folder on each run
+        import shutil
+        self.projection_debug_dir = self.output_path / "projection_debug"
+        if self.projection_debug_dir.exists():
+            shutil.rmtree(self.projection_debug_dir)
+            print(f"[Init] Cleared folder: {self.projection_debug_dir}")
+        # Don't create it here - let it be created when needed
+
         # Load scene info
         self.scene_bbox, self.num_points = self._load_scene_info()
         self.cam_infos = self._load_camera_infos()
@@ -385,7 +393,8 @@ class AdaptiveTileTrainer:
         print(f"[Scene] Loaded {len(cam_infos)} cameras")
         return cam_infos
 
-    def _compute_visible_cameras(self, tile_bbox: BBox, margin: int = 100) -> List[str]:
+    def _compute_visible_cameras(self, tile_bbox: BBox, margin: int = 100, 
+                                tile_id: str = None, visual_debug: bool = False) -> List[str]:
         """
         Compute which cameras can see the tile.
 
@@ -395,6 +404,16 @@ class AdaptiveTileTrainer:
         from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
         visible = []
+        
+        # Setup visual debug if requested
+        if visual_debug and tile_id:
+            visual_debug_dir = self.output_path / "projection_debug" / tile_id
+            # Remove existing debug directory and recreate it
+            import shutil
+            if visual_debug_dir.exists():
+                shutil.rmtree(visual_debug_dir)
+            visual_debug_dir.mkdir(parents=True, exist_ok=True)
+        
         corners = np.array([
             [tile_bbox.x_min, tile_bbox.y_min, tile_bbox.z_min],
             [tile_bbox.x_min, tile_bbox.y_min, tile_bbox.z_max],
@@ -445,8 +464,152 @@ class AdaptiveTileTrainer:
             # Check overlap with image
             if x_max > 0 and x_min < cam["width"] and y_max > 0 and y_min < cam["height"]:
                 visible.append(cam["image_name"])
+                
+                # Save visual debug if requested
+                if visual_debug and tile_id:
+                    self._save_visual_debug(cam, tile_bbox, tile_id, x_min, x_max, y_min, y_max, visual_debug_dir)
 
         return visible
+    
+    def _save_visual_debug(self, cam, tile_bbox, tile_id, x_min, x_max, y_min, y_max, visual_debug_dir):
+        """Save visual debug using the new side-by-side visualization."""
+        try:
+            # Import the new visualization function
+            import sys
+            import os
+            import numpy as np
+            sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'Grendel-GS', 'scene'))
+            from adaptive_tile_utils import save_projection_debug_visualization, TileBBox, CropRegion
+            from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+            
+            # Convert to proper format
+            from src.tile_storage import BBox as StorageBBox
+            scene_bbox = StorageBBox(
+                min_xyz=np.array([tile_bbox.x_min, tile_bbox.y_min, tile_bbox.z_min]),
+                max_xyz=np.array([tile_bbox.x_max, tile_bbox.y_max, tile_bbox.z_max])
+            )
+            tile_bbox_3d = TileBBox(
+                scene_bbox.min[0], scene_bbox.min[1], scene_bbox.min[2],  # x_min, y_min, z_min
+                scene_bbox.max[0], scene_bbox.max[1], scene_bbox.max[2]   # x_max, y_max, z_max
+            )
+            
+            # Create crop region
+            crop = CropRegion(
+                x_min=max(0, int(x_min)),
+                y_min=max(0, int(y_min)),
+                x_max=min(cam["width"], int(x_max)),
+                y_max=min(cam["height"], int(y_max))
+            )
+            
+            # Build projection matrix
+            Rt = getWorld2View2(cam["R"], cam["T"])
+            world_view = Rt.T
+            proj = getProjectionMatrix(
+                znear=0.01, zfar=100.0,
+                fovX=cam["fov_x"], fovY=cam["fov_y"]
+            ).cpu().numpy().T
+            full_proj = world_view @ proj
+            
+            # Create camera info object
+            class CamInfo:
+                def __init__(self, cam_dict):
+                    self.R = cam_dict["R"]
+                    self.T = cam_dict["T"] 
+                    self.width = cam_dict["width"]
+                    self.height = cam_dict["height"]
+                    self.image_name = cam_dict["image_name"]
+                    self.cx = cam_dict.get("cx", None)
+                    self.cy = cam_dict.get("cy", None)
+            
+            cam_info = CamInfo(cam)
+            
+            # Calculate fixed image bounds to include all corner projections across all cameras
+            # Get 8 corners of the tile bbox
+            corners = np.array([
+                [tile_bbox.x_min, tile_bbox.y_min, tile_bbox.z_min],
+                [tile_bbox.x_min, tile_bbox.y_min, tile_bbox.z_max],
+                [tile_bbox.x_min, tile_bbox.y_max, tile_bbox.z_min],
+                [tile_bbox.x_min, tile_bbox.y_max, tile_bbox.z_max],
+                [tile_bbox.x_max, tile_bbox.y_min, tile_bbox.z_min],
+                [tile_bbox.x_max, tile_bbox.y_min, tile_bbox.z_max],
+                [tile_bbox.x_max, tile_bbox.y_max, tile_bbox.z_min],
+                [tile_bbox.x_max, tile_bbox.y_max, tile_bbox.z_max],
+            ], dtype=np.float32)
+            
+            # Track min/max projected coordinates across all cameras
+            all_px_min, all_py_min = float('inf'), float('inf')
+            all_px_max, all_py_max = float('-inf'), float('-inf')
+            
+            # Also track max image dimensions
+            max_width = 0
+            max_height = 0
+            
+            for cam_dict in self.cam_infos:
+                max_width = max(max_width, cam_dict["width"])
+                max_height = max(max_height, cam_dict["height"])
+                
+                # Build projection matrix for this camera
+                Rt_cam = getWorld2View2(cam_dict["R"], cam_dict["T"])
+                world_view_cam = Rt_cam.T
+                proj_cam = getProjectionMatrix(
+                    znear=0.01, zfar=100.0,
+                    fovX=cam_dict["fov_x"], fovY=cam_dict["fov_y"]
+                ).cpu().numpy().T
+                full_proj_cam = world_view_cam @ proj_cam
+                
+                # Project corners
+                corners_h = np.concatenate([corners, np.ones((8, 1))], axis=1)
+                clip = corners_h @ full_proj_cam
+                
+                w = clip[:, 3]
+                valid = w > 0.001
+                if np.any(valid):
+                    # NDC to pixel coordinates
+                    ndc = np.zeros((8, 2))
+                    ndc[valid] = clip[valid, :2] / w[valid, np.newaxis]
+                    
+                    px = (ndc[:, 0] + 1.0) * 0.5 * cam_dict["width"]
+                    py = (ndc[:, 1] + 1.0) * 0.5 * cam_dict["height"]
+                    
+                    # Update global min/max (including invalid/behind-camera points)
+                    all_px_min = min(all_px_min, px.min())
+                    all_px_max = max(all_px_max, px.max())
+                    all_py_min = min(all_py_min, py.min())
+                    all_py_max = max(all_py_max, py.max())
+            
+            # Add margin to ensure all corners are visible
+            margin_ratio = 0.2  # 20% additional margin
+            x_range = all_px_max - all_px_min
+            y_range = all_py_max - all_py_min
+            
+            # Use the larger of: projection range or image size
+            x_span = max(x_range, max_width)
+            y_span = max(y_range, max_height)
+            
+            margin_x = x_span * margin_ratio
+            margin_y = y_span * margin_ratio
+            
+            # Set bounds to include all projected corners with margin
+            fixed_image_bounds = (
+                min(all_px_min - margin_x, -margin_x),
+                min(all_py_min - margin_y, -margin_y),
+                max(all_px_max + margin_x, max_width + margin_x),
+                max(all_py_max + margin_y, max_height + margin_y)
+            )
+            
+            # Use new visualization with all cameras
+            save_projection_debug_visualization(
+                tile_bbox_3d, cam_info, crop, full_proj,
+                str(visual_debug_dir), tile_id, 0, 
+                full_scene_bbox=tile_bbox_3d,
+                all_cameras=self.cam_infos,
+                fixed_image_bounds=fixed_image_bounds
+            )
+            
+        except Exception as e:
+            print(f"[Visual Debug] Failed to save visualization: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _clear_visualizations(self):
         """Clear visualizations folder."""
@@ -1052,11 +1215,52 @@ class AdaptiveTileTrainer:
                 traceback.print_exc()
 
             # Compute visible cameras
-            visible_cameras = self._compute_visible_cameras(tile.bbox, self.args.tile_crop_margin)
+            visible_cameras = self._compute_visible_cameras(
+                tile.bbox, self.args.tile_crop_margin,
+                tile_id=tile.tile_id, visual_debug=self.args.visual_debug
+            )
             tile.num_cameras = len(visible_cameras)
             print(f"  Visible cameras: {len(visible_cameras)} / {len(self.cam_infos)}")
             if visible_cameras:
                 print(f"    Names: {visible_cameras[:5]}{'...' if len(visible_cameras) > 5 else ''}")
+            
+            # If visual_debug_only, generate images for all levels up to target
+            if self.args.visual_debug_only:
+                print(f"  [Visual Debug] Generated images for level {current_level}")
+                print(f"  Debug images saved to: {self.output_path}/projection_debug/{tile.tile_id}/")
+                
+                if current_level == self.args.visual_debug_level:
+                    print("\n" + "=" * 60)
+                    print(f"Visual Debug Complete! Generated images for levels 0-{current_level}")
+                    print("Exiting (--visual-debug-only mode)")
+                    print("=" * 60)
+                    import sys
+                    sys.exit(0)
+                elif current_level < self.args.visual_debug_level:
+                    print(f"  [Visual Debug] Continuing to level {current_level + 1} (target: level {self.args.visual_debug_level})")
+                    # Simulate OOM to force split for reaching next level
+                    print(f"  [Visual Debug] Simulating OOM to split tile")
+                    
+                    # Split tile logic (same as preemptive split)
+                    bbox_a, bbox_b = tile.bbox.split()
+                    tile_a_id = self._next_tile_id()
+                    tile_b_id = self._next_tile_id()
+                    
+                    tile.status = "split"
+                    tile.fail_iter = 0  # Mark as visual debug split
+                    tile.oom_type = "visual_debug"
+                    
+                    # Create child tiles
+                    child_a = TileInfo(tile_a_id, bbox_a, "pending")
+                    child_b = TileInfo(tile_b_id, bbox_b, "pending")
+                    
+                    # Add to tiles dict and save state
+                    self.tiles[tile_a_id] = child_a
+                    self.tiles[tile_b_id] = child_b
+                    self._save_state()
+                    
+                    print(f"  Split into {tile_a_id} and {tile_b_id} for visual debug")
+                    continue
 
             if len(visible_cameras) == 0:
                 print(f"  [Warning] No cameras see this tile, skipping...")
@@ -1470,6 +1674,12 @@ def parse_args():
                         help="Densification interval (default: 100)")
     parser.add_argument("--densify_grad_threshold", type=float, default=0.0002,
                         help="Gradient threshold for densification (default: 0.0002, lower=faster growth)")
+    parser.add_argument("--visual_debug", action="store_true",
+                        help="Enable visual debugging for projection and crop calculations")
+    parser.add_argument("--visual_debug_only", action="store_true",
+                        help="Run only visual debugging and exit (no training)")
+    parser.add_argument("--visual_debug_level", type=int, default=0,
+                        help="Debug at specific tile level (default: 0, use higher for split tiles)")
 
     return parser.parse_args()
 

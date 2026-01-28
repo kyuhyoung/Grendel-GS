@@ -36,6 +36,10 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, cro
         crop: Optional CropRegion to apply during loading (saves memory)
     """
     import math
+    import sys
+    import os
+    # Add path to import our projection utils
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
     orig_w, orig_h = cam_info.width, cam_info.height
 
@@ -51,19 +55,25 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, cro
     # Determine final resolution (after crop if applicable)
     if crop:
         resolution = crop.width, crop.height
+        utils.print_rank_0(f"[loadCam-DEBUG] Camera {cam_info.image_name} has crop: {crop}")
     else:
         resolution = orig_w, orig_h
+        utils.print_rank_0(f"[loadCam-DEBUG] Camera {cam_info.image_name} has NO crop")
 
-    # Compute FoV (will be adjusted if cropped)
-    FovX = cam_info.FovX
-    FovY = cam_info.FovY
+    # Store original FoV for projection matrix computation
+    orig_FovX = cam_info.FovX
+    orig_FovY = cam_info.FovY
+    
+    # Compute FoV for the cropped image (for backward compatibility)
+    FovX = orig_FovX
+    FovY = orig_FovY
 
     if crop:
         # Adjust FoV to maintain correct focal length after crop
         # focal_x = orig_w / (2 * tan(FoVx/2))
         # new_FoVx = 2 * atan(crop_width / (2 * focal_x))
-        tanfovx = math.tan(FovX / 2)
-        tanfovy = math.tan(FovY / 2)
+        tanfovx = math.tan(orig_FovX / 2)
+        tanfovy = math.tan(orig_FovY / 2)
         focal_x = orig_w / (2 * tanfovx)
         focal_y = orig_h / (2 * tanfovy)
         FovX = 2 * math.atan(crop.width / (2 * focal_x))
@@ -124,7 +134,7 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, cro
     if return_image:
         return gt_image
 
-    return Camera(
+    cam = Camera(
         colmap_id=cam_info.uid,
         R=cam_info.R,
         T=cam_info.T,
@@ -139,6 +149,53 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, cro
         cx=getattr(cam_info, 'cx', None),  # Original principal point (will be adjusted by apply_crop_to_camera)
         cy=getattr(cam_info, 'cy', None),
     )
+    
+    # If cropped, update the projection matrix for asymmetric frustum
+    if crop:
+        utils.print_rank_0(
+            f"[loadCam-DEBUG] Processing crop for camera {cam_info.image_name}: "
+            f"crop=({crop.x_min},{crop.y_min})-({crop.x_max},{crop.y_max})"
+        )
+        try:
+            from src.camera_projection_utils import CropInfo, adjust_camera_for_crop
+            utils.print_rank_0(f"[loadCam-DEBUG] Successfully imported camera_projection_utils")
+            
+            crop_info = CropInfo(
+                x_min=crop.x_min,
+                y_min=crop.y_min,
+                x_max=crop.x_max,
+                y_max=crop.y_max
+            )
+            # Store original FoV for correct projection computation
+            cam._orig_FovX = orig_FovX
+            cam._orig_FovY = orig_FovY
+            # Important: Use original FOV for projection calculation
+            cam.FoVx = orig_FovX
+            cam.FoVy = orig_FovY
+            
+            utils.print_rank_0(f"[loadCam-DEBUG] Calling adjust_camera_for_crop...")
+            adjust_camera_for_crop(cam, crop_info, orig_w, orig_h)
+            utils.print_rank_0(f"[loadCam-DEBUG] adjust_camera_for_crop completed")
+            
+            # Restore cropped FoV for other uses
+            cam.FoVx = FovX
+            cam.FoVy = FovY
+            # Log the projection offsets
+            if hasattr(cam, '_proj_offset_x'):
+                utils.print_rank_0(
+                    f"[loadCam] Camera {cam_info.image_name}: "
+                    f"crop=({crop.x_min},{crop.y_min})-({crop.x_max},{crop.y_max}), "
+                    f"proj_offset=({cam._proj_offset_x:.3f},{cam._proj_offset_y:.3f})"
+                )
+            else:
+                utils.print_rank_0(f"[loadCam-DEBUG] WARNING: No _proj_offset_x after adjust_camera_for_crop!")
+        except ImportError as e:
+            # Fallback if new module not available
+            utils.print_rank_0(f"[loadCam] ERROR: camera_projection_utils import failed: {e}")
+        except Exception as e:
+            utils.print_rank_0(f"[loadCam] ERROR: Unexpected error in crop adjustment: {e}")
+    
+    return cam
 
 
 def load_decompressed_image(params):
