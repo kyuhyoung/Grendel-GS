@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Optional, Dict, Any
@@ -222,6 +223,7 @@ class TileInfo:
     num_cameras: Optional[int] = None  # Number of visible cameras
     ply_path: Optional[str] = None  # Path to pre-trained gaussians PLY (for Category 3 OOM resume)
     oom_type: Optional[str] = None  # "gpu" (exit 42) or "ram" (exit -9)
+    oom_category: Optional[int] = None  # OOM category: 1=early, 2=mid, 3=densification
 
 
 class AdaptiveTileTrainer:
@@ -246,20 +248,21 @@ class AdaptiveTileTrainer:
         self.ply_dir = self.output_path / "ply"
         self.ply_dir.mkdir(parents=True, exist_ok=True)
 
-        # Clear and recreate debug_images folder on each run
-        self.debug_images_dir = self.output_path / "debug_images"
-        if self.debug_images_dir.exists():
-            import shutil
-            shutil.rmtree(self.debug_images_dir)
-        self.debug_images_dir.mkdir(parents=True, exist_ok=True)
-
-        # Clear and recreate projection_debug folder on each run
+        # 매 실행마다 visualizations 폴더 전체 삭제 후 재생성
+        # (count_timeline / cat3_oom / resume / tile_map / tile_split_tree / projection_debug /
+        #  gt_compare / render_debug_json / render_debug_png 모두 이 아래에 만들어짐)
         import shutil
-        self.projection_debug_dir = self.output_path / "projection_debug"
-        if self.projection_debug_dir.exists():
-            shutil.rmtree(self.projection_debug_dir)
-            print(f"[Init] Cleared folder: {self.projection_debug_dir}")
-        # Don't create it here - let it be created when needed
+        self.viz_root = self.output_path / "visualizations"
+        if self.viz_root.exists():
+            shutil.rmtree(self.viz_root)
+            print(f"[Init] Cleared folder: {self.viz_root}")
+        self.viz_root.mkdir(parents=True, exist_ok=True)
+
+        # 후속 코드 호환: 기존 attribute 명 유지 (이제 viz_root 하위)
+        self.debug_images_dir = self.viz_root / "gt_compare"
+        self.debug_images_dir.mkdir(parents=True, exist_ok=True)
+        self.projection_debug_dir = self.viz_root / "projection_debug"
+        # projection_debug 는 필요할 때 생성
 
         # Load scene info
         self.scene_bbox, self.num_points = self._load_scene_info()
@@ -293,21 +296,64 @@ class AdaptiveTileTrainer:
             vertex = ply['vertex']
             xyz = np.stack([vertex['x'], vertex['y'], vertex['z']], axis=1)
 
-        # Use percentiles to exclude outliers (0.1% ~ 99.9%)
-        pct_low, pct_high = 0.1, 99.9
-        x_min, y_min, z_min = np.percentile(xyz, pct_low, axis=0)
-        x_max, y_max, z_max = np.percentile(xyz, pct_high, axis=0)
+        # 축별로 stable percentile 을 자동 탐색해 SfM outlier 를 제거.
+        # 알고리즘: 후보 percentile 마다 "percentile 1% 늘어날 때 size 가 줄어드는 rate"
+        # 를 계산. outlier 제거 구간에서는 rate 가 매우 큼 → 정상 데이터 trim 구간으로
+        # 들어서면 rate 가 평탄해진다. median rate × 1.5 미만이 되는 첫 percentile 이
+        # 그 축의 stable 지점.
+        candidates = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+
+        def stable_axis_bounds(vals_1d):
+            """Return (chosen_pct, lo, hi)."""
+            sizes, los, his = [], [], []
+            for p in candidates:
+                lo = float(np.percentile(vals_1d, p))
+                hi = float(np.percentile(vals_1d, 100 - p))
+                los.append(lo); his.append(hi)
+                sizes.append(hi - lo)
+            # rate[i] = (size[i]-size[i+1]) / (candidates[i+1]-candidates[i])
+            rates = []
+            for i in range(len(candidates) - 1):
+                dp = candidates[i + 1] - candidates[i]
+                ds = sizes[i] - sizes[i + 1]
+                rates.append(ds / dp if dp > 0 else 0.0)
+            if not rates:
+                return candidates[0], los[0], his[0]
+            sorted_rates = sorted(rates)
+            median_rate = sorted_rates[len(sorted_rates) // 2]
+            threshold = 1.5 * max(median_rate, 1e-9)
+            for i, rate in enumerate(rates):
+                if rate <= threshold:
+                    return candidates[i], los[i], his[i]
+            # 모든 rate 가 threshold 초과 (이론상 거의 없음) → 가장 큰 candidate
+            return candidates[-1], los[-1], his[-1]
+
+        xyz_min_full = xyz.min(axis=0)
+        xyz_max_full = xyz.max(axis=0)
+        chosen_pct = [0.0, 0.0, 0.0]
+        clean_lo = [0.0, 0.0, 0.0]
+        clean_hi = [0.0, 0.0, 0.0]
+        for ax in range(3):
+            p, lo, hi = stable_axis_bounds(xyz[:, ax])
+            chosen_pct[ax] = p
+            clean_lo[ax] = lo
+            clean_hi[ax] = hi
 
         bbox = BBox(
-            float(x_min), float(y_min), float(z_min),
-            float(x_max), float(y_max), float(z_max)
+            clean_lo[0], clean_lo[1], clean_lo[2],
+            clean_hi[0], clean_hi[1], clean_hi[2],
         )
 
+        axis_names = ["X", "Y", "Z"]
         print(f"[Scene] Loaded {len(xyz)} points")
-        print(f"[Scene] Extent (percentile {pct_low}%-{pct_high}%, excluding outliers):")
-        print(f"  X: {bbox.x_min:.3f} ~ {bbox.x_max:.3f} (size: {bbox.size[0]:.3f})")
-        print(f"  Y: {bbox.y_min:.3f} ~ {bbox.y_max:.3f} (size: {bbox.size[1]:.3f})")
-        print(f"  Z: {bbox.z_min:.3f} ~ {bbox.z_max:.3f} (size: {bbox.size[2]:.3f})")
+        print(f"[Scene] Extent (per-axis auto-percentile, outliers excluded):")
+        for ax in range(3):
+            print(f"  {axis_names[ax]}: {clean_lo[ax]:.3f} ~ {clean_hi[ax]:.3f} "
+                  f"(size: {clean_hi[ax]-clean_lo[ax]:.3f}, pct: {chosen_pct[ax]:.2f}%-{100-chosen_pct[ax]:.2f}%)")
+        print(f"  Full extent (with outliers):")
+        for ax in range(3):
+            full_size = float(xyz_max_full[ax] - xyz_min_full[ax])
+            print(f"  {axis_names[ax]}: {float(xyz_min_full[ax]):.3f} ~ {float(xyz_max_full[ax]):.3f} (size: {full_size:.3f})")
 
         return bbox, len(xyz)
 
@@ -367,12 +413,18 @@ class AdaptiveTileTrainer:
             if intr.model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL"]:
                 focal_x = intr.params[0]
                 focal_y = intr.params[0]
+                cx = intr.params[1]
+                cy = intr.params[2]
             elif intr.model in ["PINHOLE", "OPENCV"]:
                 focal_x = intr.params[0]
                 focal_y = intr.params[1]
+                cx = intr.params[2]
+                cy = intr.params[3]
             else:
                 focal_x = intr.params[0]
                 focal_y = intr.params[0]
+                cx = intr.width / 2.0
+                cy = intr.height / 2.0
 
             fov_x = focal2fov(focal_x, intr.width)
             fov_y = focal2fov(focal_y, intr.height)
@@ -386,6 +438,10 @@ class AdaptiveTileTrainer:
                 "T": T,
                 "fov_x": fov_x,
                 "fov_y": fov_y,
+                "focal_x": focal_x,
+                "focal_y": focal_y,
+                "cx": cx,
+                "cy": cy,
                 "width": intr.width,
                 "height": intr.height,
             })
@@ -393,6 +449,22 @@ class AdaptiveTileTrainer:
         print(f"[Scene] Loaded {len(cam_infos)} cameras")
         return cam_infos
 
+    def _generate_visual_debug_for_tile(self, tile_bbox: BBox, tile_id: str):
+        """Generate visual debug images for a newly created tile."""
+        if not self.args.visual_debug or self.args.visual_debug_only:
+            # Skip if visual debug is disabled or in visual-debug-only mode
+            return
+            
+        print(f"  [Visual Debug] Generating debug images for {tile_id}...")
+        visible_cameras = self._compute_visible_cameras(
+            tile_bbox, margin=self.args.tile_crop_margin,
+            tile_id=tile_id, visual_debug=True
+        )
+        if visible_cameras:
+            debug_dir = self.output_path / "visualizations" / "projection_debug" / tile_id
+            if debug_dir.exists():
+                print(f"  [Visual Debug] Generated debug images in {debug_dir}")
+        
     def _compute_visible_cameras(self, tile_bbox: BBox, margin: int = 100, 
                                 tile_id: str = None, visual_debug: bool = False) -> List[str]:
         """
@@ -407,7 +479,7 @@ class AdaptiveTileTrainer:
         
         # Setup visual debug if requested
         if visual_debug and tile_id:
-            visual_debug_dir = self.output_path / "projection_debug" / tile_id
+            visual_debug_dir = self.output_path / "visualizations" / "projection_debug" / tile_id
             # Remove existing debug directory and recreate it
             import shutil
             if visual_debug_dir.exists():
@@ -475,7 +547,6 @@ class AdaptiveTileTrainer:
         """Save visual debug using the new side-by-side visualization."""
         try:
             # Import the new visualization function
-            import sys
             import os
             import numpy as np
             sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'Grendel-GS', 'scene'))
@@ -484,13 +555,25 @@ class AdaptiveTileTrainer:
             
             # Convert to proper format
             from src.tile_storage import BBox as StorageBBox
-            scene_bbox = StorageBBox(
+            
+            # Current tile bbox
+            tile_storage_bbox = StorageBBox(
                 min_xyz=np.array([tile_bbox.x_min, tile_bbox.y_min, tile_bbox.z_min]),
                 max_xyz=np.array([tile_bbox.x_max, tile_bbox.y_max, tile_bbox.z_max])
             )
             tile_bbox_3d = TileBBox(
-                scene_bbox.min[0], scene_bbox.min[1], scene_bbox.min[2],  # x_min, y_min, z_min
-                scene_bbox.max[0], scene_bbox.max[1], scene_bbox.max[2]   # x_max, y_max, z_max
+                tile_storage_bbox.min[0], tile_storage_bbox.min[1], tile_storage_bbox.min[2],
+                tile_storage_bbox.max[0], tile_storage_bbox.max[1], tile_storage_bbox.max[2]
+            )
+            
+            # Full scene bbox for fixed 3D view
+            full_scene_storage_bbox = StorageBBox(
+                min_xyz=np.array([self.scene_bbox.x_min, self.scene_bbox.y_min, self.scene_bbox.z_min]),
+                max_xyz=np.array([self.scene_bbox.x_max, self.scene_bbox.y_max, self.scene_bbox.z_max])
+            )
+            full_scene_bbox_3d = TileBBox(
+                full_scene_storage_bbox.min[0], full_scene_storage_bbox.min[1], full_scene_storage_bbox.min[2],
+                full_scene_storage_bbox.max[0], full_scene_storage_bbox.max[1], full_scene_storage_bbox.max[2]
             )
             
             # Create crop region
@@ -524,16 +607,16 @@ class AdaptiveTileTrainer:
             cam_info = CamInfo(cam)
             
             # Calculate fixed image bounds to include all corner projections across all cameras
-            # Get 8 corners of the tile bbox
+            # Use FULL SCENE corners (not current tile) for consistent bounds
             corners = np.array([
-                [tile_bbox.x_min, tile_bbox.y_min, tile_bbox.z_min],
-                [tile_bbox.x_min, tile_bbox.y_min, tile_bbox.z_max],
-                [tile_bbox.x_min, tile_bbox.y_max, tile_bbox.z_min],
-                [tile_bbox.x_min, tile_bbox.y_max, tile_bbox.z_max],
-                [tile_bbox.x_max, tile_bbox.y_min, tile_bbox.z_min],
-                [tile_bbox.x_max, tile_bbox.y_min, tile_bbox.z_max],
-                [tile_bbox.x_max, tile_bbox.y_max, tile_bbox.z_min],
-                [tile_bbox.x_max, tile_bbox.y_max, tile_bbox.z_max],
+                [self.scene_bbox.x_min, self.scene_bbox.y_min, self.scene_bbox.z_min],
+                [self.scene_bbox.x_min, self.scene_bbox.y_min, self.scene_bbox.z_max],
+                [self.scene_bbox.x_min, self.scene_bbox.y_max, self.scene_bbox.z_min],
+                [self.scene_bbox.x_min, self.scene_bbox.y_max, self.scene_bbox.z_max],
+                [self.scene_bbox.x_max, self.scene_bbox.y_min, self.scene_bbox.z_min],
+                [self.scene_bbox.x_max, self.scene_bbox.y_min, self.scene_bbox.z_max],
+                [self.scene_bbox.x_max, self.scene_bbox.y_max, self.scene_bbox.z_min],
+                [self.scene_bbox.x_max, self.scene_bbox.y_max, self.scene_bbox.z_max],
             ], dtype=np.float32)
             
             # Track min/max projected coordinates across all cameras
@@ -601,7 +684,7 @@ class AdaptiveTileTrainer:
             save_projection_debug_visualization(
                 tile_bbox_3d, cam_info, crop, full_proj,
                 str(visual_debug_dir), tile_id, 0, 
-                full_scene_bbox=tile_bbox_3d,
+                full_scene_bbox=full_scene_bbox_3d,
                 all_cameras=self.cam_infos,
                 fixed_image_bounds=fixed_image_bounds
             )
@@ -622,9 +705,13 @@ class AdaptiveTileTrainer:
         self.vis_counter = 0  # Reset counter
 
     def _clear_output_folders(self):
-        """Clear all output folders when not resuming (fresh start)."""
+        """Clear all output folders when not resuming (fresh start).
+
+        visualizations 는 __init__ 에서 이미 청소하고 gt_compare 등 하위
+        폴더를 만들어 둔 상태이므로 여기서는 건드리지 않는다.
+        """
         import shutil
-        folders_to_clear = ["models", "logs", "ply", "visualizations"]
+        folders_to_clear = ["models", "logs", "ply"]
         for folder_name in folders_to_clear:
             folder_path = self.output_path / folder_name
             if folder_path.exists():
@@ -634,7 +721,6 @@ class AdaptiveTileTrainer:
         if self.state_file.exists():
             self.state_file.unlink()
             print(f"[Init] Removed state file: {self.state_file}")
-        # Mark visualizations as cleared to prevent redundant clear later
         self._vis_cleared = True
 
     def _init_tiles(self):
@@ -702,13 +788,76 @@ class AdaptiveTileTrainer:
                     "fail_iter": t.fail_iter,
                     "num_cameras": t.num_cameras,
                     "ply_path": t.ply_path,
-                    "oom_type": t.oom_type
+                    "oom_type": t.oom_type,
+                    "oom_category": t.oom_category
                 }
                 for tid, t in self.tiles.items()
             }
         }
         with open(self.state_file, "w") as f:
             json.dump(state, f, indent=2)
+
+    def _compute_camera_footprints(self) -> List[Optional[np.ndarray]]:
+        """
+        Compute the XY-plane footprint of each camera's frustum.
+
+        For each camera, unprojects the 4 image corners into world-space rays,
+        then intersects them with Z = z_mid (median Z of scene bbox).
+
+        Returns:
+            List of Nx2 arrays (the XY polygon vertices), or None for cameras
+            whose rays do not intersect the Z plane.
+        """
+        z_mid = (self.scene_bbox.z_min + self.scene_bbox.z_max) / 2.0
+        footprints = []
+
+        for cam in self.cam_infos:
+            R = cam["R"]       # R_c2w (transposed from COLMAP's R_w2c)
+            T = cam["T"]       # COLMAP tvec
+            fx = cam["focal_x"]
+            fy = cam["focal_y"]
+            cx = cam["cx"]
+            cy = cam["cy"]
+            W = cam["width"]
+            H = cam["height"]
+
+            # Camera position in world space: -R_c2w @ T
+            cam_pos = -R @ T
+
+            # 4 image corners
+            corners_px = np.array([
+                [0, 0],
+                [W, 0],
+                [W, H],
+                [0, H],
+            ], dtype=np.float64)
+
+            # Unproject to camera-space ray directions
+            ray_dirs_cam = np.stack([
+                (corners_px[:, 0] - cx) / fx,
+                (corners_px[:, 1] - cy) / fy,
+                np.ones(4),
+            ], axis=1)  # (4, 3)
+
+            # Transform to world-space ray directions
+            ray_dirs_world = (R @ ray_dirs_cam.T).T  # (4, 3)
+
+            # Intersect each ray with Z = z_mid plane
+            # cam_pos[2] + t * ray_dir_z = z_mid  =>  t = (z_mid - cam_pos[2]) / ray_dir_z
+            dz = ray_dirs_world[:, 2]
+            valid = np.abs(dz) > 1e-8
+            t_vals = np.where(valid, (z_mid - cam_pos[2]) / dz, -1.0)
+
+            # All 4 rays must hit the plane with t > 0 (camera looking toward the plane)
+            if not np.all(t_vals > 0):
+                footprints.append(None)
+                continue
+
+            # Intersection points
+            points = cam_pos[np.newaxis, :] + t_vals[:, np.newaxis] * ray_dirs_world  # (4, 3)
+            footprints.append(points[:, :2])  # Only XY
+
+        return footprints
 
     def _visualize_tile_map(self, current_tile_id: str = None):
         """
@@ -720,15 +869,19 @@ class AdaptiveTileTrainer:
         # Status colors (for status indicator circles)
         # Note: "split" is further divided based on fail_iter and oom_type
         status_colors = {
-            "completed": "#4CAF50",       # Green
-            "in_progress": "#2196F3",     # Blue
-            "pending": "#9E9E9E",         # Gray
-            "split_gpu_oom": "#FF9800",   # Orange - GPU OOM (exit 42)
-            "split_ram_oom": "#E91E63",   # Pink - RAM OOM (exit -9)
-            "split_preemptive": "#9C27B0", # Purple - Preemptive split (skipped without trying)
-            "split": "#FF9800",           # Orange - fallback for old data
-            "failed": "#F44336",          # Red
-            "skipped": "#795548",         # Brown
+            "completed": "#4CAF50",           # Green
+            "in_progress": "#2196F3",         # Blue
+            "pending": "#9E9E9E",             # Gray
+            "split_cat1": "#FFEB3B",          # Yellow - Cat 1: early OOM (SSIM on large image)
+            "split_cat2": "#FF9800",          # Orange - Cat 2: mid-training OOM
+            "split_cat3": "#F44336",          # Red - Cat 3: densification OOM (gaussians saved)
+            "split_cat4": "#FF5722",          # Deep Orange - Cat 4: pre-trained too large (reuse parent PLY)
+            "split_ram_oom": "#E91E63",       # Pink - RAM OOM (exit -9)
+            "split_preemptive": "#9C27B0",    # Purple - Preemptive split (skipped without trying)
+            "split_gpu_oom": "#FF9800",       # Orange - fallback for unknown category
+            "split": "#FF9800",               # Orange - fallback for old data
+            "failed": "#F44336",              # Red
+            "skipped": "#795548",             # Brown
         }
 
         # Generate tile colors using golden ratio for better distribution
@@ -753,6 +906,30 @@ class AdaptiveTileTrainer:
         )
         ax.add_patch(scene_rect)
 
+        # Draw camera frustum footprints on the XY plane (behind tiles)
+        from matplotlib.patches import Polygon as MplPolygon
+        footprints = self._compute_camera_footprints()
+        num_valid_footprints = sum(1 for fp in footprints if fp is not None)
+        cam_cmap = plt.cm.tab20
+        num_cams = len(self.cam_infos)
+        for i, (cam, fp) in enumerate(zip(self.cam_infos, footprints)):
+            if fp is None:
+                continue
+            color = cam_cmap(i / max(num_cams - 1, 1))
+            poly = MplPolygon(
+                fp, closed=True,
+                facecolor=(*color[:3], 0.07),
+                edgecolor=(*color[:3], 0.3),
+                linewidth=0.5,
+                zorder=2,
+            )
+            ax.add_patch(poly)
+            # Small marker at camera position
+            R = cam["R"]
+            T = cam["T"]
+            cam_pos = -R @ T
+            ax.plot(cam_pos[0], cam_pos[1], '.', color=color, markersize=2, zorder=3)
+
         # Calculate max tile size for linewidth scaling
         max_tile_area = max(t.bbox.size[0] * t.bbox.size[1] for t in self.tiles.values())
         import math
@@ -773,14 +950,22 @@ class AdaptiveTileTrainer:
             tile_num = int(tile_id.split("_")[-1]) if "_" in tile_id else idx
             tile_color = generate_tile_color(tile_num)
 
-            # Determine status color (split into gpu_oom, ram_oom, preemptive)
+            # Determine status color (split by OOM category)
             if tile.status == "split":
                 if tile.fail_iter == 0:
                     display_status = "split_preemptive"
                 elif tile.oom_type == "ram":
                     display_status = "split_ram_oom"
+                elif tile.oom_category == 1:
+                    display_status = "split_cat1"
+                elif tile.oom_category == 2:
+                    display_status = "split_cat2"
+                elif tile.oom_category == 3:
+                    display_status = "split_cat3"
+                elif tile.oom_category == 4:
+                    display_status = "split_cat4"
                 else:
-                    display_status = "split_gpu_oom"  # default for gpu or unknown
+                    display_status = "split_gpu_oom"  # fallback for unknown category
             else:
                 display_status = tile.status
             status_color = status_colors.get(display_status, "#9E9E9E")
@@ -830,9 +1015,10 @@ class AdaptiveTileTrainer:
                     if tile.fail_iter == 0:
                         info_parts.append("preemptive")
                     else:
-                        # Show OOM type (GPU/RAM) if available
+                        # Show OOM type and category
                         oom_prefix = "RAM" if tile.oom_type == "ram" else "GPU"
-                        info_parts.append(f"{oom_prefix}@{tile.fail_iter}")
+                        cat_str = f"C{tile.oom_category}" if tile.oom_category else ""
+                        info_parts.append(f"{oom_prefix}{cat_str}@{tile.fail_iter}")
                 if tile.num_cameras is not None:
                     info_parts.append(f"C{tile.num_cameras}")
                 label_text += f"\n({', '.join(info_parts)})"
@@ -919,7 +1105,7 @@ class AdaptiveTileTrainer:
         plt.tight_layout()
 
         # Save to PNG
-        vis_dir = self.output_path / "visualizations"
+        vis_dir = self.output_path / "visualizations" / "tile_map"
         vis_dir.mkdir(parents=True, exist_ok=True)
 
         # Save with iteration counter and tile ID in filename
@@ -933,7 +1119,157 @@ class AdaptiveTileTrainer:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
-        print(f"  [Visualization] Saved: {save_path}", flush=True)
+        print(f"  [Visualization] Saved: {save_path} (camera footprints: {num_valid_footprints}/{num_cams})", flush=True)
+
+    def _visualize_split_tree(self):
+        """타일 분할 트리 (parent → children) PNG 저장.
+
+        타일 ID 규칙 ``tile_{N:04d}`` 기준으로 부모(``(N-1)//2``)를 추론.
+        노드 색상은 status / oom_category, 라벨에 fail_iter, num_cameras 표시.
+        """
+        if not self.tiles:
+            return
+
+        def parse_num(tid: str) -> Optional[int]:
+            try:
+                return int(tid.split("_")[-1])
+            except Exception:
+                return None
+
+        nums = {tid: parse_num(tid) for tid in self.tiles}
+        # parent_num -> [child_num, ...]
+        children: Dict[int, List[int]] = {}
+        roots: List[int] = []
+        for tid, n in nums.items():
+            if n is None:
+                continue
+            if n == 0:
+                roots.append(0)
+                continue
+            parent_n = (n - 1) // 2
+            if any(nums[t] == parent_n for t in nums):
+                children.setdefault(parent_n, []).append(n)
+            else:
+                roots.append(n)
+        if not roots:
+            roots = [n for n in nums.values() if n is not None and n == 0] or [min(n for n in nums.values() if n is not None)]
+
+        # BFS 깊이 계산
+        depth: Dict[int, int] = {}
+        order: List[int] = []
+        from collections import deque
+        q = deque([(r, 0) for r in roots])
+        while q:
+            n, d = q.popleft()
+            if n in depth:
+                continue
+            depth[n] = d
+            order.append(n)
+            for c in sorted(children.get(n, [])):
+                q.append((c, d + 1))
+
+        # 같은 깊이끼리 모은 다음 x 좌표를 균등 분포
+        by_depth: Dict[int, List[int]] = {}
+        for n, d in depth.items():
+            by_depth.setdefault(d, []).append(n)
+        for d in by_depth:
+            by_depth[d].sort()
+
+        max_d = max(by_depth) if by_depth else 0
+        max_w = max(len(v) for v in by_depth.values()) if by_depth else 1
+        positions: Dict[int, Tuple[float, float]] = {}
+        for d, ns in by_depth.items():
+            count = len(ns)
+            for i, n in enumerate(ns):
+                x = (i + 1) / (count + 1) * max(max_w, 2)
+                y = -d
+                positions[n] = (x, y)
+
+        # tid 매핑 (num -> tile_id 문자열)
+        num_to_tid: Dict[int, str] = {n: tid for tid, n in nums.items() if n is not None}
+
+        status_colors = {
+            "completed": "#43A047",
+            "split": "#F4A261",
+            "failed": "#E53935",
+            "skipped": "#9E9E9E",
+            "in_progress": "#1E88E5",
+            "pending": "#BDBDBD",
+        }
+
+        fig_w = max(10, max_w * 1.4)
+        fig_h = max(5, (max_d + 1) * 1.4)
+        fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h))
+
+        # 엣지
+        for parent_n, child_list in children.items():
+            if parent_n not in positions:
+                continue
+            px, py = positions[parent_n]
+            for c in child_list:
+                if c not in positions:
+                    continue
+                cx, cy = positions[c]
+                ax.plot([px, cx], [py, cy], "-", color="#888888", linewidth=1.0, zorder=1)
+
+        # 노드
+        for n, (x, y) in positions.items():
+            tid = num_to_tid.get(n)
+            if tid is None or tid not in self.tiles:
+                continue
+            t = self.tiles[tid]
+            color = status_colors.get(t.status, "#777777")
+            edge = "black"
+            if t.status == "split" and t.oom_category is not None:
+                edge_map = {1: "#FFB300", 2: "#FB8C00", 3: "#D32F2F", 4: "#6A1B9A"}
+                edge = edge_map.get(t.oom_category, "black")
+            ax.scatter([x], [y], s=900, c=[color], edgecolors=edge,
+                       linewidths=2.0, zorder=2)
+            label = tid.replace("tile_", "")
+            details = []
+            if t.oom_category is not None:
+                details.append(f"cat{t.oom_category}")
+            if t.fail_iter is not None:
+                details.append(f"iter{t.fail_iter}")
+            if t.num_cameras is not None:
+                details.append(f"cams={t.num_cameras}")
+            label_full = label
+            if details:
+                label_full += "\n" + " ".join(details)
+            ax.text(x, y - 0.18, label_full, ha="center", va="top",
+                    fontsize=7, zorder=3)
+
+        # 범례
+        legend_handles = []
+        for status, color in status_colors.items():
+            legend_handles.append(patches.Patch(facecolor=color, edgecolor="black",
+                                                label=status))
+        legend_handles.append(patches.Patch(facecolor="white", edgecolor="#FFB300",
+                                            linewidth=2, label="split: cat 1"))
+        legend_handles.append(patches.Patch(facecolor="white", edgecolor="#FB8C00",
+                                            linewidth=2, label="split: cat 2"))
+        legend_handles.append(patches.Patch(facecolor="white", edgecolor="#D32F2F",
+                                            linewidth=2, label="split: cat 3"))
+        legend_handles.append(patches.Patch(facecolor="white", edgecolor="#6A1B9A",
+                                            linewidth=2, label="split: cat 4"))
+        ax.legend(handles=legend_handles, loc="upper left",
+                  bbox_to_anchor=(1.01, 1.0), fontsize=8, framealpha=0.9)
+
+        ax.set_xlim(0, max(max_w + 1, 3))
+        ax.set_ylim(-(max_d + 0.7), 0.7)
+        ax.set_xticks([])
+        ax.set_yticks(list(range(0, -(max_d + 1), -1)))
+        ax.set_yticklabels([f"L{abs(d)}" for d in range(0, -(max_d + 1), -1)])
+        ax.set_title(f"Tile split tree | total={len(self.tiles)}  depth={max_d}")
+        ax.grid(True, axis="y", alpha=0.25)
+        fig.tight_layout()
+
+        out_dir = self.output_path / "visualizations" / "tile_split_tree"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "tile_split_tree.png"
+        fig.savefig(out_path, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [Visualization] Saved tile split tree -> {out_path}", flush=True)
 
     def _save_completed_ply(self, tile: TileInfo, tile_level: int):
         """Copy completed tile PLY to ply folder with informative name."""
@@ -1090,6 +1426,16 @@ class AdaptiveTileTrainer:
         sys.stdout.flush()
 
         print(f"  [torchrun returned exit_code={result_code}]", flush=True)
+        # If render debug abort flag exists, stop the whole wrapper
+        if os.environ.get("RENDER_DEBUG_ABORT", "0") == "1":
+            try:
+                flag = self.ply_dir.parent / "visualizations" / "render_debug_png" / "render_debug_abort.flag"
+                if flag.exists():
+                    print(f"  [Render debug] Abort flag found: {flag}. Stopping wrapper.", flush=True)
+                    flag.unlink(missing_ok=True)
+                    return result_code, {"abort": "render_debug"}
+            except Exception:
+                pass
 
         # Check for OOM via state file (torchrun returns 1 even when worker exits with 42)
         state_file = self.ply_dir / "adaptive_tile_state.json"
@@ -1223,18 +1569,18 @@ class AdaptiveTileTrainer:
             print(f"  Visible cameras: {len(visible_cameras)} / {len(self.cam_infos)}")
             if visible_cameras:
                 print(f"    Names: {visible_cameras[:5]}{'...' if len(visible_cameras) > 5 else ''}")
+
             
             # If visual_debug_only, generate images for all levels up to target
             if self.args.visual_debug_only:
                 print(f"  [Visual Debug] Generated images for level {current_level}")
-                print(f"  Debug images saved to: {self.output_path}/projection_debug/{tile.tile_id}/")
+                print(f"  Debug images saved to: {self.output_path}/visualizations/projection_debug/{tile.tile_id}/")
                 
                 if current_level == self.args.visual_debug_level:
                     print("\n" + "=" * 60)
                     print(f"Visual Debug Complete! Generated images for levels 0-{current_level}")
                     print("Exiting (--visual-debug-only mode)")
                     print("=" * 60)
-                    import sys
                     sys.exit(0)
                 elif current_level < self.args.visual_debug_level:
                     print(f"  [Visual Debug] Continuing to level {current_level + 1} (target: level {self.args.visual_debug_level})")
@@ -1336,6 +1682,11 @@ class AdaptiveTileTrainer:
                     self.tiles = new_tiles
 
                     self._save_state()
+                    
+                    # Generate visual debug for new tiles
+                    self._generate_visual_debug_for_tile(bbox_a, tile_a_id)
+                    self._generate_visual_debug_for_tile(bbox_b, tile_b_id)
+                    
                     continue
 
             # Mark as in_progress
@@ -1345,11 +1696,37 @@ class AdaptiveTileTrainer:
             # Run training
             exit_code, oom_info = self._run_torchrun(tile, visible_cameras)
 
+            # Count timeline 시각화: 매 타일 종료 후 두 aggregate PNG 갱신 (best-effort)
+            #  - all_tiles_timeline.png: x=학습 iter, 각 타일 색 분리
+            #  - oom_progression.png:    x=타일 처리 순서, wrapper 시퀀스 뷰
+            try:
+                count_dir = Path(self.args.output_path) / "visualizations" / "count_timeline"
+                if count_dir.exists() and any(count_dir.glob("*_rank*.jsonl")):
+                    sys.path.insert(0, str(ROOT / "Grendel-GS"))
+                    from utils.oom_viz import save_all_tiles_timeline_viz, save_oom_progression_viz
+
+                    agg_png = count_dir / "all_tiles_timeline.png"
+                    save_all_tiles_timeline_viz(count_dir, out_path=agg_png, target_count=None)
+                    prog_png = count_dir / "oom_progression.png"
+                    save_oom_progression_viz(count_dir, out_path=prog_png)
+                    print(f"  [viz] timeline updated -> {agg_png.name}, {prog_png.name}", flush=True)
+            except Exception as _ct_viz_e:
+                print(f"  [viz] count timeline skipped: {_ct_viz_e}", flush=True)
+
+            # Tile split tree 매 타일 처리 후 갱신 (best-effort)
+            try:
+                self._visualize_split_tree()
+            except Exception as _tree_e:
+                print(f"  [viz] tile split tree skipped: {_tree_e}", flush=True)
+
             # Log exit code for debugging
             print(f"\n[Tile {tile.tile_id}] torchrun exit_code = {exit_code}", flush=True)
             print(f"  oom_info = {oom_info}", flush=True)
             print(f"  EXIT_CODE_OOM = {self.EXIT_CODE_OOM}", flush=True)
             print(f"  Recognized OOM codes: {self.EXIT_CODE_OOM}, -9, 143, -15, 137", flush=True)
+            if oom_info and oom_info.get("abort") == "render_debug":
+                print("  [Render debug] Aborting adaptive run due to render debug abort.", flush=True)
+                sys.exit(1)
 
             if exit_code == self.EXIT_CODE_SUCCESS:
                 tile.status = "completed"
@@ -1383,7 +1760,6 @@ class AdaptiveTileTrainer:
                 # RAM OOM: wait for OS to reclaim memory from dead processes
                 if is_ram_oom:
                     import gc
-                    import time
                     import psutil
 
                     gc.collect()  # Force Python garbage collection
@@ -1417,7 +1793,33 @@ class AdaptiveTileTrainer:
                 print(f"[Tile {tile.tile_id}] {oom_type_str} OOM at iteration {oom_iteration}, level={tile_level}, splitting...", flush=True)
                 tile.fail_iter = oom_iteration
                 tile.oom_type = "ram" if is_ram_oom else "gpu"
+                tile.oom_category = oom_category
 
+                # Category 4: pre-trained gaussians too large before densification.
+                # Split and reuse parent PLY — no new PLY saving needed.
+                if oom_category == 4:
+                    print(f"  [Category 4] Pre-trained gaussians too large (iter {oom_iteration}, before densification).", flush=True)
+                    print(f"  Splitting tile. Children will reuse parent PLY filtered by bbox.", flush=True)
+
+                # Category 2: memory fragmentation, not a size problem.
+                # Retry the same tile — the torchrun process already exited,
+                # so GPU memory is freed and fragmentation is gone.
+                MAX_CAT2_RETRIES = 3
+                if oom_category == 2:
+                    cat2_retries = getattr(tile, '_cat2_retries', 0)
+                    if cat2_retries < MAX_CAT2_RETRIES:
+                        tile._cat2_retries = cat2_retries + 1
+                        tile.status = "pending"
+                        tile.fail_iter = None
+                        tile.oom_type = None
+                        tile.oom_category = None
+                        print(f"  [Category 2 RETRY] Memory fragmentation OOM at iter {oom_iteration}.", flush=True)
+                        print(f"  Retrying same tile ({tile._cat2_retries}/{MAX_CAT2_RETRIES})...", flush=True)
+                        print("#" * 60 + "\n", flush=True)
+                        self._save_state()
+                        continue
+                    else:
+                        print(f"  [Category 2] Exhausted {MAX_CAT2_RETRIES} retries, falling through to split.", flush=True)
                 # Check minimum tile size before splitting
                 MIN_TILE_SIZE = 50.0  # Minimum size in world units
                 tile_size = tile.bbox.size
@@ -1473,9 +1875,17 @@ class AdaptiveTileTrainer:
                 print(f"    {tile_b_id}: size=({size_b[0]:.1f}, {size_b[1]:.1f}, {size_b[2]:.1f}), level={level_b}", flush=True)
 
                 # For Category 3 OOM (increased gaussians), use saved PLY for resume
+                # For Category 4 OOM (pre-trained too large), reuse parent's PLY
                 ply_path_a = None
                 ply_path_b = None
-                if oom_category == 3 and oom_info:
+                if oom_category == 4 and tile.ply_path:
+                    # Reuse parent's PLY — children will filter by their bbox on load
+                    ply_path_a = tile.ply_path
+                    ply_path_b = tile.ply_path
+                    print(f"\n  >>> CATEGORY 4 OOM: Reusing parent PLY for children <<<", flush=True)
+                    print(f"    Parent PLY: {tile.ply_path}", flush=True)
+
+                elif oom_category == 3 and oom_info:
                     print(f"\n  >>> CATEGORY 3 OOM: Pre-trained gaussians will be used <<<", flush=True)
                     tile_a_info = oom_info.get("tile_a") or {}
                     tile_b_info = oom_info.get("tile_b") or {}
@@ -1492,6 +1902,34 @@ class AdaptiveTileTrainer:
                     merge_errors = []
                     count_a = 0
                     count_b = 0
+
+                    # Wait for PLY files to be saved (configurable timeout)
+                    if num_ranks > 1:
+                        wait_timeout = int(os.environ.get('PLY_WAIT_TIMEOUT', 3600))  # Default 1 hour
+                        print(f"  [Waiting] Checking for PLY files from {num_ranks} ranks (timeout: {wait_timeout}s)...", flush=True)
+                        wait_start = time.time()
+                        check_interval = 5  # Check every 5 seconds
+                        
+                        while time.time() - wait_start < wait_timeout:
+                            # Check if all rank files exist
+                            all_exist = True
+                            for prefix in [ply_prefix_a, ply_prefix_b]:
+                                if prefix and prefix != "None":
+                                    for rank in range(num_ranks):
+                                        rank_file = f"{prefix}_rank{rank}.ply"
+                                        if not Path(rank_file).exists():
+                                            all_exist = False
+                                            break
+                                if not all_exist:
+                                    break
+                            
+                            if all_exist:
+                                print(f"    All PLY files found after {time.time() - wait_start:.1f}s", flush=True)
+                                break
+                            
+                            time.sleep(check_interval)
+                        else:
+                            print(f"    WARNING: Timeout after {wait_timeout}s waiting for PLY files", flush=True)
 
                     # Try Tile A merge
                     if ply_prefix_a and is_prefix_a and num_ranks > 1:
@@ -1529,10 +1967,48 @@ class AdaptiveTileTrainer:
                         else:
                             merge_errors.append(f"Tile B: PLY file not found: {ply_prefix_b}")
 
-                    # If any merge failed, report all errors and exit
+                    # Cat3 merged 시각화 (best-effort, multi-rank 인 경우만)
+                    try:
+                        if num_ranks > 1 and is_prefix_a and is_prefix_b and tile_a_info.get("bbox") and tile_b_info.get("bbox"):
+                            sys.path.insert(0, str(ROOT / "Grendel-GS"))
+                            from utils.oom_viz import save_merged_cat3_viz
+                            from scene.adaptive_tile_utils import TileBBox as _TBB
+                            parent_bbox_obj = tile.bbox
+                            tile_a_bbox_obj = _TBB.from_string(tile_a_info["bbox"])
+                            tile_b_bbox_obj = _TBB.from_string(tile_b_info["bbox"])
+                            iter_for_viz = oom_info.get("iteration", 0) if isinstance(oom_info, dict) else 0
+                            tile_id_for_viz = getattr(tile, "tile_id", "tile")
+                            viz_dir = Path(self.args.output_path) / "visualizations" / "cat3_oom"
+                            viz_dir.mkdir(parents=True, exist_ok=True)
+
+                            for child_label, child_prefix, child_bbox in [
+                                ("A", ply_prefix_a, tile_a_bbox_obj),
+                                ("B", ply_prefix_b, tile_b_bbox_obj),
+                            ]:
+                                if not child_prefix:
+                                    continue
+                                rank_files = [f"{child_prefix}_rank{r}.ply" for r in range(num_ranks)]
+                                rank_files = [p for p in rank_files if Path(p).exists()]
+                                if not rank_files:
+                                    continue
+                                out_png = viz_dir / f"cat3_iter{iter_for_viz}_tile{tile_id_for_viz}_child{child_label}_merged.png"
+                                save_merged_cat3_viz(
+                                    rank_files,
+                                    iteration=iter_for_viz,
+                                    tile_id=f"{tile_id_for_viz}_child{child_label}",
+                                    parent_bbox=parent_bbox_obj,
+                                    tile_a=tile_a_bbox_obj,
+                                    tile_b=tile_b_bbox_obj,
+                                    out_path=out_png,
+                                )
+                                print(f"  [viz] saved merged Cat3 viz -> {out_png}", flush=True)
+                    except Exception as _viz_e:
+                        print(f"  [viz] merged Cat3 viz skipped: {_viz_e}", flush=True)
+
+                    # If any merge failed, try to use partial results
                     if merge_errors:
                         print(f"\n{'!'*60}", flush=True)
-                        print(f"  FATAL ERROR: Category 3 OOM PLY merge failed!", flush=True)
+                        print(f"  WARNING: Category 3 OOM PLY merge partially failed!", flush=True)
                         for err in merge_errors:
                             print(f"  - {err}", flush=True)
                         print(f"  ", flush=True)
@@ -1548,9 +2024,20 @@ class AdaptiveTileTrainer:
                         if ply_path_b:
                             print(f"  [Partial success] Tile B merged: {ply_path_b}", flush=True)
                         print(f"  ", flush=True)
-                        print(f"  Adaptive training cannot continue without ALL valid PLY files.", flush=True)
-                        print(f"{'!'*60}\n", flush=True)
-                        sys.exit(1)
+                        
+                        # Allow partial results if at least one tile has data
+                        if ply_path_a or ply_path_b:
+                            print(f"  [PARTIAL SUCCESS] Continuing with available PLY files:", flush=True)
+                            if ply_path_a:
+                                print(f"    - Tile A: {ply_path_a}", flush=True)
+                            if ply_path_b:
+                                print(f"    - Tile B: {ply_path_b}", flush=True)
+                            print(f"  Note: Missing rank data will result in incomplete gaussians", flush=True)
+                            print(f"{'!'*60}\n", flush=True)
+                        else:
+                            print(f"  FATAL: No PLY files available at all. Cannot continue.", flush=True)
+                            print(f"{'!'*60}\n", flush=True)
+                            sys.exit(1)
 
                     if ply_path_a or ply_path_b:
                         print(f"  [Category 3 Resume] Child tiles will load pre-trained gaussians:", flush=True)
@@ -1621,6 +2108,10 @@ class AdaptiveTileTrainer:
                 self.tiles = new_tiles
 
                 self._save_state()
+                
+                # Generate visual debug for new tiles after OOM split
+                self._generate_visual_debug_for_tile(bbox_a, tile_a_id)
+                self._generate_visual_debug_for_tile(bbox_b, tile_b_id)
 
             else:
                 # Other failures - mark as failed and continue
@@ -1637,10 +2128,29 @@ class AdaptiveTileTrainer:
         except Exception as e:
             print(f"[Final visualization ERROR] {e}")
 
+        # Tile split tree (시간/인과 관계)
+        try:
+            self._visualize_split_tree()
+            print("[Final] Saved tile split tree visualization")
+        except Exception as e:
+            print(f"[Final split tree ERROR] {e}")
+
+        # Count successful vs failed/split tiles
+        success_count = sum(1 for tile in self.tiles.values() if tile.status == "completed")
+        failed_count = sum(1 for tile in self.tiles.values() if tile.status == "failed") 
+        split_count = sum(1 for tile in self.tiles.values() if tile.status == "split")
+
         print("\n" + "=" * 60)
-        print("Adaptive Tile Training Complete!")
-        print(f"  Completed tiles: {completed}")
+        if success_count == len(self.tiles):
+            print("🎉 Adaptive Tile Training - ALL TILES COMPLETED! 🎉")
+        else:
+            print("⚠️  Adaptive Tile Training - PARTIAL COMPLETION ⚠️")
+        print(f"  Successfully completed tiles: {success_count}")
+        print(f"  Failed tiles: {failed_count}")
+        print(f"  Split tiles (OOM): {split_count}")
         print(f"  Total tiles: {len(self.tiles)}")
+        if success_count < len(self.tiles):
+            print("  ⚠️  Some tiles did not complete successfully - check logs for errors")
         print("=" * 60)
 
 
@@ -1706,25 +2216,36 @@ class TeeOutput:
 def main():
     args = parse_args()
 
-    # Set up logging to file
-    log_file = Path(args.output_path) / "train_adaptive.log"
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    # Set up logging to file unless disabled by environment variable
+    # If disabled, rely on caller (e.g., run_adaptive.sh) to capture stdout/stderr.
+    disable_log = os.environ.get("TRAIN_ADAPTIVE_NO_LOG", "0") == "1"
 
-    # Tee stdout and stderr to both console and file
     import datetime
+    # Always capture originals for safe cleanup in exception handler
     original_stdout = sys.stdout
     original_stderr = sys.stderr
+    tee_stdout = None
+    tee_stderr = None
+    if not disable_log:
+        log_file = Path(args.output_path) / "train_adaptive.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    tee_stdout = TeeOutput(log_file, original_stdout)
-    tee_stderr = TeeOutput(log_file, original_stderr)
+        # Tee stdout and stderr to both console and file
+        tee_stdout = TeeOutput(log_file, original_stdout)
+        tee_stderr = TeeOutput(log_file, original_stderr)
 
-    sys.stdout = tee_stdout
-    sys.stderr = tee_stderr
+        sys.stdout = tee_stdout
+        sys.stderr = tee_stderr
 
-    print(f"\n{'='*60}")
-    print(f"[{datetime.datetime.now().isoformat()}] train_adaptive.py started")
-    print(f"Log file: {log_file}")
-    print(f"{'='*60}\n")
+        print(f"\n{'='*60}")
+        print(f"[{datetime.datetime.now().isoformat()}] train_adaptive.py started")
+        print(f"Log file: {log_file}")
+        print(f"{'='*60}\n")
+    else:
+        print(f"\n{'='*60}")
+        print(f"[{datetime.datetime.now().isoformat()}] train_adaptive.py started")
+        print("Log file: (disabled; using caller stdout/stderr)")
+        print(f"{'='*60}\n")
 
     try:
         trainer = AdaptiveTileTrainer(args)
@@ -1738,8 +2259,10 @@ def main():
         print(f"\n[{datetime.datetime.now().isoformat()}] train_adaptive.py finished")
         sys.stdout = original_stdout
         sys.stderr = original_stderr
-        tee_stdout.close()
-        tee_stderr.close()
+        if tee_stdout is not None:
+            tee_stdout.close()
+        if tee_stderr is not None:
+            tee_stderr.close()
 
 
 if __name__ == "__main__":

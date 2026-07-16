@@ -66,7 +66,41 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        # CPU snapshot for OOM-safe PLY saving
+        self._oom_cpu_snapshot = None
+        self._oom_cpu_snapshot_meta = {}
         self.setup_functions()
+
+    def update_oom_cpu_snapshot(self, iteration=None, reason="periodic"):
+        import time
+        import traceback
+        try:
+            t0 = time.monotonic()
+            with torch.no_grad():
+                snap = {
+                    "xyz": self._xyz.detach().cpu(),
+                    "features_dc": self._features_dc.detach().cpu(),
+                    "features_rest": self._features_rest.detach().cpu(),
+                    "opacity": self._opacity.detach().cpu(),
+                    "scaling": self._scaling.detach().cpu(),
+                    "rotation": self._rotation.detach().cpu(),
+                }
+            self._oom_cpu_snapshot = snap
+            self._oom_cpu_snapshot_meta = {
+                "iteration": iteration,
+                "reason": reason,
+                "time": time.time(),
+                "count": int(self._xyz.shape[0]) if self._xyz is not None else 0,
+            }
+            print(
+                f"[oom-snapshot] Updated CPU snapshot (iter={iteration}, reason={reason}, count={self._oom_cpu_snapshot_meta['count']}, dt={time.monotonic() - t0:.3f}s)",
+                flush=True,
+            )
+            return True
+        except Exception as e:
+            print(f"[oom-snapshot] ERROR: failed to update CPU snapshot: {e}", flush=True)
+            print(f"[oom-snapshot] traceback:\n{traceback.format_exc()}", flush=True)
+            return False
 
     def capture(self):
         return (
@@ -428,7 +462,38 @@ class GaussianModel:
         # filter_bbox: optional TileBBox to save only gaussians within the bbox (applied after gather, or on local data if local_only)
         # local_only: if True, skip distributed gather and save only this rank's local gaussians
         #             (used during OOM recovery when other ranks may not be synchronized)
+        
+        # IMMEDIATE DEBUG: First line in save_ply function
+        import time
+        import threading
+        import subprocess
+        import faulthandler
+        try:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+        except:
+            rank = 0
+        t0 = time.monotonic()
+        pid = os.getpid()
+        thread_name = threading.current_thread().name
+        print(f"[save_ply ENTRY] rank {rank} ENTERED save_ply function with path={path}, local_only={local_only}", flush=True)
+        print(f"[save_ply ENTRY] rank {rank} pid={pid} thread={thread_name} t0={t0:.6f}", flush=True)
+        
         args = utils.get_args()
+        print(f"[save_ply ENTRY] rank {rank} got args successfully", flush=True)
+        
+        # CRITICAL: For local_only mode during OOM recovery, temporarily disable distributed operations
+        # to prevent collective operation timeouts when other ranks are stuck or dead
+        original_gaussians_distribution = None
+        if local_only:
+            if hasattr(args, 'gaussians_distribution'):
+                original_gaussians_distribution = args.gaussians_distribution
+                args.gaussians_distribution = False
+            # NOTE: Do NOT modify utils.WORLD_SIZE here.
+            # The local_only branch already skips distributed gather,
+            # and changing WORLD_SIZE causes race conditions with SIGTERM handlers.
+            print(f"[save_ply] LOCAL_ONLY: Disabled distributed ops (gaussians_distribution={args.gaussians_distribution})", flush=True)
+        
         _xyz = _features_dc = _features_rest = _opacity = _scaling = _rotation = None
         utils.log_cpu_memory_usage("start save_ply")
         group = utils.DEFAULT_GROUP
@@ -443,12 +508,46 @@ class GaussianModel:
         # Local-only mode: skip gather and save each rank's local data independently
         # Used during OOM recovery when distributed sync is not possible
         if local_only:
-            _xyz = self._xyz
-            _features_dc = self._features_dc
-            _features_rest = self._features_rest
-            _opacity = self._opacity
-            _scaling = self._scaling
-            _rotation = self._rotation
+            use_snapshot = os.environ.get("PLY_USE_CPU_SNAPSHOT", "1") == "1"
+            snap = self._oom_cpu_snapshot if use_snapshot else None
+            if snap is not None:
+                meta = self._oom_cpu_snapshot_meta or {}
+                print(
+                    f"[save_ply] rank {group.rank()} using CPU snapshot for save (iter={meta.get('iteration')}, reason={meta.get('reason')}, count={meta.get('count')})",
+                    flush=True,
+                )
+                _xyz = snap.get("xyz")
+                _features_dc = snap.get("features_dc")
+                _features_rest = snap.get("features_rest")
+                _opacity = snap.get("opacity")
+                _scaling = snap.get("scaling")
+                _rotation = snap.get("rotation")
+            print(f"[save_ply DEBUG] rank {group.rank()} entering local_only branch", flush=True)
+            try:
+                if _xyz is None:
+                    print(f"[save_ply DEBUG] rank {group.rank()} accessing self._xyz", flush=True)
+                    _xyz = self._xyz
+                if _features_dc is None:
+                    print(f"[save_ply DEBUG] rank {group.rank()} accessing self._features_dc", flush=True)
+                    _features_dc = self._features_dc
+                if _features_rest is None:
+                    print(f"[save_ply DEBUG] rank {group.rank()} accessing self._features_rest", flush=True)
+                    _features_rest = self._features_rest
+                if _opacity is None:
+                    print(f"[save_ply DEBUG] rank {group.rank()} accessing self._opacity", flush=True)
+                    _opacity = self._opacity
+                if _scaling is None:
+                    print(f"[save_ply DEBUG] rank {group.rank()} accessing self._scaling", flush=True)
+                    _scaling = self._scaling
+                if _rotation is None:
+                    print(f"[save_ply DEBUG] rank {group.rank()} accessing self._rotation", flush=True)
+                    _rotation = self._rotation
+                print(f"[save_ply DEBUG] rank {group.rank()} all tensor accesses complete", flush=True)
+            except Exception as e:
+                print(f"[save_ply ERROR] rank {group.rank()} failed to access tensors: {e}", flush=True)
+                import traceback
+                print(f"[save_ply ERROR] rank {group.rank()} traceback:\n{traceback.format_exc()}", flush=True)
+                raise
             # Add rank suffix to path for each rank's output
             if path.endswith(".ply"):
                 path = path[:-4] + f"_rank{group.rank()}.ply"
@@ -547,27 +646,126 @@ class GaussianModel:
 
         mkdir_p(os.path.dirname(path))
 
-        xyz = _xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
-        f_dc = (
-            _features_dc.detach()
-            .transpose(1, 2)
-            .flatten(start_dim=1)
-            .contiguous()
-            .cpu()
-            .numpy()
-        )
-        f_rest = (
-            _features_rest.detach()
-            .transpose(1, 2)
-            .flatten(start_dim=1)
-            .contiguous()
-            .cpu()
-            .numpy()
-        )
-        opacities = _opacity.detach().cpu().numpy()
-        scale = _scaling.detach().cpu().numpy()
-        rotation = _rotation.detach().cpu().numpy()
+        print(f"[save_ply DEBUG] rank {group.rank()} starting tensor GPU->CPU conversion", flush=True)
+        conv_t0 = time.monotonic()
+        watchdog_enabled = os.environ.get("PLY_SAVE_WATCHDOG", "1") == "1"
+        watchdog_interval = float(os.environ.get("PLY_SAVE_WATCHDOG_INTERVAL", "5"))
+        trace_timeout = int(os.environ.get("PLY_SAVE_TRACE_TIMEOUT", "15"))
+        stop_event = threading.Event()
+
+        def _watchdog_loop():
+            last_nvsmi = None
+            while not stop_event.wait(watchdog_interval):
+                elapsed = time.monotonic() - conv_t0
+                # Try to probe GPU/driver health without blocking too long
+                nvsmi_status = "skip"
+                try:
+                    r = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                    nvsmi_status = f"ok(rc={r.returncode})"
+                except subprocess.TimeoutExpired:
+                    nvsmi_status = "timeout"
+                except Exception as e:
+                    nvsmi_status = f"err({type(e).__name__})"
+                if nvsmi_status != last_nvsmi:
+                    last_nvsmi = nvsmi_status
+                try:
+                    import torch
+                    alloc = torch.cuda.memory_allocated() / (1024**3)
+                    reserved = torch.cuda.memory_reserved() / (1024**3)
+                    mem_str = f"alloc={alloc:.2f}GB reserved={reserved:.2f}GB"
+                except Exception as e:
+                    mem_str = f"cuda_mem_err={type(e).__name__}"
+                print(f"[save_ply WATCHDOG] rank {group.rank()} elapsed={elapsed:.1f}s nvidia-smi={nvsmi_status} {mem_str}", flush=True)
+
+        if watchdog_enabled:
+            try:
+                faulthandler.dump_traceback_later(trace_timeout, repeat=True)
+            except Exception:
+                pass
+            watchdog_thread = threading.Thread(target=_watchdog_loop, name=f"ply-watchdog-r{group.rank()}", daemon=True)
+            watchdog_thread.start()
+        try:
+            print(f"[save_ply DEBUG] rank {group.rank()} converting xyz", flush=True)
+            step_t0 = time.monotonic()
+            try:
+                import torch
+                print(f"[save_ply DEBUG] rank {group.rank()} xyz meta: shape={tuple(_xyz.shape)}, dtype={_xyz.dtype}, device={_xyz.device}, contiguous={_xyz.is_contiguous()}", flush=True)
+                # Only sync CUDA if tensors are on GPU; skip for CPU snapshots
+                # to avoid blocking on pending NCCL ops during OOM recovery
+                if _xyz.is_cuda:
+                    sync_t0 = time.monotonic()
+                    print(f"[save_ply DEBUG] rank {group.rank()} pre-copy cuda.synchronize() start", flush=True)
+                    torch.cuda.synchronize()
+                    print(f"[save_ply DEBUG] rank {group.rank()} pre-copy cuda.synchronize() done, dt={time.monotonic() - sync_t0:.3f}s", flush=True)
+                else:
+                    print(f"[save_ply DEBUG] rank {group.rank()} skipping cuda.synchronize() (tensors on CPU)", flush=True)
+                if os.environ.get("PLY_COPY_PROBE", "1") == "1":
+                    probe_t0 = time.monotonic()
+                    print(f"[save_ply DEBUG] rank {group.rank()} probe copy start (1024 elems)", flush=True)
+                    _ = _xyz.view(-1)[:1024].detach().cpu()
+                    print(f"[save_ply DEBUG] rank {group.rank()} probe copy done, dt={time.monotonic() - probe_t0:.3f}s", flush=True)
+            except Exception as e:
+                print(f"[save_ply ERROR] rank {group.rank()} pre-copy checks failed: {e}", flush=True)
+            xyz = _xyz.detach().cpu().numpy()
+            print(f"[save_ply DEBUG] rank {group.rank()} xyz converted, shape={xyz.shape}, dt={time.monotonic() - step_t0:.3f}s", flush=True)
+            
+            print(f"[save_ply DEBUG] rank {group.rank()} creating normals", flush=True)
+            step_t0 = time.monotonic()
+            normals = np.zeros_like(xyz)
+            print(f"[save_ply DEBUG] rank {group.rank()} normals created, dt={time.monotonic() - step_t0:.3f}s", flush=True)
+            
+            print(f"[save_ply DEBUG] rank {group.rank()} converting features_dc", flush=True)
+            step_t0 = time.monotonic()
+            f_dc = (
+                _features_dc.detach()
+                .transpose(1, 2)
+                .flatten(start_dim=1)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
+            print(f"[save_ply DEBUG] rank {group.rank()} f_dc converted, dt={time.monotonic() - step_t0:.3f}s", flush=True)
+            
+            print(f"[save_ply DEBUG] rank {group.rank()} converting features_rest", flush=True)
+            step_t0 = time.monotonic()
+            f_rest = (
+                _features_rest.detach()
+                .transpose(1, 2)
+                .flatten(start_dim=1)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
+            print(f"[save_ply DEBUG] rank {group.rank()} f_rest converted, dt={time.monotonic() - step_t0:.3f}s", flush=True)
+            
+            print(f"[save_ply DEBUG] rank {group.rank()} converting opacity", flush=True)
+            step_t0 = time.monotonic()
+            opacities = _opacity.detach().cpu().numpy()
+            print(f"[save_ply DEBUG] rank {group.rank()} opacity converted, dt={time.monotonic() - step_t0:.3f}s", flush=True)
+            
+            print(f"[save_ply DEBUG] rank {group.rank()} converting scaling", flush=True)
+            step_t0 = time.monotonic()
+            scale = _scaling.detach().cpu().numpy()
+            print(f"[save_ply DEBUG] rank {group.rank()} scaling converted, dt={time.monotonic() - step_t0:.3f}s", flush=True)
+            
+            print(f"[save_ply DEBUG] rank {group.rank()} converting rotation", flush=True)
+            step_t0 = time.monotonic()
+            rotation = _rotation.detach().cpu().numpy()
+            print(f"[save_ply DEBUG] rank {group.rank()} rotation converted, dt={time.monotonic() - step_t0:.3f}s", flush=True)
+            
+            print(f"[save_ply DEBUG] rank {group.rank()} all tensor conversions complete, total_dt={time.monotonic() - conv_t0:.3f}s", flush=True)
+        except Exception as e:
+            print(f"[save_ply ERROR] rank {group.rank()} tensor conversion failed: {e}", flush=True)
+            import traceback
+            print(f"[save_ply ERROR] rank {group.rank()} conversion traceback:\n{traceback.format_exc()}", flush=True)
+            raise
+        finally:
+            if watchdog_enabled:
+                stop_event.set()
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception:
+                    pass
 
         # Apply filter_bbox if provided (for saving subset of gaussians within a spatial region)
         # This is computed after gather, so it works correctly with distributed training
@@ -603,10 +801,40 @@ class GaussianModel:
         utils.log_cpu_memory_usage(
             "after change numpy to plyelement before writing ply file"
         )
-        PlyData([el]).write(path)
+        write_t0 = time.monotonic()
+        print(f"[save_ply DEBUG] rank {group.rank()} starting PlyData.write, path={path}", flush=True)
+        # Atomic write: write to temp file then replace to avoid corrupt final files
+        tmp_path = None
+        try:
+            import tempfile
+            tmp_dir = os.path.dirname(path) or "."
+            fd, tmp_path = tempfile.mkstemp(prefix=".tmp_ply_", suffix=".ply", dir=tmp_dir)
+            os.close(fd)
+            PlyData([el]).write(tmp_path)
+            # fsync to reduce chance of partial file after abrupt termination
+            try:
+                with open(tmp_path, "rb") as f:
+                    os.fsync(f.fileno())
+            except Exception:
+                pass
+            os.replace(tmp_path, path)
+        finally:
+            # Clean up temp on failure
+            if tmp_path and os.path.exists(tmp_path) and not os.path.exists(path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+        print(f"[save_ply DEBUG] rank {group.rank()} PlyData.write complete, dt={time.monotonic() - write_t0:.3f}s", flush=True)
         utils.log_cpu_memory_usage("finish write ply file")
         # remark: max_radii2D, xyz_gradient_accum and denom are not saved here; they are save elsewhere.
         print(f"[save_ply] wrote {xyz.shape[0]:,} gaussians to {path}", flush=True)
+        
+        # Restore original distributed settings if they were temporarily disabled
+        if original_gaussians_distribution is not None:
+            args.gaussians_distribution = original_gaussians_distribution
+            print(f"[save_ply] Restored settings (gaussians_distribution={args.gaussians_distribution})", flush=True)
+        
         return xyz.shape[0]  # Return the number of gaussians saved
 
     def reset_opacity(self):

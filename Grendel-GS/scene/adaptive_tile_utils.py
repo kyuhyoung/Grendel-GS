@@ -29,7 +29,17 @@ class TileBBox:
         parts = [float(x) for x in bbox_str.split(",")]
         if len(parts) != 6:
             raise ValueError(f"Invalid bbox string: {bbox_str}")
-        return cls(*parts)
+        
+        bbox = cls(*parts)
+        # Validate bbox coordinates
+        if bbox.x_max < bbox.x_min:
+            raise ValueError(f"Invalid bbox: x_max ({bbox.x_max}) < x_min ({bbox.x_min})")
+        if bbox.y_max < bbox.y_min:
+            raise ValueError(f"Invalid bbox: y_max ({bbox.y_max}) < y_min ({bbox.y_min})")
+        if bbox.z_max < bbox.z_min:
+            raise ValueError(f"Invalid bbox: z_max ({bbox.z_max}) < z_min ({bbox.z_min})")
+        
+        return bbox
 
     def get_corners(self) -> np.ndarray:
         """Get 8 corners of the bounding box."""
@@ -62,29 +72,31 @@ class TileBBox:
         )
 
     def split(self) -> Tuple["TileBBox", "TileBBox"]:
-        """Split the tile along the longest axis."""
+        """Split the tile along the longest horizontal axis (X or Y only, never Z)."""
         dx = self.x_max - self.x_min
         dy = self.y_max - self.y_min
-        dz = self.z_max - self.z_min
-
-        if dx >= dy and dx >= dz:
+        
+        # Only split along X or Y axis, never Z
+        if dx >= dy:
+            # Split along X axis
             mid = (self.x_min + self.x_max) / 2
-            return (
-                TileBBox(self.x_min, self.y_min, self.z_min, mid, self.y_max, self.z_max),
-                TileBBox(mid, self.y_min, self.z_min, self.x_max, self.y_max, self.z_max),
-            )
-        elif dy >= dz:
-            mid = (self.y_min + self.y_max) / 2
-            return (
-                TileBBox(self.x_min, self.y_min, self.z_min, self.x_max, mid, self.z_max),
-                TileBBox(self.x_min, mid, self.z_min, self.x_max, self.y_max, self.z_max),
-            )
+            tile_a = TileBBox(self.x_min, self.y_min, self.z_min, mid, self.y_max, self.z_max)
+            tile_b = TileBBox(mid, self.y_min, self.z_min, self.x_max, self.y_max, self.z_max)
+            split_axis = "X"
         else:
-            mid = (self.z_min + self.z_max) / 2
-            return (
-                TileBBox(self.x_min, self.y_min, self.z_min, self.x_max, self.y_max, mid),
-                TileBBox(self.x_min, self.y_min, mid, self.x_max, self.y_max, self.z_max),
-            )
+            # Split along Y axis
+            mid = (self.y_min + self.y_max) / 2
+            tile_a = TileBBox(self.x_min, self.y_min, self.z_min, self.x_max, mid, self.z_max)
+            tile_b = TileBBox(self.x_min, mid, self.z_min, self.x_max, self.y_max, self.z_max)
+            split_axis = "Y"
+        
+        # Debug: validate split results
+        print(f"[DEBUG] Original bbox: {self.to_string()}")
+        print(f"[DEBUG] Split axis: {split_axis} (X={dx:.2f}, Y={dy:.2f})")
+        print(f"[DEBUG] Tile A: {tile_a.to_string()}")
+        print(f"[DEBUG] Tile B: {tile_b.to_string()}")
+        
+        return (tile_a, tile_b)
 
     def to_string(self) -> str:
         """Convert to string format."""

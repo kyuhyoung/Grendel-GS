@@ -197,11 +197,12 @@ def init_distributed(args):
     LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
     WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
     if WORLD_SIZE > 1:
-        # Set timeout for NCCL operations (default is 30 minutes, we use 300 seconds)
+        # Set timeout for NCCL operations (default is 30 minutes, we use environment variable or 300 seconds)
         # This ensures that if one rank dies (e.g., OOM), other ranks won't hang forever
         # They will get a timeout exception which we can catch and handle gracefully
         # Note: Image loading can take 2+ minutes, so we need at least 300s timeout
-        nccl_timeout = timedelta(seconds=300)
+        nccl_timeout_seconds = int(os.environ.get('NCCL_TIMEOUT', 300))
+        nccl_timeout = timedelta(seconds=nccl_timeout_seconds)
         torch.distributed.init_process_group(
             "nccl", rank=GLOBAL_RANK, world_size=WORLD_SIZE, timeout=nccl_timeout
         )

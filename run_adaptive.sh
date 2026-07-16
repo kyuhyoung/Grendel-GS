@@ -19,7 +19,9 @@ set -euo pipefail
 # ============================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/run_adaptive.log"
-> "${LOG_FILE}"  # Clear log file
+# Always start fresh log per run
+rm -f "${LOG_FILE}"
+: > "${LOG_FILE}"
 exec > >(tee "${LOG_FILE}") 2>&1
 
 echo ""
@@ -34,7 +36,7 @@ SOURCE_PATH="/data/dabeeo/samsung_dong_mini_30"
 OUTPUT_PATH="./output/adaptive_test"
 # Auto-detect number of available GPUs
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-GPU_IDS=""  # e.g., "0,1,2,3" or "4,5,6,7"
+GPU_IDS="0,1"  # Container maps physical GPUs to 0,1
 ITERATIONS=1000
 BACKEND="default"
 BSZ=1
@@ -56,6 +58,13 @@ DEBUG_SAVE_ITERS="1"
 VISUAL_DEBUG=false
 VISUAL_DEBUG_ONLY=false
 VISUAL_DEBUG_LEVEL=""  # Empty means level 0 (default)
+RENDER_DEBUG=false
+RENDER_DEBUG_MIN_POINTS=30
+
+# OOM timeout settings (seconds)
+OOM_ACK_TIMEOUT=60       # Timeout for rank ACK during OOM signaling (1 minute - faster detection)
+NCCL_TIMEOUT_OVERRIDE=1200  # NCCL timeout override (20 minutes for large gaussians)
+PLY_WAIT_TIMEOUT=3600    # Timeout for waiting PLY files to be saved (60 minutes)
 
 # ============================================
 # Parse arguments
@@ -82,6 +91,10 @@ print_usage() {
     echo "  --visual-debug              Enable visual debugging for projection and crop calculations"
     echo "  --visual-debug-only         Run only visual debugging and exit (no training)"
     echo "  --visual-debug-level N      Debug at specific tile level (default: 0, use higher for split tiles)"
+    echo "  --oom-ack-timeout N         Timeout for rank ACK during OOM signaling in seconds (default: 900)"
+    echo "  --nccl-timeout N            NCCL timeout for distributed operations in seconds (default: 1200)"
+    echo "  --ply-wait-timeout N        Timeout for waiting PLY files to be saved in seconds (default: 3600)"
+    echo "  --render-debug             Enable render debug dumps/PNGs for low-point cases"
     echo ""
 }
 
@@ -152,6 +165,22 @@ while [[ $# -gt 0 ]]; do
             DEBUG_SAVE_ITERS="$2"
             shift 2
             ;;
+        --oom-ack-timeout)
+            OOM_ACK_TIMEOUT="$2"
+            shift 2
+            ;;
+        --nccl-timeout)
+            NCCL_TIMEOUT_OVERRIDE="$2"
+            shift 2
+            ;;
+        --ply-wait-timeout)
+            PLY_WAIT_TIMEOUT="$2"
+            shift 2
+            ;;
+        --render-debug)
+            RENDER_DEBUG=true
+            shift
+            ;;
         --help|-h)
             print_usage
             exit 0
@@ -184,7 +213,7 @@ if [[ "$EXPLOSIVE_DENSIFICATION" == true ]]; then
     echo "  Overriding densification params for aggressive gaussian growth..."
     DENSIFY_FROM_ITER=100
     DENSIFICATION_INTERVAL=50
-    DENSIFY_GRAD_THRESHOLD=0.00005
+    DENSIFY_GRAD_THRESHOLD=0.00001  # 적당히 낮은 threshold (0.000001 -> 0.00001)
     ITERATIONS=8000
     echo "  Iterations set to: ${ITERATIONS}"
 fi
@@ -262,6 +291,34 @@ if [[ -n "$GPU_IDS" ]]; then
 fi
 
 # ============================================
+# NCCL Configuration for better OOM handling
+# ============================================
+export NCCL_TIMEOUT=$NCCL_TIMEOUT_OVERRIDE  # Configurable NCCL timeout for OOM handling
+export OOM_ACK_TIMEOUT=$OOM_ACK_TIMEOUT     # Configurable ACK timeout for OOM signaling
+export PLY_WAIT_TIMEOUT=$PLY_WAIT_TIMEOUT   # Configurable PLY wait timeout
+export NCCL_ASYNC_ERROR_HANDLING=1  # Better async error handling
+export TORCH_NCCL_ENABLE_MONITORING=0  # Disable NCCL watchdog to prevent kills during PLY save
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=0  # Disable heartbeat timeout
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1  # Avoid NCCL stream recording issues
+# Extend torchrun elastic shutdown grace period to allow large PLY writes to finish
+export TORCHELASTIC_SHUTDOWN_GRACE_PERIOD=600
+export TORCH_ELASTIC_SHUTDOWN_GRACE_PERIOD=600
+# Robust OOM PLY save timeouts (increase to allow large PLY writes)
+export OOM_PLY_SAVE_TIMEOUT=600
+if [[ "${RENDER_DEBUG}" == true ]]; then
+    export RENDER_DEBUG_DUMP=1
+    export RENDER_DEBUG_PNG=1
+    export RENDER_DEBUG_ABORT=1
+    export RENDER_DEBUG_MIN_POINTS="${RENDER_DEBUG_MIN_POINTS}"
+    echo "  Render debug: ON (min_points=${RENDER_DEBUG_MIN_POINTS})"
+else
+    unset RENDER_DEBUG_DUMP
+    unset RENDER_DEBUG_PNG
+    unset RENDER_DEBUG_MIN_POINTS
+fi
+# Render debug: dump small-point projections and PNGs for loss-zero analysis
+
+# ============================================
 # Run train_adaptive.py
 # ============================================
 echo ""
@@ -284,6 +341,8 @@ echo "  Densify from iter: ${DENSIFY_FROM_ITER}"
 echo "  Densification interval: ${DENSIFICATION_INTERVAL}"
 echo "  Densify grad threshold: ${DENSIFY_GRAD_THRESHOLD}"
 echo "  Debug save iters: ${DEBUG_SAVE_ITERS:-'default (1,100,500,1000)'}"
+echo "  OOM ACK timeout: ${OOM_ACK_TIMEOUT}s"
+echo "  NCCL timeout: ${NCCL_TIMEOUT_OVERRIDE}s"
 echo "============================================"
 echo ""
 
@@ -291,6 +350,8 @@ echo ""
 if [[ -n "$DEBUG_SAVE_ITERS" ]]; then
     export DEBUG_SAVE_ITERS="${DEBUG_SAVE_ITERS}"
 fi
+# Disable train_adaptive.py file logging; rely on run_adaptive.log
+export TRAIN_ADAPTIVE_NO_LOG=1
 
 # Build command (use -u for unbuffered output to ensure logs appear immediately)
 CMD="python -u ${SCRIPT_DIR}/scripts/train_adaptive.py"

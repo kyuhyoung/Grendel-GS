@@ -10,6 +10,14 @@ import json
 import random
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+# Import robust OOM handler
+from robust_oom_handler import (
+    initialize_robust_oom_handler, 
+    get_robust_oom_handler,
+    detect_oom_robust,
+    check_oom_signal_robust
+)
 from utils.loss_utils import l1_loss
 from gaussian_renderer import (
     distributed_preprocess3dgs_and_all2all_final,
@@ -191,6 +199,12 @@ def _sigterm_handler(signum, frame):
             _SIGTERM_LOG_FILE.flush()
         except:
             pass
+    # Ignore further SIGTERM during save to reduce re-entrancy
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        print(f"[SIGTERM] Rank {rank}: Ignoring further SIGTERM during save", flush=True)
+    except Exception:
+        pass
 
     # Write ack file (even though we received SIGTERM, write it for logging)
     try:
@@ -243,7 +257,8 @@ def install_sigterm_handler():
 
 OOM_SIGNAL_FILENAME = "oom_signal.json"
 
-# Global OOM signal monitor instance (set by training function)
+# Global OOM signal monitor instance (set by training function) - DEPRECATED
+# Now using robust OOM handler instead
 _oom_signal_monitor: Optional["OOMSignalMonitor"] = None
 
 
@@ -755,7 +770,14 @@ def handle_oom_signal_from_other_rank(
     # Calculate child tile bboxes (same logic as handle_adaptive_tile_oom)
     parent_level = getattr(args, "tile_level", 0)
     child_level = parent_level + 1
-    tile_a, tile_b = tile_bbox.split()
+    # Safely handle tile split
+    split_result = tile_bbox.split()
+    if isinstance(split_result, tuple) and len(split_result) == 2:
+        tile_a, tile_b = split_result
+    else:
+        print(f"[oom-signal] Rank {utils.GLOBAL_RANK} ERROR: tile_bbox.split() returned unexpected format: {split_result}", flush=True)
+        print(f"[oom-signal] Expected tuple with 2 elements, got {type(split_result)} with {len(split_result) if hasattr(split_result, '__len__') else 'unknown'} elements", flush=True)
+        return False
     # Use same tile ID generation as handle_adaptive_tile_oom()
     tile_num = int(tile_id.split("_")[-1]) if "_" in tile_id else 0
     tile_a_id = f"tile_{tile_num * 2 + 1:04d}"
@@ -838,6 +860,45 @@ def handle_oom_signal_from_other_rank(
 
     log_file.write(f"[oom-signal] Rank {utils.GLOBAL_RANK} saved {total_saved:,} gaussians\n")
     log_file.flush()
+
+    # Write adaptive_tile_state.json so the wrapper can merge/resume (Category 3)
+    try:
+        state_file = getattr(args, "tile_state_file", "") or (tile_output_dir / "adaptive_tile_state.json")
+        state_file = Path(state_file)
+        ply_path_a = str(tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{use_iteration}")
+        ply_path_b = str(tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{use_iteration}")
+        oom_state = {
+            "oom_occurred": True,
+            "oom_cause": "signal",
+            "oom_category": 3,
+            "original_tile_id": tile_id,
+            "original_tile_bbox": tile_bbox.to_string(),
+            "iteration": use_iteration,
+            "num_ranks": utils.WORLD_SIZE,
+            "tile_a": {
+                "tile_id": tile_a_id,
+                "bbox": tile_a.to_string(),
+                "ply_path": ply_path_a if count_a > 0 else None,
+                "ply_is_prefix": True,
+                "gaussian_count_local": int(count_a),
+                "status": "pending",
+            },
+            "tile_b": {
+                "tile_id": tile_b_id,
+                "bbox": tile_b.to_string(),
+                "ply_path": ply_path_b if count_b > 0 else None,
+                "ply_is_prefix": True,
+                "gaussian_count_local": int(count_b),
+                "status": "pending",
+            },
+        }
+        with open(state_file, "w") as f:
+            json.dump(oom_state, f, indent=2)
+        print(f"[oom-signal] Saved OOM state to {state_file} (num_ranks={utils.WORLD_SIZE}, WORLD_SIZE={utils.WORLD_SIZE})", flush=True)
+        log_file.write(f"[oom-signal] Saved OOM state to {state_file} (num_ranks={utils.WORLD_SIZE})\n")
+        log_file.flush()
+    except Exception as e:
+        print(f"[oom-signal] WARNING: Failed to write adaptive_tile_state.json: {e}", flush=True)
 
     # Write done file to signal completion to the signaling rank
     # Include per-child counts for merge validation
@@ -1038,6 +1099,7 @@ def save_debug_images(
     iteration: int,
     output_dir: Path,
     tile_id: str = "unknown",
+    args=None,
 ):
     """
     Save GT, rendered, and diff images for debugging off-center projection.
@@ -1055,7 +1117,7 @@ def save_debug_images(
     """
     import torchvision
 
-    debug_dir = output_dir / "debug_images"
+    debug_dir = output_dir / "visualizations" / "gt_compare"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     rank = utils.GLOBAL_RANK
@@ -1120,8 +1182,9 @@ def save_debug_images(
         print(f"[DEBUG-IMG] GPU{rank}: local_rendered.shape={local_rendered.shape}, local_gt.shape={local_gt.shape}", flush=True)
 
         cam_name = camera.image_name.replace("/", "_").replace("\\", "_")
-        # Format: tile_xxxx_iter_yyyy_cam_zzzz_gpuW_compare.png
-        prefix = f"{tile_id}_iter{iteration:04d}_cam{cam_name}_gpu{rank}"
+        num_visible = getattr(args, '_num_visible_cameras', 0)
+        # Format: tile_xxxx_view_NN_of_MM_cam_zzzz_gpuW_compare.png
+        prefix = f"{tile_id}_view{iteration:02d}of{num_visible:02d}_cam{cam_name}_gpu{rank}"
 
         # Combine GT (left/top) and Rendered (right/bottom) into single image
         local_rendered_clamped = local_rendered.clamp(0.0, 1.0).cpu()
@@ -1137,7 +1200,9 @@ def save_debug_images(
             combined = torch.cat([local_gt_cpu, local_rendered_clamped], dim=2)
             layout = "left_GT_right_Rendered"
 
-        torchvision.utils.save_image(combined, debug_dir / f"{prefix}_compare.png")
+        save_path = debug_dir / f"{prefix}_compare.png"
+        torchvision.utils.save_image(combined, save_path)
+        print(f"[DEBUG-IMG] Saved: {save_path.name}", flush=True)
 
         # Save info file
         info_path = debug_dir / f"{prefix}_info.txt"
@@ -1163,24 +1228,30 @@ def save_debug_images(
 
 
 def should_save_debug_images(iteration: int, args) -> bool:
-    """Check if debug images should be saved at this iteration."""
-    # Check environment variable
+    """Check if debug images should be saved at this iteration.
+
+    By default, saves for the first N iterations where N = number of visible cameras.
+    This ensures all views are captured (each camera appears once in first N iters).
+    """
+    # Check environment variable for explicit iteration list
     debug_iters_str = os.environ.get("DEBUG_SAVE_ITERS", "")
     if debug_iters_str:
         try:
             debug_iters = [int(x.strip()) for x in debug_iters_str.split(",")]
-            return iteration in debug_iters
+            if debug_iters != [1]:  # Skip default "1" — use auto N instead
+                return iteration in debug_iters
         except ValueError:
             pass
 
-    # Check args
+    # Check args for interval-based saving
     debug_interval = getattr(args, "debug_image_interval", 0)
     if debug_interval > 0 and iteration % debug_interval == 0:
         return True
 
-    # Default: save at iterations 1, 100, 500, 1000
-    default_iters = {1, 100, 500, 1000}
-    return iteration in default_iters
+    # Default: save first N iterations (N = visible camera count)
+    # This captures all views since each camera appears once in first N iters
+    num_visible = getattr(args, '_num_visible_cameras', 30)
+    return iteration <= num_visible
 
 
 def handle_adaptive_tile_oom(
@@ -1254,17 +1325,40 @@ def handle_adaptive_tile_oom(
     densify_interval_early = getattr(args, 'densification_interval', 100)
     first_densify_early = densify_from_early + densify_interval_early
     is_category3_early = iteration > first_densify_early
+    has_pretrained_early = bool(getattr(args, "pretrained_ply", ""))
     C_early = total_cameras_in_tile if total_cameras_in_tile > 0 else num_cameras
-    oom_category_early = 3 if is_category3_early else (1 if (C_early > 0 and iteration <= C_early) else 2)
+    if is_category3_early:
+        oom_category_early = 3
+    elif has_pretrained_early:
+        oom_category_early = 4
+    elif C_early > 0 and iteration <= C_early:
+        oom_category_early = 1
+    else:
+        oom_category_early = 2
     early_cause = "densification" if is_category3_early else "early_iteration"
 
-    # Write signal immediately - this is the most critical operation
-    print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} IMMEDIATE signal write (iter={iteration}, cat={oom_category_early})", flush=True)
-    write_oom_signal(args, iteration, early_cause, oom_category_early)
+    # Only use robust OOM handler for Category 3 (which needs PLY saving across ranks)
+    # Category 1,2 can be handled locally without cross-rank coordination
+    robust_used = False
+    if oom_category_early == 3:
+        print(f"\n[robust-oom] Rank {utils.GLOBAL_RANK} IMMEDIATE robust OOM signal (iter={iteration}, cat={oom_category_early})", flush=True)
+        # Do NOT kill the process group here; we still need to write state files.
+        # Also avoid handling SIGUSR1 on the detecting rank so it can finish state write.
+        detect_oom_robust(
+            iteration,
+            oom_category_early,
+            early_cause,
+            kill_process_group=False,
+            signal_self=False,
+            save_self=False,
+        )
+        robust_used = True
+    else:
+        print(f"\n[simple-oom] Rank {utils.GLOBAL_RANK} IMMEDIATE category {oom_category_early} OOM - no cross-rank coordination needed", flush=True)
 
     # Only wait for acks if Category 3 (need PLY saving from other ranks)
     # Category 1/2: No PLY saving needed, other ranks are likely stuck in collective ops anyway
-    if oom_category_early == 3:
+    if oom_category_early == 3 and not robust_used:
         # Wait for other ranks to acknowledge the signal (dynamic waiting)
         # This is CRITICAL: we wait until all other ranks have written ack files,
         # which means they've seen the signal and will NOT enter backward() (all_reduce).
@@ -1276,13 +1370,19 @@ def handle_adaptive_tile_oom(
         #   - Early/large tiles have long loss computation (20s was too short)
         #   - Small tiles finish quickly (20s was wasteful)
         #   - Ack-based waiting adapts to actual completion time
-        all_acked, acked_ranks = wait_for_all_acks(args, utils.WORLD_SIZE, utils.GLOBAL_RANK, timeout=60.0)
+        # Use environment variable for ACK timeout (default 600s for large gaussian counts 10M+)
+        ack_timeout = float(os.environ.get('OOM_ACK_TIMEOUT', 600.0))
+        all_acked, acked_ranks = wait_for_all_acks(args, utils.WORLD_SIZE, utils.GLOBAL_RANK, timeout=ack_timeout)
 
         if all_acked:
             print(f"[oom-signal] Proceeding with OOM handling - all ranks will save PLY.", flush=True)
         else:
             print(f"[oom-signal] Proceeding with OOM handling - stuck ranks will save via SIGTERM.", flush=True)
             print(f"[oom-signal] Will wait for done files only from acked ranks: {acked_ranks}", flush=True)
+    elif oom_category_early == 3 and robust_used:
+        # Robust handler does not use ack files; skip ack waiting to avoid timeouts.
+        all_acked, acked_ranks = False, []
+        print(f"[robust-oom] Skipping ack wait (robust handler in use)", flush=True)
     else:
         # Category 1/2: Skip ack waiting - no PLY saving needed
         print(f"[oom-signal] Category {oom_category_early} OOM - skipping ack wait (no PLY saving needed)", flush=True)
@@ -1364,22 +1464,24 @@ def handle_adaptive_tile_oom(
     log_file.write(f"  --> Likely cause: {likely_cause}\n")
     log_file.flush()
 
-    # Determine split axis
-    if dx >= dy and dx >= dz:
+    # Determine split axis (X or Y only, never Z)
+    if dx >= dy:
         split_axis = "X"
         mid = (tile_bbox.x_min + tile_bbox.x_max) / 2
-        utils.print_rank_0(f"[adaptive-tile] Splitting along {split_axis} axis (longest): mid={mid:.2f}")
-    elif dy >= dz:
+        utils.print_rank_0(f"[adaptive-tile] Splitting along {split_axis} axis (dx={dx:.1f} >= dy={dy:.1f}): mid={mid:.2f}")
+    else:
         split_axis = "Y"
         mid = (tile_bbox.y_min + tile_bbox.y_max) / 2
-        utils.print_rank_0(f"[adaptive-tile] Splitting along {split_axis} axis (longest): mid={mid:.2f}")
-    else:
-        split_axis = "Z"
-        mid = (tile_bbox.z_min + tile_bbox.z_max) / 2
-        utils.print_rank_0(f"[adaptive-tile] Splitting along {split_axis} axis (longest): mid={mid:.2f}")
+        utils.print_rank_0(f"[adaptive-tile] Splitting along {split_axis} axis (dy={dy:.1f} > dx={dx:.1f}): mid={mid:.2f}")
 
     # Split the tile
-    tile_a, tile_b = tile_bbox.split()
+    split_result = tile_bbox.split()
+    if isinstance(split_result, tuple) and len(split_result) == 2:
+        tile_a, tile_b = split_result
+    else:
+        utils.print_rank_0(f"[adaptive-tile] ERROR: tile_bbox.split() returned unexpected format: {split_result}")
+        utils.print_rank_0(f"[adaptive-tile] Expected tuple with 2 elements, got {type(split_result)} with {len(split_result) if hasattr(split_result, '__len__') else 'unknown'} elements")
+        return
     utils.print_rank_0(f"[adaptive-tile] Splitting tile into:")
     utils.print_rank_0(f"  Tile A: {tile_a.to_string()}")
     utils.print_rank_0(f"  Tile B: {tile_b.to_string()}")
@@ -1392,17 +1494,38 @@ def handle_adaptive_tile_oom(
     tile_a_id = f"tile_{tile_num * 2 + 1:04d}"
     tile_b_id = f"tile_{tile_num * 2 + 2:04d}"
 
-    # Determine if this is Category 3 OOM (increased gaussians)
+    # Determine OOM category
+    has_pretrained = bool(getattr(args, "pretrained_ply", ""))
     is_category3 = iteration > first_densify_iter
-    oom_category = 3 if is_category3 else (1 if (C > 0 and iteration <= C) else 2)
+    if is_category3:
+        oom_category = 3  # Densification grew gaussians (save PLY + split)
+    elif has_pretrained:
+        oom_category = 4  # Pre-trained gaussians too large before densification (split, reuse parent PLY)
+    elif C > 0 and iteration <= C:
+        oom_category = 1  # First camera pass, image too large (split)
+    else:
+        oom_category = 2  # Memory fragmentation before densification (retry)
 
     print(f"\n[OOM Category Detection]", flush=True)
-    print(f"  iteration={iteration}, first_densify_iter={first_densify_iter}", flush=True)
+    print(f"  iteration={iteration}, first_densify_iter={first_densify_iter}, has_pretrained={has_pretrained}", flush=True)
     print(f"  is_category3={is_category3}, oom_category={oom_category}", flush=True)
 
-    # Update OOM signal with more detailed cause (signal was already written at function start)
-    print(f"\n[oom-signal] Rank {utils.GLOBAL_RANK} updating signal with detailed cause: {likely_cause}", flush=True)
-    write_oom_signal(args, iteration, likely_cause, oom_category)
+    # Only use robust OOM handler for Category 3 (which needs PLY saving across ranks)
+    # Category 1,2 can be handled locally without cross-rank coordination
+    if not robust_used:
+        if is_category3:
+            print(f"\n[robust-oom] Rank {utils.GLOBAL_RANK} robust OOM signal with detailed cause: {likely_cause}", flush=True)
+            detect_oom_robust(
+                iteration,
+                oom_category,
+                likely_cause,
+                kill_process_group=False,
+                signal_self=False,
+                save_self=False,
+            )
+            robust_used = True
+        else:
+            print(f"\n[simple-oom] Category {oom_category} OOM - no cross-rank coordination needed", flush=True)
 
     # Save state for wrapper script to handle
     tile_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1428,24 +1551,55 @@ def handle_adaptive_tile_oom(
         # CRITICAL: Aggressively clear GPU memory before saving PLY
         # When OOM happens, GPU is nearly full. We need to free as much as possible:
         # 1. Clear gradients on all gaussian parameters (frees gradient tensors)
-        # 2. Force Python garbage collection
-        # 3. Synchronize CUDA and clear PyTorch's memory cache
+        # 2. Move tensors to CPU temporarily to maximize GPU memory
+        # 3. Force Python garbage collection multiple times
+        # 4. Synchronize CUDA and clear PyTorch's memory cache
         import gc
 
+        print(f"  [aggressive-cleanup] Starting aggressive GPU memory cleanup for PLY saving...", flush=True)
+        
         # Clear gradients - this frees the .grad tensors attached to parameters
         for param in gaussians.parameters():
             if param.grad is not None:
                 param.grad = None
 
-        # Force garbage collection to free any unreferenced tensors
+        # First cleanup pass
         gc.collect()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-        # Report memory status
+        # More aggressive cleanup: remove gradient computation and force memory release
+        # But avoid moving essential tensors that might break save_ply
+        print(f"  [aggressive-cleanup] Performing additional memory cleanup...", flush=True)
+        cpu_backup = {}
+        
+        # Disable gradients and clear caches before PLY saving
+        # NOTE: Do NOT modify utils.WORLD_SIZE or utils.GLOBAL_RANK here.
+        # save_ply(local_only=True) handles distributed ops internally.
+        # Changing globals causes race conditions with SIGTERM handlers
+        # that read WORLD_SIZE for state file writes.
+        print(f"  [aggressive-cleanup] Disabling gradients and clearing caches for PLY saving...", flush=True)
+
+        try:
+            torch.set_grad_enabled(False)  # Temporarily disable gradients
+
+            # Clear any remaining optimizer states if they exist
+            if hasattr(gaussians, 'optimizer_state'):
+                gaussians.optimizer_state = None
+
+        except Exception as e:
+            print(f"  [aggressive-cleanup] Warning: Additional cleanup failed: {e}", flush=True)
+
+        # Multiple cleanup passes - sometimes tensors are not freed immediately
+        for i in range(3):
+            gc.collect()
+            torch.cuda.synchronize() 
+            torch.cuda.empty_cache()
+
+        # Report memory status after aggressive cleanup
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"  [GPU cleanup] Cleared gradients and cache. Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB", flush=True)
+        print(f"  [aggressive-cleanup] After cleanup. Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB", flush=True)
 
         # PLY prefix for wrapper to find all rank files
         ply_prefix_a = str(tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{iteration}")
@@ -1496,6 +1650,13 @@ def handle_adaptive_tile_oom(
         else:
             print(f"  Rank {utils.GLOBAL_RANK} finished saving. Total local: 0 gaussians", flush=True)
 
+        # Re-enable gradients after PLY saving
+        try:
+            torch.set_grad_enabled(True)
+            print(f"  [aggressive-cleanup] Re-enabled gradients after PLY saving", flush=True)
+        except Exception as e:
+            print(f"  [aggressive-cleanup] Warning: Failed to restore settings: {e}", flush=True)
+
         # Set ply_path to the prefix (wrapper will look for *_rank*.ply files)
         ply_path_a = ply_prefix_a if count_a > 0 else None
         ply_path_b = ply_prefix_b if count_b > 0 else None
@@ -1514,7 +1675,7 @@ def handle_adaptive_tile_oom(
     oom_state = {
         "oom_occurred": True,
         "oom_cause": likely_cause,
-        "oom_category": 3 if is_category3 else (1 if (C > 0 and iteration <= C) else 2),
+        "oom_category": oom_category,
         "original_tile_id": tile_id,
         "original_tile_bbox": tile_bbox.to_string(),
         "iteration": iteration,
@@ -1540,8 +1701,8 @@ def handle_adaptive_tile_oom(
     with open(state_file, "w") as f:
         json.dump(oom_state, f, indent=2)
 
-    utils.print_rank_0(f"[adaptive-tile] Saved OOM state to {state_file}")
-    log_file.write(f"[adaptive-tile] Saved OOM state to {state_file}\n")
+    utils.print_rank_0(f"[adaptive-tile] Saved OOM state to {state_file} (num_ranks={world_size}, WORLD_SIZE={utils.WORLD_SIZE})")
+    log_file.write(f"[adaptive-tile] Saved OOM state to {state_file} (num_ranks={world_size})\n")
     log_file.flush()
 
     # Write done file for this rank (even for Category 1/2, to unblock other ranks)
@@ -1570,7 +1731,17 @@ def handle_adaptive_tile_oom(
     # - Acked ranks finish quickly, OOM rank proceeds without fixed delay
     # - Stuck ranks get full SIGTERM grace period from torchrun (default ~30s)
 
-    if acked_ranks:
+    if robust_used and is_category3:
+        wait_timeout = float(os.environ.get('PLY_WAIT_TIMEOUT', 3600))
+        target_ranks = list(range(utils.WORLD_SIZE))
+        print(f"\n[robust-oom] Waiting for done files from all ranks {target_ranks} (timeout {wait_timeout}s)...", flush=True)
+        all_done = check_all_ranks_done(args, utils.WORLD_SIZE, timeout=wait_timeout, target_ranks=target_ranks)
+        if all_done:
+            print(f"[robust-oom] All ranks completed saving. Safe to exit.", flush=True)
+        else:
+            print(f"[robust-oom] FATAL - TIMEOUT after {wait_timeout:.0f}s waiting for all ranks!", flush=True)
+            print(f"[robust-oom] Some ranks did not complete saving.", flush=True)
+    elif acked_ranks:
         print(f"\n[oom-signal] Waiting for acked ranks {acked_ranks} to complete saving...", flush=True)
         # Wait indefinitely for acked ranks - they MUST complete saving.
         # Using 1 hour timeout as safety net, but should never be reached.
@@ -1876,6 +2047,19 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         scene = Scene(args, gaussians)
         log_gpu_memory("after_scene_load", force=True)
 
+    # Per-rank gaussian count tracker — initialized as early as possible so any
+    # OOM/exception in pre-training stages also leaves a JSONL trace. Must come
+    # after Scene init (gaussians._xyz exists) but before any optional pre-flight.
+    _count_tracker = None
+    try:
+        from utils.count_tracker import init_tracker as _init_count_tracker
+        _ct_tile_id = getattr(args, "tile_id", "tile")
+        _ct_out_dir = Path(getattr(args, "tile_output_dir", "") or args.model_path).parent / "visualizations" / "count_timeline"
+        _count_tracker = _init_count_tracker(utils.GLOBAL_RANK, _ct_tile_id, _ct_out_dir, sample_every=20)
+        _count_tracker.record_event(0, gaussians._xyz.shape[0], "start")
+    except Exception as _ct_e:
+        print(f"[count_tracker] init skipped: {_ct_e}", flush=True)
+
         if args.start_checkpoint != "":
             model_params, start_from_this_iteration = utils.load_checkpoint(args)
             gaussians.restore(model_params, opt_args)
@@ -1890,6 +2074,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     # Init dataset
     train_dataset = SceneDataset(scene.getTrainCameras())
+    args._num_visible_cameras = len(train_dataset.cameras)
     if args.adjust_strategy_warmp_iterations == -1:
         args.adjust_strategy_warmp_iterations = len(train_dataset.cameras)
         # use one epoch to warm up. do not use the first epoch's running time for adjustment of strategy.
@@ -1929,12 +2114,171 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     tile_loss_scheduler = TileImageLossScheduler(args, background)
 
-    # Start OOM signal monitor thread (for distributed OOM handling)
-    oom_monitor = None
-    if getattr(args, "adaptive_tile_enabled", False) and utils.WORLD_SIZE > 1:
-        oom_monitor = OOMSignalMonitor(args, utils.GLOBAL_RANK, utils.WORLD_SIZE)
-        oom_monitor.start()
-        set_oom_signal_monitor(oom_monitor)
+    # PLY save callback for robust OOM handler
+    def save_ply_callback(iteration: int, rank: int) -> bool:
+        """Save PLY files for robust OOM handler. Returns True if successful."""
+        try:
+            # Get tile split configuration
+            tile_output_dir = Path(getattr(args, "tile_output_dir", "") or args.model_path)
+            tile_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Get current tile info from args
+            current_tile_id = getattr(args, "tile_id", "tile_0000")
+            parent_level = getattr(args, "tile_level", 0)
+            child_level = parent_level + 1
+            
+            # Get tile bbox from args if available
+            tile_bbox_str = getattr(args, "tile_bbox", None)
+            print(f"[robust-oom] Rank {rank} DEBUG: tile_bbox_str = {tile_bbox_str}, type = {type(tile_bbox_str)}", flush=True)
+            
+            if tile_bbox_str is None:
+                print(f"[robust-oom] Rank {rank} no tile_bbox found, saving all gaussians", flush=True)
+                # Save all gaussians
+                final_base = tile_output_dir / f"{current_tile_id}_L{parent_level}_oom_iter{iteration}.ply"
+                count = gaussians.save_ply(str(final_base), local_only=True)
+                final_path = tile_output_dir / f"{current_tile_id}_L{parent_level}_oom_iter{iteration}_rank{rank}.ply"
+                count_a, count_b = 0, 0
+            else:
+                # Convert string to TileBBox object if needed
+                from scene.adaptive_tile_utils import TileBBox
+                if isinstance(tile_bbox_str, str):
+                    print(f"[robust-oom] Rank {rank} converting string '{tile_bbox_str}' to TileBBox", flush=True)
+                    tile_bbox = TileBBox.from_string(tile_bbox_str)
+                else:
+                    print(f"[robust-oom] Rank {rank} using existing TileBBox object: {tile_bbox_str}", flush=True)
+                    tile_bbox = tile_bbox_str
+                
+                print(f"[robust-oom] Rank {rank} about to call split() on {tile_bbox}", flush=True)
+                # Split and save tiles
+                split_result = tile_bbox.split()
+                print(f"[robust-oom] Rank {rank} split() returned: {split_result}, type: {type(split_result)}", flush=True)
+                
+                # Safely unpack split result
+                if isinstance(split_result, tuple) and len(split_result) == 2:
+                    tile_a, tile_b = split_result
+                else:
+                    print(f"[robust-oom] Rank {rank} ERROR: split() returned unexpected format: {split_result}", flush=True)
+                    print(f"[robust-oom] Rank {rank} Expected tuple with 2 elements, got {type(split_result)} with {len(split_result) if hasattr(split_result, '__len__') else 'unknown'} elements", flush=True)
+                    return False
+                
+                # Generate new tile IDs
+                tile_num = int(current_tile_id.split("_")[-1]) if "_" in current_tile_id else 0
+                base_id = "_".join(current_tile_id.split("_")[:-1]) if "_" in current_tile_id else "tile"
+                tile_a_id = f"{base_id}_{(tile_num * 2 + 1):04d}"
+                tile_b_id = f"{base_id}_{(tile_num * 2 + 2):04d}"
+                
+                print(f"[robust-oom] Rank {rank} saving split tiles: {tile_a_id}, {tile_b_id}", flush=True)
+                
+                # Save tile B first (larger tile)
+                final_base_b = tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{iteration}.ply"
+                count_b = gaussians.save_ply(str(final_base_b), filter_bbox=tile_b, local_only=True)
+                
+                # Save tile A second
+                final_base_a = tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{iteration}.ply"
+                count_a = gaussians.save_ply(str(final_base_a), filter_bbox=tile_a, local_only=True)
+                
+                count = count_a + count_b
+                print(f"[robust-oom] Rank {rank} saved A:{count_a}, B:{count_b} gaussians", flush=True)
+
+                # Per-rank Cat3 OOM 시각화 (학습/저장 흐름을 막지 않도록 best-effort)
+                try:
+                    from utils.oom_viz import save_per_rank_cat3_viz
+                    snap = getattr(gaussians, "_oom_cpu_snapshot", None)
+                    if snap is not None and snap.get("xyz") is not None:
+                        xyz_local = snap["xyz"].detach().cpu().numpy()
+                    else:
+                        xyz_local = gaussians._xyz.detach().cpu().numpy()
+                    viz_dir = tile_output_dir.parent / "visualizations" / "cat3_oom"
+                    save_per_rank_cat3_viz(
+                        xyz_local,
+                        rank=rank,
+                        iteration=iteration,
+                        tile_id=current_tile_id,
+                        parent_bbox=tile_bbox,
+                        tile_a=tile_a,
+                        tile_b=tile_b,
+                        out_dir=viz_dir,
+                        count_a=count_a,
+                        count_b=count_b,
+                    )
+                except Exception as viz_e:
+                    print(f"[robust-oom] Rank {rank} viz skipped: {viz_e}", flush=True)
+
+            # Write done file for robust handler so wrapper can wait/merge
+            try:
+                write_oom_done(args, rank, count, count_a=count_a, count_b=count_b)
+            except Exception as e:
+                print(f"[robust-oom] Rank {rank} WARNING: failed to write done file: {e}", flush=True)
+
+            # Count timeline: OOM event 기록 + flush
+            try:
+                from utils.count_tracker import get_tracker as _get_ct
+                _ct = _get_ct()
+                if _ct is not None:
+                    try:
+                        _cur = gaussians._xyz.shape[0]
+                    except Exception:
+                        _cur = -1
+                    _ct.record_event(iteration, _cur, "oom_cat3")
+                    _ct.flush()
+            except Exception as _ct_e:
+                print(f"[count_tracker] flush at OOM skipped: {_ct_e}", flush=True)
+
+            return count > 0
+            
+        except Exception as e:
+            print(f"[robust-oom] FATAL: Rank {rank} PLY save failed: {e}", flush=True)
+            return False
+    
+    # Function to check and handle OOM signal from robust handler (backward compatibility)
+    def check_and_handle_oom(iteration, phase="unknown"):
+        """Check for OOM signal and handle if found. Returns True if OOM detected."""
+        if not getattr(args, "adaptive_tile_enabled", False):
+            return False
+            
+        # Check robust OOM handler first
+        robust_handler = get_robust_oom_handler()
+        if robust_handler:
+            oom_signal = robust_handler.check_oom_signal()
+            if oom_signal:
+                print(f"\n[{_ts()}] [robust-oom] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected robust OOM signal! ({phase})", flush=True)
+                log_file.write(f"[{_ts()}] [robust-oom] Rank {utils.GLOBAL_RANK} detected robust signal at iter {iteration} ({phase})\n")
+                
+                # Handle OOM through robust handler - it will call save_ply_callback and exit
+                # No need to do anything else here as the signal handler will take over
+                return True
+        
+        # Fallback to legacy OOM signal check for backward compatibility
+        oom_signal = check_oom_signal(args)
+        if oom_signal and oom_signal.get("signaling_rank") != utils.GLOBAL_RANK:
+            print(f"\n[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected legacy OOM signal! ({phase})", flush=True)
+            log_file.write(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} detected legacy signal at iter {iteration} ({phase})\n")
+            
+            # IMMEDIATELY write ack file
+            write_oom_ack(args, utils.GLOBAL_RANK)
+            
+            handled = handle_oom_signal_from_other_rank(
+                oom_signal, gaussians, args, iteration, log_file
+            )
+            if handled:
+                log_file.flush()
+                tile_manager.finalize(gaussians)
+                progress_bar.clear()
+                progress_bar.disable = True
+                progress_bar.close()
+                print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
+                sys.exit(EXIT_CODE_OOM)
+            return True
+        return False
+
+    # NOTE: Removed the DEBUG-IMG pre-loop that previously rendered all visible cameras
+    # before training. It used the same distributed render path as a training step, so it
+    # cost the same memory as one full training iteration on a giant image and routinely
+    # caused CUDA OOM at the very start (before robust_oom_handler / count_tracker were
+    # initialized, masking the real Cat 3 behavior we want to study). GT-vs-rendered debug
+    # images are still saved during the training loop at the iterations specified by
+    # DEBUG_SAVE_ITERS via should_save_debug_images / save_debug_images, which is the
+    # correct (and safe) place because the training loop's OOM handler protects them.
 
     # Training Loop
     end2end_timers = End2endTimer(args)
@@ -1948,14 +2292,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     num_trained_batches = 0
 
     ema_loss_for_log = 0
-    adaptive_tile_mode = getattr(args, "adaptive_tile_enabled", False)
+    # Always enable adaptive tile mode if we're in a tile training (has tile_id)
+    adaptive_tile_mode = getattr(args, "adaptive_tile_enabled", False) or hasattr(args, "tile_id")
     current_iteration = start_from_this_iteration
 
-    # Install SIGTERM handler for distributed OOM synchronization
-    # This allows other ranks to save their gaussians when one rank catches OOM
+    # Initialize robust OOM handler for distributed OOM synchronization
     if adaptive_tile_mode:
+        print(f"[robust-oom] Rank {utils.GLOBAL_RANK} initializing robust OOM handler (adaptive_tile_enabled={getattr(args, 'adaptive_tile_enabled', False)}, has_tile_id={hasattr(args, 'tile_id')}, tile_id={getattr(args, 'tile_id', 'None')})", flush=True)
+        initialize_robust_oom_handler(args, utils.GLOBAL_RANK, utils.WORLD_SIZE, save_ply_callback)
+        print(f"[robust-oom] Rank {utils.GLOBAL_RANK} robust OOM handler initialized successfully", flush=True)
+
+        # Legacy SIGTERM handler as fallback (for backward compatibility)
         install_sigterm_handler()
-        # Initial state registration
         register_sigterm_state(gaussians, args, log_file, current_iteration)
 
     try:
@@ -1974,29 +2322,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             # Reset operation tracker for this iteration
             set_current_operation("iteration_start")
 
-            # Check for OOM signal from other ranks (distributed OOM sync)
-            # This allows all ranks to save their gaussians when one rank catches OOM
+            # Check for OOM signal at iteration start (CRITICAL POINT 1)
             if adaptive_tile_mode:
-                oom_signal = check_oom_signal(args)
-                if oom_signal and oom_signal.get("signaling_rank") != utils.GLOBAL_RANK:
-                    # Another rank caught OOM - save our gaussians and exit
-                    print(f"\n[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Detected OOM signal! (iter_start)", flush=True)
-                    log_file.write(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} detected signal at iter {iteration} (iter_start)\n")
+                check_and_handle_oom(iteration, "iter_start")
 
-                    # IMMEDIATELY write ack file - this tells the OOM rank we won't enter backward()
-                    write_oom_ack(args, utils.GLOBAL_RANK)
-
-                    handled = handle_oom_signal_from_other_rank(
-                        oom_signal, gaussians, args, iteration, log_file
-                    )
-                    if handled:
-                        log_file.flush()
-                        tile_manager.finalize(gaussians)
-                        progress_bar.clear()
-                        progress_bar.disable = True
-                        progress_bar.close()
-                        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
-                        sys.exit(EXIT_CODE_OOM)
+            # Periodic CPU snapshot for OOM-safe PLY saving
+            if adaptive_tile_mode:
+                try:
+                    snap_interval = int(os.environ.get("OOM_CPU_SNAPSHOT_INTERVAL", "50"))
+                except Exception:
+                    snap_interval = 50
+                if snap_interval > 0 and iteration % snap_interval == 0:
+                    gaussians.update_oom_cpu_snapshot(iteration=iteration, reason="periodic")
 
             if debug_first_iters:
                 utils.print_rank_0(f"\n[DEBUG] ===== Iteration {iteration} START =====")
@@ -2103,11 +2440,20 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 )
                 timers.stop("load_cameras")
                 log_gpu_memory("after_load_images")
+                
+                # Check for OOM signal after loading images (CRITICAL POINT 3)
+                if adaptive_tile_mode:
+                    check_and_handle_oom(iteration, "after_load_images")
+                    
                 if debug_first_iters:
                     utils.print_rank_0(f"[DEBUG] [{iteration}] Cameras loaded to GPU")
 
             if debug_first_iters:
                 utils.print_rank_0(f"[DEBUG] [{iteration}] Starting rendering (backend={args.backend})...")
+
+            # Check for OOM signal before forward pass (preprocessing/rendering)
+            if adaptive_tile_mode:
+                check_and_handle_oom(iteration, "before_forward_pass")
 
             if args.backend == "gsplat":
                 set_current_operation("gsplat_preprocess")
@@ -2196,7 +2542,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     tile_output_dir = Path(getattr(args, "tile_output_dir", "") or args.model_path)
                     output_path = tile_output_dir.parent  # Go up from ply/ to adaptive_test/
                     tile_id = getattr(args, "tile_id", "unknown")
-                    utils.print_rank_0(f"[DEBUG-IMG] Saving to {output_path}/debug_images/ tile={tile_id} iter={iteration}")
+                    utils.print_rank_0(f"[DEBUG-IMG] Saving to {output_path}/visualizations/gt_compare/ tile={tile_id} iter={iteration}")
                     save_debug_images(
                         batched_image,
                         batched_cameras,
@@ -2204,6 +2550,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         iteration,
                         output_path,
                         tile_id=tile_id,
+                        args=args,
                     )
                 except Exception as e:
                     utils.print_rank_0(f"[DEBUG-IMG] Failed to save debug images: {e}")
@@ -2274,6 +2621,28 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK} exiting with code {EXIT_CODE_OOM}", flush=True)
                         sys.exit(EXIT_CODE_OOM)
 
+            # CRITICAL: Synchronize all ranks before backward to ensure no rank is stuck
+            # This prevents deadlock when one rank hits OOM while another enters backward
+            if adaptive_tile_mode and utils.DEFAULT_GROUP.size() > 1:
+                try:
+                    # Synchronize all ranks before backward
+                    torch.distributed.barrier(group=utils.DEFAULT_GROUP)
+                except RuntimeError as e:
+                    # Barrier failure might indicate rank sync issues
+                    print(f"[{_ts()}] [barrier-error] Rank {utils.GLOBAL_RANK} @ iter {iteration}: Pre-backward barrier failed: {e}", flush=True)
+                    # Check for OOM signal again
+                    oom_signal = check_oom_signal(args)
+                    if oom_signal:
+                        print(f"[{_ts()}] [oom-signal] Rank {utils.GLOBAL_RANK}: OOM signal found after barrier timeout", flush=True)
+                        write_oom_ack(args, utils.GLOBAL_RANK)
+                        handled = handle_oom_signal_from_other_rank(
+                            oom_signal, gaussians, args, iteration, log_file
+                        )
+                        if handled:
+                            sys.exit(EXIT_CODE_OOM)
+                    # If no OOM signal, re-raise the original error
+                    raise e
+            
             set_current_operation("backward")
             log_gpu_memory("before_backward")
             timers.start("backward")
@@ -2281,6 +2650,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             timers.stop("backward")
             log_gpu_memory("after_backward")
             utils.check_initial_gpu_memory_usage("after backward")
+            
+            # Check for OOM signal after backward pass (CRITICAL POINT 2)
+            if adaptive_tile_mode:
+                check_and_handle_oom(iteration, "after_backward")
 
             if debug_first_iters:
                 utils.print_rank_0(f"[DEBUG] [{iteration}] Backward done")
@@ -2350,6 +2723,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
                 # Densification
                 if not tile_manager.enabled:
+                    # Check for OOM signal before densification (CRITICAL POINT 4)
+                    if adaptive_tile_mode:
+                        check_and_handle_oom(iteration, "before_densification")
+                    
                     set_current_operation("densification")
                     log_gpu_memory("before_densification")
                     num_gaussians_before = gaussians.get_xyz.shape[0]
@@ -2361,6 +2738,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         densification(iteration, scene, gaussians, batched_screenspace_pkg)
                     num_gaussians_after = gaussians.get_xyz.shape[0]
                     log_gpu_memory("after_densification")
+                    
+                    # Check for OOM signal after densification (CRITICAL POINT 5)
+                    if adaptive_tile_mode:
+                        check_and_handle_oom(iteration, "after_densification")
                     # Log gaussian count change (compute total across all ranks)
                     if num_gaussians_after != num_gaussians_before:
                         local_delta = num_gaussians_after - num_gaussians_before
@@ -2372,6 +2753,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         total_delta = total_after - total_before
                         total_sign = "+" if total_delta > 0 else ""
                         utils.print_rank_0(f"[Densify] iter {iteration}: TOTAL {total_before:,} -> {total_after:,} ({total_sign}{total_delta:,})")
+                        if _count_tracker is not None:
+                            _count_tracker.record_event(
+                                iteration, num_gaussians_after,
+                                f"densify_{sign}{local_delta}",
+                            )
 
                 if tile_loss_scheduler.enabled:
                     # Release heavy training buffers before running the auxiliary render.
@@ -2513,6 +2899,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             progress_bar.update(args.bsz)
             log_file.flush()
 
+            if _count_tracker is not None:
+                try:
+                    _count_tracker.maybe_record(iteration, gaussians._xyz.shape[0])
+                except Exception:
+                    pass
+
     except KeyboardInterrupt:
         # Handle KeyboardInterrupt from OOM signal monitor thread (_thread.interrupt_main())
         # This is used to force the main thread out of blocking collective operations for PLY saving
@@ -2615,14 +3007,42 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             )
 
             if handled:
-                utils.print_rank_0(f"[adaptive-tile] Exiting with code {EXIT_CODE_OOM} for wrapper to handle")
-                log_file.flush()
-                tile_manager.finalize(gaussians)
-                # Clear and close progress bar silently (don't print final state on OOM)
-                progress_bar.clear()
-                progress_bar.disable = True
-                progress_bar.close()
-                sys.exit(EXIT_CODE_OOM)
+                # Read the OOM category from the state file to determine if we should exit
+                tile_output_dir = Path(getattr(args, "tile_output_dir", "output/adaptive_test/ply"))
+                state_file = getattr(args, "tile_state_file", "") or (tile_output_dir / "adaptive_tile_state.json")
+                state_file = Path(state_file)
+                
+                oom_category = None
+                if state_file.exists():
+                    try:
+                        with open(state_file, 'r') as f:
+                            state_data = json.load(f)
+                            oom_category = state_data.get("oom_category", None)
+                            utils.print_rank_0(f"[adaptive-tile] OOM category {oom_category} detected from state file")
+                    except Exception as e:
+                        utils.print_rank_0(f"[adaptive-tile] Warning: Failed to read OOM category from state file: {e}")
+                
+                # Only exit for Category 3 OOM (which requires PLY save and resume)
+                # Category 1 and 2 should continue with tile splitting in the wrapper
+                if oom_category == 3:
+                    utils.print_rank_0(f"[adaptive-tile] Category 3 OOM: Exiting with code {EXIT_CODE_OOM} for wrapper to handle PLY resume")
+                    log_file.flush()
+                    tile_manager.finalize(gaussians)
+                    # Clear and close progress bar silently (don't print final state on OOM)
+                    progress_bar.clear()
+                    progress_bar.disable = True
+                    progress_bar.close()
+                    sys.exit(EXIT_CODE_OOM)
+                else:
+                    # For Category 1 and 2, we still need to exit but the wrapper will handle tile splitting
+                    utils.print_rank_0(f"[adaptive-tile] Category {oom_category if oom_category else 'unknown'} OOM: Exiting with code {EXIT_CODE_OOM} for wrapper to handle tile splitting")
+                    log_file.flush()
+                    tile_manager.finalize(gaussians)
+                    # Clear and close progress bar silently (don't print final state on OOM)
+                    progress_bar.clear()
+                    progress_bar.disable = True
+                    progress_bar.close()
+                    sys.exit(EXIT_CODE_OOM)
 
         # Re-raise if not OOM or not handled
         print(f"[exception] Rank {utils.GLOBAL_RANK} re-raising unhandled exception: {type(e).__name__}", flush=True)
@@ -2636,6 +3056,14 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
         )
     )
+    
+    # Cleanup robust OOM handler
+    if adaptive_tile_mode:
+        robust_handler = get_robust_oom_handler()
+        if robust_handler:
+            print(f"[robust-oom] Rank {utils.GLOBAL_RANK} cleaning up robust OOM handler", flush=True)
+            robust_handler.cleanup()
+    
     tile_manager.finalize(gaussians)
     progress_bar.close()
 
@@ -2794,8 +3222,4 @@ def training_report(
 
         torch.cuda.empty_cache()
 
-    # Stop OOM signal monitor thread
-    _monitor = get_oom_signal_monitor()
-    if _monitor is not None:
-        _monitor.stop()
-        set_oom_signal_monitor(None)
+    # OOM signal monitor thread removed - no cleanup needed
