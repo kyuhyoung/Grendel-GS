@@ -1,0 +1,10 @@
+# Docker build context 에서 제외 (빌드에는 Grendel-GS/submodules 만 필요)
+.git
+output/
+data/
+result/
+tmp/
+*.log
+*.ply
+*.pth
+__pycache__/
