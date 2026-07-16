@@ -1,7 +1,7 @@
 docker_name=ogs
 dir_cur=/workspace/${PWD##*/}
 #dir_data=/mnt/hdd_16tb/dataset_stereo
-dir_data=/media2/data/dataset_stereo
+dir_data=/media2/data/dataset_stereo/non-sat
 log_file="using_docker.log"
 
 ##########################################################################################
