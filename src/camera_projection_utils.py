@@ -108,26 +108,31 @@ def compute_projection_matrix_with_crop(
     crop_top = full_bottom + crop_v_max * full_height_at_z1
     
     # Build asymmetric projection matrix
-    # This follows OpenGL convention
+    # MUST use the same convention as 3DGS getProjectionMatrix (graphics_utils.py):
+    #   - crop_left/right/bottom/top are tangent values at z=1
+    #   - getProjectionMatrix uses l/r/b/t at z=znear, so P[0,0] = 2*znear/(r-l)
+    #     where r = tanHalfFovX * znear → P[0,0] = 1/tanHalfFovX
+    #   - With tangent values (at z=1), the equivalent is P[0,0] = 2/(cr-cl)
+    #   - z_sign = 1.0, P[3,2] = 1.0 (NOT -1.0 as in OpenGL)
     P = np.zeros((4, 4), dtype=np.float32)
-    
-    # Asymmetric frustum formulation
-    P[0, 0] = 2.0 * znear / (crop_right - crop_left)
+
+    # Asymmetric frustum (3DGS convention, tangent-space boundaries)
+    P[0, 0] = 2.0 / (crop_right - crop_left)
     P[0, 2] = (crop_right + crop_left) / (crop_right - crop_left)
-    
-    P[1, 1] = 2.0 * znear / (crop_top - crop_bottom)
+
+    P[1, 1] = 2.0 / (crop_top - crop_bottom)
     P[1, 2] = (crop_top + crop_bottom) / (crop_top - crop_bottom)
-    
-    P[2, 2] = -(zfar + znear) / (zfar - znear)
-    P[2, 3] = -2.0 * zfar * znear / (zfar - znear)
-    
-    P[3, 2] = -1.0
+
+    P[2, 2] = zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+
+    P[3, 2] = 1.0
     
     # Compute projection offsets for the rasterizer
     # These are 2 * P[0,2] and 2 * P[1,2]
     proj_offset_x = 2.0 * P[0, 2]
     proj_offset_y = 2.0 * P[1, 2]
-    
+
     return P, proj_offset_x, proj_offset_y
 
 
@@ -183,15 +188,17 @@ def adjust_camera_for_crop(
     )
     
     # Convert to torch and transpose (camera stores P.T)
-    camera.projection_matrix = torch.from_numpy(P).transpose(0, 1).cuda()
-    
+    new_proj = torch.from_numpy(P).transpose(0, 1).cuda()
+    camera.projection_matrix = new_proj
+
     # Recompute full projection transform
-    camera.full_proj_transform = (
+    new_fpt = (
         camera.world_view_transform.unsqueeze(0).bmm(
-            camera.projection_matrix.unsqueeze(0)
+            new_proj.unsqueeze(0)
         )
     ).squeeze(0)
-    
+    camera.full_proj_transform = new_fpt
+
     # Store crop info and offsets
     camera._crop_info = crop_info
     camera._proj_offset_x = proj_offset_x

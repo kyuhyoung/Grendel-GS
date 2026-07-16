@@ -416,21 +416,17 @@ class Scene:
         # Now load images only for visible/selected cameras
         self.train_cameras = cameraList_from_camInfos(train_cam_infos, args, crops=load_crops)
 
-        # CRITICAL: Apply off-center projection matrix for cropped cameras
-        # The image is cropped, but the projection matrix still assumes centered principal point.
-        # This causes gaussians to project to wrong pixel locations!
-        # apply_crop_to_camera updates the projection matrix to account for the principal point shift.
+        # Off-center projection is already applied by adjust_camera_for_crop() in loadCam().
+        # Do NOT call apply_crop_to_camera() here — it uses a different (buggy) convention
+        # and overwrites the correct projection matrix with wrong values.
         if visible_cam_crops and self.train_cameras:
-            utils.print_rank_0(f"[adaptive-tile] Applying off-center projection for {len(visible_cam_crops)} cropped cameras...")
             for idx, crop, debug in visible_cam_crops:
                 if idx < len(self.train_cameras):
                     camera = self.train_cameras[idx]
                     cam_info = train_cam_infos[idx]
-                    # Store original dimensions before crop (needed for projection matrix calculation)
                     camera._original_width = cam_info.width
                     camera._original_height = cam_info.height
-                    # Apply off-center projection matrix
-                    apply_crop_to_camera(camera, crop)
+                    camera._crop_region = crop
 
         # output the number of cameras in the training set and image size to the log file
         log_file.write(

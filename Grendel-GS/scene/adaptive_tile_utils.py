@@ -638,8 +638,7 @@ def compute_tile_crop_for_camera(tile_bbox: TileBBox,
                                   points_in_tile: np.ndarray = None,
                                   return_debug_info: bool = False,
                                   ndc_limit: float = 1.0,
-                                  camera_position: np.ndarray = None,
-                                  max_crop_size: int = 2048) -> Optional[CropRegion]:
+                                  camera_position: np.ndarray = None) -> Optional[CropRegion]:
     """
     Compute the crop region for a tile in a camera's view.
 
@@ -658,7 +657,6 @@ def compute_tile_crop_for_camera(tile_bbox: TileBBox,
         return_debug_info: If True, return (crop, debug_info) tuple
         ndc_limit: Maximum allowed NDC coordinate
         camera_position: (3,) camera position in world coordinates (required for inside check)
-        max_crop_size: Maximum crop width/height to prevent OOM (default 2048)
 
     Returns:
         CropRegion if tile is visible, None otherwise
@@ -720,59 +718,6 @@ def compute_tile_crop_for_camera(tile_bbox: TileBBox,
 
     # Clamp to image bounds
     clamped = crop.clamp(img_width, img_height)
-    
-    # Apply maximum crop size limit to prevent OOM
-    if max_crop_size and max_crop_size > 0:
-        crop_width = clamped.width
-        crop_height = clamped.height
-        
-        # If crop is too large, center a smaller crop within the projected region
-        if crop_width > max_crop_size or crop_height > max_crop_size:
-            print(f"[compute_tile_crop_for_camera] Limiting crop size from {crop_width}x{crop_height} to max {max_crop_size}")
-            # Calculate center of the crop
-            center_x = (clamped.x_min + clamped.x_max) // 2
-            center_y = (clamped.y_min + clamped.y_max) // 2
-            
-            # Determine new crop size (maintain aspect ratio if possible)
-            if crop_width > crop_height:
-                new_width = max_crop_size
-                new_height = min(max_crop_size, int(crop_height * max_crop_size / crop_width))
-            else:
-                new_height = max_crop_size
-                new_width = min(max_crop_size, int(crop_width * max_crop_size / crop_height))
-            
-            # Center the new crop
-            new_x_min = center_x - new_width // 2
-            new_x_max = new_x_min + new_width
-            new_y_min = center_y - new_height // 2
-            new_y_max = new_y_min + new_height
-            
-            # Ensure we stay within image bounds
-            if new_x_min < 0:
-                new_x_max -= new_x_min
-                new_x_min = 0
-            if new_y_min < 0:
-                new_y_max -= new_y_min
-                new_y_min = 0
-            if new_x_max > img_width:
-                new_x_min -= (new_x_max - img_width)
-                new_x_max = img_width
-            if new_y_max > img_height:
-                new_y_min -= (new_y_max - img_height)
-                new_y_max = img_height
-            
-            # Final clamp
-            new_x_min = max(0, new_x_min)
-            new_y_min = max(0, new_y_min)
-            new_x_max = min(img_width, new_x_max)
-            new_y_max = min(img_height, new_y_max)
-            
-            clamped = CropRegion(
-                x_min=int(new_x_min),
-                y_min=int(new_y_min),
-                x_max=int(new_x_max),
-                y_max=int(new_y_max)
-            )
     
     if return_debug_info:
         return clamped, debug_info
@@ -927,12 +872,12 @@ def compute_visible_caminfos(tile_bbox: TileBBox,
         )
 
         if return_debug_info:
+            # Remove arbitrary max_crop_size limit - let tile bbox naturally determine crop size
             crop, debug = compute_tile_crop_for_camera(
                 tile_bbox, full_proj, cam_info.width, cam_info.height, margin,
                 return_debug_info=True,
                 ndc_limit=ndc_limit,
-                camera_position=camera_position,
-                max_crop_size=3072  # Limit to prevent OOM
+                camera_position=camera_position
             )
             if crop is not None:
                 visible.append((idx, crop, debug))
@@ -945,11 +890,11 @@ def compute_visible_caminfos(tile_bbox: TileBBox,
                         all_cameras=cam_infos, fixed_image_bounds=fixed_image_bounds
                     )
         else:
+            # Remove arbitrary max_crop_size limit - let tile bbox naturally determine crop size
             crop = compute_tile_crop_for_camera(
                 tile_bbox, full_proj, cam_info.width, cam_info.height, margin,
                 ndc_limit=ndc_limit,
-                camera_position=camera_position,
-                max_crop_size=3072  # Limit to prevent OOM
+                camera_position=camera_position
             )
             if crop is not None:
                 visible.append((idx, crop))
@@ -967,7 +912,8 @@ def compute_visible_caminfos(tile_bbox: TileBBox,
 
 def compute_visible_cameras_and_crops(tile_bbox: TileBBox,
                                        cameras: List,
-                                       margin: int = 100) -> List[Tuple[int, CropRegion]]:
+                                       margin: int = 100,
+                                       tile_id: str = None) -> List[Tuple[int, CropRegion]]:
     """
     Compute which cameras can see the tile and their crop regions.
 
@@ -993,8 +939,7 @@ def compute_visible_cameras_and_crops(tile_bbox: TileBBox,
         img_height = cam.image_height if hasattr(cam, 'image_height') else cam.height
 
         crop = compute_tile_crop_for_camera(
-            tile_bbox, full_proj_transform, img_width, img_height, margin,
-            max_crop_size=3072  # Limit to prevent OOM
+            tile_bbox, full_proj_transform, img_width, img_height, margin
         )
 
         if crop is not None:
