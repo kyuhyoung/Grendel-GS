@@ -43,12 +43,13 @@ BSZ=1
 TILE_CROP_MARGIN=100
 SCENE_MARGIN=0.0
 NDC_LIMIT=1.0
-#EXPLOSIVE_DENSIFICATION=false
-EXPLOSIVE_DENSIFICATION=true
+EXPLOSIVE_DENSIFICATION=false
+#EXPLOSIVE_DENSIFICATION=true
 # Densification params (will be overridden if EXPLOSIVE_DENSIFICATION=true)
 DENSIFY_FROM_ITER=500
 DENSIFICATION_INTERVAL=100
 DENSIFY_GRAD_THRESHOLD=0.0002
+CHILD_DENSIFY_GRAD_THRESHOLD=""   # resume 자식 전용 threshold (빈 값 = 부모와 동일)
 
 # Debug image saving (for off-center projection verification)
 # Set to comma-separated iterations, e.g., "1,100,500,1000" or empty to use defaults
@@ -88,6 +89,7 @@ print_usage() {
     echo "  --ndc-limit N       NDC limit for projection filtering (default: 1.0)"
     echo "  --densify-grad-threshold N  Gradient threshold for densification (default: 0.0002, lower=faster growth)"
     echo "  --explosive-densification   Enable aggressive densification to trigger OOM from gaussian growth"
+    echo "  --child-densify-grad-threshold N  Densify threshold for resume children only (prevents re-explosion)"
     echo "  --debug-save-iters ITERS    Comma-separated iterations to save debug GT/rendered images (default: 1,100,500,1000)"
     echo "  --visual-debug              Enable visual debugging for projection and crop calculations"
     echo "  --visual-debug-only         Run only visual debugging and exit (no training)"
@@ -144,6 +146,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --densify-grad-threshold)
             DENSIFY_GRAD_THRESHOLD="$2"
+            shift 2
+            ;;
+        --child-densify-grad-threshold)
+            CHILD_DENSIFY_GRAD_THRESHOLD="$2"
             shift 2
             ;;
         --explosive-densification)
@@ -379,6 +385,9 @@ CMD+=" --ndc_limit ${NDC_LIMIT}"
 CMD+=" --densify_from_iter ${DENSIFY_FROM_ITER}"
 CMD+=" --densification_interval ${DENSIFICATION_INTERVAL}"
 CMD+=" --densify_grad_threshold ${DENSIFY_GRAD_THRESHOLD}"
+if [[ -n "${CHILD_DENSIFY_GRAD_THRESHOLD}" ]]; then
+    CMD+=" --child_densify_grad_threshold ${CHILD_DENSIFY_GRAD_THRESHOLD}"
+fi
 
 # Add visual debug flag if enabled
 if [[ "$VISUAL_DEBUG" == "true" ]]; then

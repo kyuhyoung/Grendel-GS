@@ -1535,7 +1535,11 @@ class AdaptiveTileTrainer:
             "--ndc_limit", str(self.args.ndc_limit),
             "--densify_from_iter", str(effective_densify_from),
             "--densification_interval", str(self.args.densification_interval),
-            "--densify_grad_threshold", str(self.args.densify_grad_threshold),
+            "--densify_grad_threshold", str(
+                self.args.child_densify_grad_threshold
+                if (tile.ply_path and self.args.child_densify_grad_threshold is not None)
+                else self.args.densify_grad_threshold
+            ),
             "--test_iterations", "999999999",  # Disable testing during adaptive training
         ]
 
@@ -1553,6 +1557,9 @@ class AdaptiveTileTrainer:
         if tile.ply_path:
             print(f"  *** RESUME MODE: Using pre-trained gaussians ***")
             print(f"  Pre-trained PLY: {tile.ply_path}")
+            if self.args.child_densify_grad_threshold is not None:
+                print(f"  Child densify threshold: {self.args.child_densify_grad_threshold} "
+                      f"(parent: {self.args.densify_grad_threshold})")
         else:
             print(f"  Starting from scratch (SfM points)")
 
@@ -2352,6 +2359,10 @@ def parse_args():
                         help="Start densification from this iteration (default: 500)")
     parser.add_argument("--densification_interval", type=int, default=100,
                         help="Densification interval (default: 100)")
+    parser.add_argument("--child_densify_grad_threshold", type=float, default=None,
+                        help="Resume 자식 타일 전용 densify threshold. "
+                             "explosive 부모에서 물려받은 자식이 재폭증해 완주 못 하는 것을 방지 "
+                             "(default: None = 부모와 동일)")
     parser.add_argument("--densify_grad_threshold", type=float, default=0.0002,
                         help="Gradient threshold for densification (default: 0.0002, lower=faster growth)")
     parser.add_argument("--visual_debug", action="store_true",
