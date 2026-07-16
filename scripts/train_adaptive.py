@@ -173,6 +173,113 @@ def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str, strict: b
     return total_count
 
 
+def merge_final_scene(output_path, filter_mode: str = "bbox"):
+    """완료 타일들의 최종 point_cloud.ply 를 하나의 scene PLY 로 머지.
+
+    adaptive_state.json 의 타일 bbox/status 를 기준으로 함 (학습 재실행 불필요).
+    filter_mode="bbox": 각 타일에서 자기 bbox 내부(half-open)의 가우시안만 유지해
+      타일 경계의 중복을 제거. 단, 어떤 완료 타일 bbox 에도 속하지 않는 가우시안
+      (타일 밖으로 드리프트한 배경 등)은 유지.
+    filter_mode="none": 필터 없이 단순 concat.
+
+    Returns: 머지된 PLY 경로 (Path) 또는 실패 시 None
+    """
+    try:
+        from plyfile import PlyData, PlyElement
+    except ImportError:
+        print("[merge_scene] ERROR: plyfile not installed, cannot merge", flush=True)
+        return None
+
+    output_path = Path(output_path)
+    state_file = output_path / "adaptive_state.json"
+    if not state_file.exists():
+        print(f"[merge_scene] state file not found: {state_file}", flush=True)
+        return None
+    with open(state_file) as f:
+        state = json.load(f)
+
+    completed = {
+        tid: info for tid, info in state.get("tiles", {}).items()
+        if info.get("status") == "completed"
+    }
+    if not completed:
+        print("[merge_scene] no completed tiles — nothing to merge", flush=True)
+        return None
+
+    def find_final_ply(tile_id: str):
+        model_dir = output_path / "models" / tile_id / "point_cloud"
+        if not model_dir.exists():
+            return None
+        iter_folders = sorted(model_dir.glob("iteration_*"),
+                              key=lambda x: int(x.name.split("_")[1]))
+        if not iter_folders:
+            return None
+        folder = iter_folders[-1]
+        exact = folder / "point_cloud.ply"
+        if exact.exists():
+            return exact
+        candidates = sorted(folder.glob("point_cloud*.ply"))
+        return candidates[0] if len(candidates) == 1 else None
+
+    bboxes = {tid: BBox.from_string(info["bbox"]) for tid, info in completed.items()}
+
+    def in_bbox(xyz, b):
+        return ((xyz[:, 0] >= b.x_min) & (xyz[:, 0] < b.x_max)
+                & (xyz[:, 1] >= b.y_min) & (xyz[:, 1] < b.y_max)
+                & (xyz[:, 2] >= b.z_min) & (xyz[:, 2] < b.z_max))
+
+    merged_chunks = []
+    manifest = {}
+    skipped = []
+    for tid in sorted(completed.keys()):
+        src = find_final_ply(tid)
+        if src is None:
+            print(f"[merge_scene] WARNING: no final PLY for {tid} — skipped", flush=True)
+            skipped.append(tid)
+            manifest[tid] = {"source": None}
+            continue
+        vertices = PlyData.read(str(src))["vertex"].data
+        total = len(vertices)
+        if filter_mode == "bbox" and total > 0:
+            xyz = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=1)
+            own = in_bbox(xyz, bboxes[tid])
+            inside_any = np.zeros(total, dtype=bool)
+            for b in bboxes.values():
+                inside_any |= in_bbox(xyz, b)
+            keep = own | ~inside_any
+        else:
+            keep = np.ones(total, dtype=bool)
+        kept = int(keep.sum())
+        merged_chunks.append(vertices[keep])
+        manifest[tid] = {"source": str(src), "total": total,
+                         "kept": kept, "dropped": total - kept}
+        print(f"[merge_scene] {tid}: kept {kept:,}/{total:,} from {src.name}", flush=True)
+
+    if not merged_chunks:
+        print("[merge_scene] ERROR: no tile PLYs found to merge", flush=True)
+        return None
+
+    merged = np.concatenate(merged_chunks)
+    out_dir = output_path / "merged"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_ply = out_dir / "scene_point_cloud.ply"
+    PlyData([PlyElement.describe(merged, "vertex")]).write(str(out_ply))
+    with open(out_dir / "merge_manifest.json", "w") as f:
+        json.dump({
+            "filter_mode": filter_mode,
+            "num_tiles_merged": len(merged_chunks),
+            "num_tiles_skipped": len(skipped),
+            "skipped_tiles": skipped,
+            "total_gaussians": int(len(merged)),
+            "tiles": manifest,
+        }, f, indent=2)
+    print(f"[merge_scene] merged {len(merged):,} gaussians from "
+          f"{len(merged_chunks)} tiles -> {out_ply}", flush=True)
+    if skipped:
+        print(f"[merge_scene] WARNING: {len(skipped)} completed tiles had no PLY: {skipped}", flush=True)
+    return out_ply
+
+
 @dataclass
 class BBox:
     """3D bounding box."""
@@ -2144,21 +2251,31 @@ class AdaptiveTileTrainer:
         except Exception as e:
             print(f"[Final split tree ERROR] {e}")
 
+        # 완료 타일들의 최종 PLY 를 하나의 scene 으로 머지
+        try:
+            merge_final_scene(self.output_path)
+        except Exception as e:
+            print(f"[merge_scene ERROR] {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
         # Count successful vs failed/split tiles
+        # split 타일은 자식으로 대체된 내부 노드이므로 완료 판정은 리프 기준
         success_count = sum(1 for tile in self.tiles.values() if tile.status == "completed")
-        failed_count = sum(1 for tile in self.tiles.values() if tile.status == "failed") 
+        failed_count = sum(1 for tile in self.tiles.values() if tile.status == "failed")
         split_count = sum(1 for tile in self.tiles.values() if tile.status == "split")
+        leaf_count = len(self.tiles) - split_count
 
         print("\n" + "=" * 60)
-        if success_count == len(self.tiles):
+        if success_count == leaf_count and failed_count == 0:
             print("🎉 Adaptive Tile Training - ALL TILES COMPLETED! 🎉")
         else:
             print("⚠️  Adaptive Tile Training - PARTIAL COMPLETION ⚠️")
-        print(f"  Successfully completed tiles: {success_count}")
+        print(f"  Successfully completed tiles: {success_count} / {leaf_count} (leaf)")
         print(f"  Failed tiles: {failed_count}")
-        print(f"  Split tiles (OOM): {split_count}")
+        print(f"  Split tiles (OOM, replaced by children): {split_count}")
         print(f"  Total tiles: {len(self.tiles)}")
-        if success_count < len(self.tiles):
+        if success_count < leaf_count or failed_count > 0:
             print("  ⚠️  Some tiles did not complete successfully - check logs for errors")
         print("=" * 60)
 
