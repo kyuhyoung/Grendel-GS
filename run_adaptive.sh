@@ -60,6 +60,7 @@ VISUAL_DEBUG_ONLY=false
 VISUAL_DEBUG_LEVEL=""  # Empty means level 0 (default)
 RENDER_DEBUG=false
 RENDER_DEBUG_MIN_POINTS=30
+RESUME_VIZ_STOP=false    # true: resume viz 만 저장하고 자식 타일 학습 없이 종료 (검증 모드)
 
 # OOM timeout settings (seconds)
 OOM_ACK_TIMEOUT=60       # Timeout for rank ACK during OOM signaling (1 minute - faster detection)
@@ -95,6 +96,7 @@ print_usage() {
     echo "  --nccl-timeout N            NCCL timeout for distributed operations in seconds (default: 1200)"
     echo "  --ply-wait-timeout N        Timeout for waiting PLY files to be saved in seconds (default: 3600)"
     echo "  --render-debug             Enable render debug dumps/PNGs for low-point cases"
+    echo "  --resume-viz-stop           Save resume viz and exit child before training (verification mode)"
     echo ""
 }
 
@@ -179,6 +181,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --render-debug)
             RENDER_DEBUG=true
+            shift
+            ;;
+        --resume-viz-stop)
+            RESUME_VIZ_STOP=true
             shift
             ;;
         --help|-h)
@@ -315,6 +321,12 @@ else
     unset RENDER_DEBUG_DUMP
     unset RENDER_DEBUG_PNG
     unset RENDER_DEBUG_MIN_POINTS
+fi
+if [[ "${RESUME_VIZ_STOP}" == true ]]; then
+    export RESUME_VIZ_STOP=1
+    echo "  Resume viz stop: ON (children exit after resume viz, no training)"
+else
+    unset RESUME_VIZ_STOP
 fi
 # Render debug: dump small-point projections and PNGs for loss-zero analysis
 

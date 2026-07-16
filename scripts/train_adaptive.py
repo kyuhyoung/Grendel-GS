@@ -1293,8 +1293,17 @@ class AdaptiveTileTrainer:
         source_ply = latest_iter_folder / "point_cloud.ply"
 
         if not source_ply.exists():
-            print(f"  [Warning] Source PLY not found: {source_ply}")
-            return
+            # 비분산/distributed_save 모드는 point_cloud_rk*_ws*.ply 로 저장됨
+            candidates = sorted(latest_iter_folder.glob("point_cloud*.ply"))
+            if len(candidates) == 1:
+                source_ply = candidates[0]
+            elif len(candidates) > 1:
+                print(f"  [Warning] Multiple PLY shards in {latest_iter_folder} "
+                      f"({[c.name for c in candidates]}) — merge required, skipping copy")
+                return
+            else:
+                print(f"  [Warning] Source PLY not found: {source_ply}")
+                return
 
         # Count gaussians (by reading first line of PLY or checking file size)
         try:

@@ -3049,6 +3049,17 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         raise
 
     # Finish training
+    if args.adaptive_tile_enabled:
+        # 완료 타일 최종 저장. scene.save() 는 rank 0 으로의 collective gather 를
+        # 포함하므로 모든 rank 가 함께 호출해야 함 (rank guard 금지)
+        utils.print_rank_0(
+            f"[adaptive-tile] Training complete — saving final gaussians at iteration {opt_args.iterations}"
+        )
+        torch.cuda.empty_cache()
+        scene.save(opt_args.iterations)
+        log_file.write(
+            f"[ITER {opt_args.iterations}] Saving final Gaussians (adaptive mode)\n"
+        )
     if opt_args.iterations not in args.save_iterations:
         end2end_timers.print_time(log_file, opt_args.iterations)
     log_file.write(

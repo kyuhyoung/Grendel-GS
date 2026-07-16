@@ -591,13 +591,14 @@ class Scene:
                         out_dir=_viz_dir,
                         pretrained_ply_path=args.pretrained_ply,
                     )
-                    # 검증 모드: resume_viz png 만들고 자식 프로세스 즉시 종료 (학습 시작 안 함)
-                    print("\n" + "=" * 60, flush=True)
-                    print(f"[resume_viz] STOP: tile={_tile_id} rank={_rank}", flush=True)
-                    print(f"  -> {_resume_path}", flush=True)
-                    print("=" * 60, flush=True)
-                    import sys as _sys
-                    _sys.exit(0)
+                    print(f"[resume_viz] saved: {_resume_path} (tile={_tile_id} rank={_rank})", flush=True)
+                    # RESUME_VIZ_STOP=1 검증 모드에서만 학습 없이 조기 종료
+                    if os.environ.get("RESUME_VIZ_STOP", "0") == "1":
+                        print("\n" + "=" * 60, flush=True)
+                        print(f"[resume_viz] STOP: tile={_tile_id} rank={_rank}", flush=True)
+                        print("=" * 60, flush=True)
+                        import sys as _sys
+                        _sys.exit(0)
             except SystemExit:
                 raise
             except Exception as _viz_e:
