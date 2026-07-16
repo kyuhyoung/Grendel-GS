@@ -52,7 +52,7 @@ DENSIFY_GRAD_THRESHOLD=0.0002
 
 # Debug image saving (for off-center projection verification)
 # Set to comma-separated iterations, e.g., "1,100,500,1000" or empty to use defaults
-DEBUG_SAVE_ITERS="1"
+DEBUG_SAVE_ITERS="1,500,2000,5000,8000"
 
 # Visual debugging for projection and crop
 VISUAL_DEBUG=false

@@ -229,6 +229,7 @@ def merge_final_scene(output_path, filter_mode: str = "bbox"):
                 & (xyz[:, 2] >= b.z_min) & (xyz[:, 2] < b.z_max))
 
     merged_chunks = []
+    merged_tids = []
     manifest = {}
     skipped = []
     for tid in sorted(completed.keys()):
@@ -251,6 +252,7 @@ def merge_final_scene(output_path, filter_mode: str = "bbox"):
             keep = np.ones(total, dtype=bool)
         kept = int(keep.sum())
         merged_chunks.append(vertices[keep])
+        merged_tids.append(tid)
         manifest[tid] = {"source": str(src), "total": total,
                          "kept": kept, "dropped": total - kept}
         print(f"[merge_scene] {tid}: kept {kept:,}/{total:,} from {src.name}", flush=True)
@@ -277,6 +279,48 @@ def merge_final_scene(output_path, filter_mode: str = "bbox"):
           f"{len(merged_chunks)} tiles -> {out_ply}", flush=True)
     if skipped:
         print(f"[merge_scene] WARNING: {len(skipped)} completed tiles had no PLY: {skipped}", flush=True)
+
+    # Top-down 병합 분포 시각화 (타일별 색 + 미완료 리프 = 구멍 표시). 실패해도 머지는 유효.
+    try:
+        from matplotlib.patches import Rectangle
+        fig, ax = plt.subplots(figsize=(14, 14))
+        cmap = plt.get_cmap("tab20")
+        rng = np.random.default_rng(0)
+        for i, (tid, verts) in enumerate(zip(merged_tids, merged_chunks)):
+            n = len(verts)
+            if n == 0:
+                continue
+            idx = rng.choice(n, size=min(n, 40000), replace=False)
+            color = cmap(i % 20)
+            ax.scatter(np.asarray(verts["x"])[idx], np.asarray(verts["y"])[idx],
+                       s=0.3, color=color, alpha=0.5, linewidths=0, rasterized=True)
+            b = bboxes[tid]
+            ax.add_patch(Rectangle((b.x_min, b.y_min), b.x_max - b.x_min, b.y_max - b.y_min,
+                                   fill=False, edgecolor=color, linewidth=1.2))
+            ax.text((b.x_min + b.x_max) / 2, (b.y_min + b.y_max) / 2,
+                    f"{tid}\n{manifest[tid]['kept']:,}",
+                    ha="center", va="center", fontsize=7)
+        for tid, info in state.get("tiles", {}).items():
+            if info.get("status") in ("skipped", "failed"):
+                b = BBox.from_string(info["bbox"])
+                ax.add_patch(Rectangle((b.x_min, b.y_min), b.x_max - b.x_min, b.y_max - b.y_min,
+                                       fill=False, edgecolor="red", linestyle="--", linewidth=1.5))
+                ax.text((b.x_min + b.x_max) / 2, (b.y_min + b.y_max) / 2,
+                        f"{tid}\n({info['status']})",
+                        ha="center", va="center", fontsize=7, color="red")
+        ax.set_aspect("equal")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_title(f"Merged scene top-down | tiles={len(merged_chunks)} "
+                     f"gaussians={len(merged):,} filter={filter_mode} "
+                     f"(red dashed = skipped/failed hole)")
+        png_path = out_dir / "scene_merged_topdown.png"
+        fig.savefig(png_path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[merge_scene] top-down viz -> {png_path}", flush=True)
+    except Exception as viz_e:
+        print(f"[merge_scene] WARNING: top-down viz failed: {viz_e}", flush=True)
+
     return out_ply
 
 
