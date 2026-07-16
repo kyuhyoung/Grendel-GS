@@ -37,20 +37,22 @@ OUTPUT_PATH="./output/adaptive_test"
 # Auto-detect number of available GPUs
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 GPU_IDS="0,1"  # Container maps physical GPUs to 0,1
-ITERATIONS=1000
-ITERATIONS_USER_SET=false
+ITERATIONS=2000
 BACKEND="default"
 BSZ=1
 TILE_CROP_MARGIN=100
 SCENE_MARGIN=0.0
 NDC_LIMIT=1.0
-EXPLOSIVE_DENSIFICATION=false
-#EXPLOSIVE_DENSIFICATION=true
+# 현재 실험 세팅: cat3 조기 유발(explosive) + 상속 자식은 정상 threshold 로 완주
+# → 저장/머지/resume/완주/최종머지 풀 사이클 검증. 평상시 스모크로 돌리려면
+#   EXPLOSIVE_DENSIFICATION=false, CHILD_DENSIFY_GRAD_THRESHOLD="" 로 되돌릴 것
+EXPLOSIVE_DENSIFICATION=true
+#EXPLOSIVE_DENSIFICATION=false
 # Densification params (will be overridden if EXPLOSIVE_DENSIFICATION=true)
 DENSIFY_FROM_ITER=500
 DENSIFICATION_INTERVAL=100
 DENSIFY_GRAD_THRESHOLD=0.0002
-CHILD_DENSIFY_GRAD_THRESHOLD=""   # resume 자식 전용 threshold (빈 값 = 부모와 동일)
+CHILD_DENSIFY_GRAD_THRESHOLD="0.0002"   # resume 자식 전용 threshold (빈 값 = 부모와 동일)
 
 # Debug image saving (for off-center projection verification)
 # Set to comma-separated iterations, e.g., "1,100,500,1000" or empty to use defaults
@@ -123,7 +125,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --iterations)
             ITERATIONS="$2"
-            ITERATIONS_USER_SET=true
             shift 2
             ;;
         --backend)
@@ -228,11 +229,8 @@ if [[ "$EXPLOSIVE_DENSIFICATION" == true ]]; then
     DENSIFY_FROM_ITER=100
     DENSIFICATION_INTERVAL=50
     DENSIFY_GRAD_THRESHOLD=0.00001  # 적당히 낮은 threshold (0.000001 -> 0.00001)
-    # 사용자가 --iterations 를 명시했으면 존중
-    if [[ "${ITERATIONS_USER_SET}" != true ]]; then
-        ITERATIONS=8000
-    fi
-    echo "  Iterations set to: ${ITERATIONS}"
+    # iterations 는 explosive 여부와 무관하게 ITERATIONS 변수/--iterations 가 결정
+    echo "  Iterations: ${ITERATIONS}"
 fi
 
 # ============================================
