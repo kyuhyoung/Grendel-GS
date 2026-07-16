@@ -140,6 +140,16 @@ def replicated_preprocess3dgs(
     # Get off-center projection offsets (for cropped images with shifted principal point)
     proj_offset_x, proj_offset_y = get_proj_offsets(viewpoint_camera)
 
+    # DEBUG: verify projection matrix reaches rasterizer
+    if abs(proj_offset_x) > 0.01 or abs(proj_offset_y) > 0.01:
+        _fpt = viewpoint_camera.full_proj_transform
+        _pm = viewpoint_camera.projection_matrix
+        cam_name = getattr(viewpoint_camera, 'image_name', '?')
+        print(f"[raster-proj-DEBUG] cam={cam_name} img=({viewpoint_camera.image_width},{viewpoint_camera.image_height}) "
+              f"proj_mat[0,0]={_pm[0,0].item():.6f} proj_mat[2,0]={_pm[2,0].item():.6f} "
+              f"fpt[0,0]={_fpt[0,0].item():.6f} fpt[3,2]={_fpt[3,2].item():.6f} "
+              f"offset=({proj_offset_x:.4f},{proj_offset_y:.4f})", flush=True)
+
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -1038,6 +1048,7 @@ def distributed_preprocess3dgs_and_all2all_final(
         # Get off-center projection offsets (for cropped images with shifted principal point)
         proj_offset_x, proj_offset_y = get_proj_offsets(viewpoint_camera)
 
+
         raster_settings = GaussianRasterizationSettings(
             image_height=int(viewpoint_camera.image_height),
             image_width=int(viewpoint_camera.image_width),
@@ -1094,6 +1105,7 @@ def distributed_preprocess3dgs_and_all2all_final(
 
     if utils.DEFAULT_GROUP.size() == 1:
         batched_screenspace_pkg = {
+            "batched_cameras": batched_viewpoint_cameras,
             "batched_locally_preprocessed_mean2D": batched_means2D,
             "batched_locally_preprocessed_visibility_filter": [
                 radii > 0 for radii in batched_radii
@@ -1151,6 +1163,7 @@ def distributed_preprocess3dgs_and_all2all_final(
         timers.stop("forward_all_to_all_communication")
 
     batched_screenspace_pkg = {
+        "batched_cameras": batched_viewpoint_cameras,
         "batched_locally_preprocessed_mean2D": batched_means2D,
         "batched_locally_preprocessed_visibility_filter": [
             radii > 0 for radii in batched_radii
@@ -1288,6 +1301,7 @@ def gsplat_distributed_preprocess3dgs_and_all2all_final(
 
     if utils.DEFAULT_GROUP.size() == 1:
         batched_screenspace_pkg = {
+            "batched_cameras": batched_viewpoint_cameras,
             "image_height": image_height,
             "image_width": image_width,
             "backgrounds": bg_color,  # default: None
@@ -1337,6 +1351,7 @@ def gsplat_distributed_preprocess3dgs_and_all2all_final(
         timers.stop("forward_all_to_all_communication")
 
     batched_screenspace_pkg = {
+        "batched_cameras": batched_viewpoint_cameras,
         "image_height": image_height,
         "image_width": image_width,
         "backgrounds": bg_color,  # default: None
@@ -1359,6 +1374,7 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
     """
     Render the scene.
     """
+    import os
     timers = utils.get_timers()
 
     batched_rendered_image = []
@@ -1407,8 +1423,110 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
         # if utils.GLOBAL_RANK == 0:
         #     print(f"[DEBUG] render_final: calling render_gaussians. Points: {means2D_redistributed.shape[0]}", flush=True)
             
-        if means2D_redistributed.shape[0] < 10:
+        # Render-scalar / debug path for very few local points
+        try:
+            min_pts_png = int(os.environ.get("RENDER_DEBUG_MIN_POINTS", "30"))
+        except Exception:
+            min_pts_png = 30
+        if means2D_redistributed.shape[0] < min_pts_png:
             # That means we do not have enough gaussians locally for rendering, that mainly happens because of insufficient initial points.
+            cur_iter = utils.get_cur_iter()
+            cam_name = getattr(batched_screenspace_pkg["batched_cameras"][cam_id], "image_name", "unknown")
+            cam_w = getattr(batched_screenspace_pkg["batched_cameras"][cam_id], "image_width", None)
+            cam_h = getattr(batched_screenspace_pkg["batched_cameras"][cam_id], "image_height", None)
+            n_pts = int(means2D_redistributed.shape[0])
+            pts_min = pts_max = None
+            pts = None
+            if n_pts > 0:
+                pts = means2D_redistributed.detach().cpu().numpy()
+                cam_obj = batched_screenspace_pkg["batched_cameras"][cam_id]
+                crop = getattr(cam_obj, "_crop_region", None)
+                if crop is not None:
+                    # Map original-image coords -> cropped-image coords
+                    pts = pts.copy()
+                    pts[:, 0] -= float(crop.x_min)
+                    pts[:, 1] -= float(crop.y_min)
+                pts_min = [float(pts[:, 0].min()), float(pts[:, 1].min())]
+                pts_max = [float(pts[:, 0].max()), float(pts[:, 1].max())]
+            print(
+                f"[render-scalar] iter={cur_iter} rank={utils.GLOBAL_RANK} cam={cam_name} "
+                f"n_pts={n_pts} img=({cam_w},{cam_h}) pts_min={pts_min} pts_max={pts_max}",
+                flush=True,
+            )
+            if os.environ.get("RENDER_DEBUG_DUMP", "0") == "1":
+                from pathlib import Path
+                import json, time
+                args = utils.get_args()
+                tile_id = getattr(args, "tile_id", "unknown")
+                base_dir = Path(getattr(args, "tile_output_dir", "output/ply")).parent
+                dump_dir = base_dir / "visualizations" / "render_debug_json"
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                dump = {
+                    "ts": time.time(),
+                    "iter": cur_iter,
+                    "rank": int(utils.GLOBAL_RANK),
+                    "tile_id": tile_id,
+                    "cam_name": cam_name,
+                    "n_pts": n_pts,
+                    "img_w": cam_w,
+                    "img_h": cam_h,
+                    "pts_min": pts_min,
+                    "pts_max": pts_max,
+                    "pts": pts.tolist() if n_pts > 0 else [],
+                }
+                dump_path = dump_dir / f"scalar_iter{cur_iter}_tile{tile_id}_cam{cam_name}_rk{utils.GLOBAL_RANK}.json"
+                with open(dump_path, "w") as f:
+                    json.dump(dump, f)
+            # Optional PNG visualization when points are very few
+                if os.environ.get("RENDER_DEBUG_PNG", "0") == "1" and n_pts < min_pts_png:
+                    if cam_w is None or cam_h is None:
+                        raise RuntimeError(
+                            f"[render-scalar] Missing camera size for PNG save: cam={cam_name} "
+                            f"tile={getattr(utils.get_args(), 'tile_id', 'unknown')} rank={utils.GLOBAL_RANK} "
+                            f"cam_w={cam_w} cam_h={cam_h}"
+                        )
+                from pathlib import Path
+                from PIL import Image, ImageDraw
+                args = utils.get_args()
+                tile_id = getattr(args, "tile_id", "unknown")
+                base_dir = Path(getattr(args, "tile_output_dir", "output/ply")).parent
+                vis_dir = base_dir / "visualizations" / "render_debug_png"
+                vis_dir.mkdir(parents=True, exist_ok=True)
+                # Use original image size (no downscaling)
+                scale = 1.0
+                canvas = Image.new("RGB", (int(cam_w), int(cam_h)), (255, 255, 255))
+                draw = ImageDraw.Draw(canvas)
+                if n_pts > 0:
+                    if pts is None:
+                        pts = means2D_redistributed.detach().cpu().numpy()
+                        cam_obj = batched_screenspace_pkg["batched_cameras"][cam_id]
+                        crop = getattr(cam_obj, "_crop_region", None)
+                        if crop is not None:
+                            pts = pts.copy()
+                            pts[:, 0] -= float(crop.x_min)
+                            pts[:, 1] -= float(crop.y_min)
+                    for x, y in pts:
+                        px = int(x * scale)
+                        py = int(y * scale)
+                        r = 2
+                        draw.ellipse((px - r, py - r, px + r, py + r), fill=(255, 0, 0))
+                fname = f"scalar_iter{cur_iter}_tile{tile_id}_cam{cam_name}_rk{utils.GLOBAL_RANK}.png"
+                out_path = vis_dir / fname
+                try:
+                    canvas.save(str(out_path))
+                except Exception as e:
+                    raise RuntimeError(f"[render-scalar] PNG save failed: {out_path}") from e
+                if os.environ.get("RENDER_DEBUG_ABORT", "0") == "1":
+                    # Write a flag so the wrapper can stop the entire adaptive run.
+                    try:
+                        flag = vis_dir / "render_debug_abort.flag"
+                        with open(flag, "w") as f:
+                            f.write(f"{cur_iter},{tile_id},{cam_name},{utils.GLOBAL_RANK}\n")
+                    except Exception:
+                        pass
+                    print(f"[render-scalar] Abort after PNG save (iter={cur_iter}, cam={cam_name}, n_pts={n_pts})", flush=True)
+                    import os as _os
+                    _os._exit(1)
             rendered_image = (
                 means2D_redistributed.sum()
                 + conic_opacity_redistributed.sum()

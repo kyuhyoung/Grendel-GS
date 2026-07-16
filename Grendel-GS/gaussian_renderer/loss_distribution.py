@@ -2638,6 +2638,7 @@ def batched_loss_computation(
         )
     ):
         # DEBUG: Print why Loss=0.2 occurs
+        import os
         cur_iter = utils.get_cur_iter()
         if utils.LOCAL_RANK == 0 and cur_iter is not None and cur_iter % 100 == 0:
             img_info = f"None" if image is None else (f"scalar" if len(image.shape) == 0 else f"shape={image.shape}")
@@ -2651,8 +2652,81 @@ def batched_loss_computation(
         elif len(image.shape) == 0:  # This image is not rendered locally.
             loss = image * 0
             batched_losses.append([loss, 0.0])
-            if utils.LOCAL_RANK == 0:
-                print(f"[loss-zero] iter={cur_iter} cam={camera.image_name}: image is scalar - Loss will be 0.2!", flush=True)
+            print(f"[loss-zero] iter={cur_iter} rank={utils.LOCAL_RANK} cam={camera.image_name}: image is scalar - Loss will be 0.2!", flush=True)
+            # Optional: dump PNG and abort for debug
+            # Do not swallow exceptions here; we need to know if PNG save failed.
+            saved_png = False
+            if os.environ.get("RENDER_DEBUG_PNG", "0") == "1":
+                from pathlib import Path
+                from PIL import Image, ImageDraw
+                import json, time
+                args = utils.get_args()
+                tile_id = getattr(args, "tile_id", "unknown")
+                cam_w = getattr(camera, "image_width", None)
+                cam_h = getattr(camera, "image_height", None)
+                base_dir = Path(getattr(args, "tile_output_dir", "output/ply")).parent
+                vis_dir = base_dir / "visualizations" / "render_debug_png"
+                vis_dir.mkdir(parents=True, exist_ok=True)
+                if cam_w is None or cam_h is None:
+                    raise RuntimeError(
+                        f"[loss-zero] Missing camera size for PNG save: cam={camera.image_name} "
+                        f"tile={tile_id} rank={utils.GLOBAL_RANK} cam_w={cam_w} cam_h={cam_h}"
+                    )
+                canvas = Image.new("RGB", (int(cam_w), int(cam_h)), (240, 240, 240))
+                draw = ImageDraw.Draw(canvas)
+                # Mark center and draw a big X so it is clearly visible.
+                cx = int(cam_w // 2)
+                cy = int(cam_h // 2)
+                r = max(6, int(min(cam_w, cam_h) * 0.01))
+                draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(0, 0, 255))
+                draw.line((0, 0, int(cam_w) - 1, int(cam_h) - 1), fill=(255, 0, 0), width=3)
+                draw.line((0, int(cam_h) - 1, int(cam_w) - 1, 0), fill=(255, 0, 0), width=3)
+                # Overlay minimal text
+                text = f"LOSS-ZERO\\niter={cur_iter} rank={utils.GLOBAL_RANK}\\ntile={tile_id}\\ncam={camera.image_name}"
+                draw.text((10, 10), text, fill=(0, 0, 0))
+                fname = f"losszero_iter{cur_iter}_tile{tile_id}_cam{camera.image_name}_rk{utils.GLOBAL_RANK}.png"
+                out_path = vis_dir / fname
+                try:
+                    canvas.save(str(out_path))
+                except Exception as e:
+                    raise RuntimeError(f"[loss-zero] PNG save failed: {out_path}") from e
+                # fsync to reduce loss on sudden exit
+                try:
+                    with open(out_path, "rb") as f:
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass
+                print(f"[loss-zero] Saved debug PNG: {fname}", flush=True)
+                saved_png = True
+                # Also dump JSON metadata (best-effort)
+                meta = {
+                    "ts": time.time(),
+                    "iter": cur_iter,
+                    "rank": int(utils.GLOBAL_RANK),
+                    "tile_id": tile_id,
+                    "cam": camera.image_name,
+                    "img_w": int(cam_w),
+                    "img_h": int(cam_h),
+                    "note": "loss-zero scalar image; no rendered pixels",
+                }
+                meta_path = vis_dir / f"losszero_iter{cur_iter}_tile{tile_id}_cam{camera.image_name}_rk{utils.GLOBAL_RANK}.json"
+                try:
+                    with open(meta_path, "w") as f:
+                        json.dump(meta, f)
+                except Exception as e:
+                    print(f"[loss-zero] WARNING: failed to write metadata: {meta_path} ({e})", flush=True)
+            if saved_png:
+                # Write a flag file so the wrapper can stop only when PNG was actually saved
+                try:
+                    flag = vis_dir / "render_debug_abort.flag"
+                    with open(flag, "w") as f:
+                        f.write(f"{cur_iter},{tile_id},{camera.image_name},{utils.GLOBAL_RANK}\n")
+                except Exception:
+                    pass
+            if saved_png and os.environ.get("RENDER_DEBUG_ABORT", "0") == "1":
+                print(f"[loss-zero] Abort after scalar image (iter={cur_iter}, cam={camera.image_name})", flush=True)
+                import os as _os
+                _os._exit(1)
         else:
             Ll1, ssim_loss = final_system_loss_computation(
                 image, camera, compute_locally, strategy, statistic_collector
