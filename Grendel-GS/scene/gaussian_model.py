@@ -688,7 +688,9 @@ class GaussianModel:
             print(f"[save_ply DEBUG] rank {group.rank()} converting xyz", flush=True)
             step_t0 = time.monotonic()
             try:
-                import torch
+                # 주의: 여기서 import torch 를 하면 torch 가 save_ply 의 지역변수가 되어
+                # 중첩 함수 gather_uneven_tensors 가 NameError(free variable) 로 죽는다.
+                # 모듈 상단의 torch 를 그대로 사용할 것.
                 print(f"[save_ply DEBUG] rank {group.rank()} xyz meta: shape={tuple(_xyz.shape)}, dtype={_xyz.dtype}, device={_xyz.device}, contiguous={_xyz.is_contiguous()}", flush=True)
                 # Only sync CUDA if tensors are on GPU; skip for CPU snapshots
                 # to avoid blocking on pending NCCL ops during OOM recovery
