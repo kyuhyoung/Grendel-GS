@@ -372,9 +372,6 @@ def save_projection_debug_visualization(tile_bbox: TileBBox,
     ax.set_title(f"3D Scene View - Camera {'INSIDE' if camera_inside_tile else 'OUTSIDE'} Tile", 
                 fontsize=14, fontweight='bold', color=title_color)
     
-    # Draw 3D bounding box using all 8 corners
-    corners_3d = tile_bbox.get_corners()
-    
     # Define the 12 edges of the bounding box
     edges = [
         [0, 1], [1, 3], [3, 2], [2, 0],  # Bottom face
@@ -382,7 +379,31 @@ def save_projection_debug_visualization(tile_bbox: TileBBox,
         [0, 4], [1, 5], [2, 6], [3, 7]   # Vertical edges
     ]
     
-    # Draw edges
+    # First, draw full scene bbox in light gray (if provided and different from current tile)
+    if full_scene_bbox is not None:
+        is_same_bbox = (full_scene_bbox.x_min == tile_bbox.x_min and 
+                       full_scene_bbox.x_max == tile_bbox.x_max and
+                       full_scene_bbox.y_min == tile_bbox.y_min and
+                       full_scene_bbox.y_max == tile_bbox.y_max and
+                       full_scene_bbox.z_min == tile_bbox.z_min and
+                       full_scene_bbox.z_max == tile_bbox.z_max)
+        
+        if not is_same_bbox:
+            # Get corners of full scene bbox
+            full_corners = full_scene_bbox.get_corners()
+            
+            # Draw full scene bbox edges in light gray with solid line
+            for edge in edges:
+                points = [full_corners[edge[0]], full_corners[edge[1]]]
+                ax.plot3D([points[0][0], points[1][0]], 
+                         [points[0][1], points[1][1]], 
+                         [points[0][2], points[1][2]], 
+                         'gray', linewidth=1, alpha=0.4)
+    
+    # Then draw current tile bounding box using all 8 corners
+    corners_3d = tile_bbox.get_corners()
+    
+    # Draw current tile edges in blue
     for edge in edges:
         points = [corners_3d[edge[0]], corners_3d[edge[1]]]
         ax.plot3D([points[0][0], points[1][0]], 
@@ -487,10 +508,18 @@ def save_projection_debug_visualization(tile_bbox: TileBBox,
              forward[0]*200, forward[1]*200, forward[2]*200,
              color='red', arrow_length_ratio=0.1, linewidth=2, alpha=0.8)
     
-    # Set 3D view limits with equal aspect ratio
-    all_x = [camera_pos[0]] + [c[0] for c in corners_3d] + [fc[0] for fc in frustum_corners]
-    all_y = [camera_pos[1]] + [c[1] for c in corners_3d] + [fc[1] for fc in frustum_corners]
-    all_z = [camera_pos[2]] + [c[2] for c in corners_3d] + [fc[2] for fc in frustum_corners]
+    # Use full scene bbox for fixed 3D view limits if provided, otherwise use current tile
+    if full_scene_bbox is not None:
+        # Use full scene bbox for view limits
+        scene_corners = full_scene_bbox.get_corners()
+        all_x = [c[0] for c in scene_corners]
+        all_y = [c[1] for c in scene_corners]
+        all_z = [c[2] for c in scene_corners]
+    else:
+        # Fallback to current tile and camera/frustum
+        all_x = [camera_pos[0]] + [c[0] for c in corners_3d] + [fc[0] for fc in frustum_corners]
+        all_y = [camera_pos[1]] + [c[1] for c in corners_3d] + [fc[1] for fc in frustum_corners]
+        all_z = [camera_pos[2]] + [c[2] for c in corners_3d] + [fc[2] for fc in frustum_corners]
     
     # Calculate ranges for each axis
     x_range = max(all_x) - min(all_x)

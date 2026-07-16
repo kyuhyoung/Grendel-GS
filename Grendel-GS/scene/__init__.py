@@ -555,6 +555,53 @@ class Scene:
 
             print(f"  (Training will RESUME from pre-trained state, NOT from scratch)", flush=True)
             print(f"{'='*60}\n", flush=True)
+
+            # Resume 검증 시각화 (best-effort, 자식 bbox + 로드된 가우시안 + visible cameras)
+            try:
+                from pathlib import Path
+                from utils.oom_viz import save_resume_viz
+                from scene.adaptive_tile_utils import TileBBox as _RTBB
+                _tile_bbox_str = getattr(args, "tile_bbox", None)
+                if _tile_bbox_str:
+                    _tile_bbox_obj = (_RTBB.from_string(_tile_bbox_str)
+                                       if isinstance(_tile_bbox_str, str)
+                                       else _tile_bbox_str)
+                    _xyz_np = self.gaussians._xyz.detach().cpu().numpy()
+                    _cam_pos = []
+                    for _c in (self.train_cameras or []):
+                        try:
+                            _cc = getattr(_c, "camera_center", None)
+                            if _cc is None:
+                                continue
+                            if hasattr(_cc, "detach"):
+                                _cc = _cc.detach().cpu().numpy()
+                            _cam_pos.append(np.asarray(_cc, dtype=np.float32).reshape(3))
+                        except Exception:
+                            continue
+                    _cam_pos_np = np.stack(_cam_pos, axis=0) if _cam_pos else np.zeros((0, 3), dtype=np.float32)
+                    _tile_id = getattr(args, "tile_id", "tile")
+                    _viz_dir = Path(getattr(args, "tile_output_dir", "") or args.model_path).parent / "visualizations" / "resume"
+                    _rank = utils.GLOBAL_RANK
+                    _resume_path = save_resume_viz(
+                        _xyz_np,
+                        rank=_rank,
+                        tile_id=_tile_id,
+                        tile_bbox=_tile_bbox_obj,
+                        camera_positions=_cam_pos_np,
+                        out_dir=_viz_dir,
+                        pretrained_ply_path=args.pretrained_ply,
+                    )
+                    # 검증 모드: resume_viz png 만들고 자식 프로세스 즉시 종료 (학습 시작 안 함)
+                    print("\n" + "=" * 60, flush=True)
+                    print(f"[resume_viz] STOP: tile={_tile_id} rank={_rank}", flush=True)
+                    print(f"  -> {_resume_path}", flush=True)
+                    print("=" * 60, flush=True)
+                    import sys as _sys
+                    _sys.exit(0)
+            except SystemExit:
+                raise
+            except Exception as _viz_e:
+                print(f"  [resume_viz] skipped: {_viz_e}", flush=True)
         elif getattr(args, "tile_scene_root", ""):
             utils.print_rank_0(
                 "[tile-ooc] Skipping initial point cloud loading; tiles will be streamed on demand"
