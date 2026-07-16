@@ -38,6 +38,7 @@ OUTPUT_PATH="./output/adaptive_test"
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 GPU_IDS="0,1"  # Container maps physical GPUs to 0,1
 ITERATIONS=1000
+ITERATIONS_USER_SET=false
 BACKEND="default"
 BSZ=1
 TILE_CROP_MARGIN=100
@@ -122,6 +123,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --iterations)
             ITERATIONS="$2"
+            ITERATIONS_USER_SET=true
             shift 2
             ;;
         --backend)
@@ -226,7 +228,10 @@ if [[ "$EXPLOSIVE_DENSIFICATION" == true ]]; then
     DENSIFY_FROM_ITER=100
     DENSIFICATION_INTERVAL=50
     DENSIFY_GRAD_THRESHOLD=0.00001  # 적당히 낮은 threshold (0.000001 -> 0.00001)
-    ITERATIONS=8000
+    # 사용자가 --iterations 를 명시했으면 존중
+    if [[ "${ITERATIONS_USER_SET}" != true ]]; then
+        ITERATIONS=8000
+    fi
     echo "  Iterations set to: ${ITERATIONS}"
 fi
 
