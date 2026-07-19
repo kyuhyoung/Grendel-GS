@@ -65,6 +65,7 @@ VISUAL_DEBUG_LEVEL=""  # Empty means level 0 (default)
 RENDER_DEBUG=false
 RENDER_DEBUG_MIN_POINTS=30
 RESUME_VIZ_STOP=false    # true: resume viz 만 저장하고 자식 타일 학습 없이 종료 (검증 모드)
+FRESH_START=false        # true: 기존 state 무시하고 처음부터 (기본: state 있으면 이어서 진행)
 
 # OOM timeout settings (seconds)
 OOM_ACK_TIMEOUT=60       # Timeout for rank ACK during OOM signaling (1 minute - faster detection)
@@ -102,6 +103,7 @@ print_usage() {
     echo "  --ply-wait-timeout N        Timeout for waiting PLY files to be saved in seconds (default: 3600)"
     echo "  --render-debug             Enable render debug dumps/PNGs for low-point cases"
     echo "  --resume-viz-stop           Save resume viz and exit child before training (verification mode)"
+    echo "  --fresh                     Ignore existing adaptive_state.json and start over (default: resume)"
     echo ""
 }
 
@@ -194,6 +196,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --resume-viz-stop)
             RESUME_VIZ_STOP=true
+            shift
+            ;;
+        --fresh)
+            FRESH_START=true
             shift
             ;;
         --help|-h)
@@ -390,6 +396,9 @@ CMD+=" --densification_interval ${DENSIFICATION_INTERVAL}"
 CMD+=" --densify_grad_threshold ${DENSIFY_GRAD_THRESHOLD}"
 if [[ -n "${CHILD_DENSIFY_GRAD_THRESHOLD}" ]]; then
     CMD+=" --child_densify_grad_threshold ${CHILD_DENSIFY_GRAD_THRESHOLD}"
+fi
+if [[ "${FRESH_START}" == true ]]; then
+    CMD+=" --fresh_start"
 fi
 
 # Add visual debug flag if enabled

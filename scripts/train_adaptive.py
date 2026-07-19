@@ -173,6 +173,26 @@ def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str, strict: b
     return total_count
 
 
+def find_final_tile_ply(output_path, tile_id: str):
+    """완료 타일의 최종 point_cloud PLY 경로 (없으면 None).
+
+    merge_final_scene 과 wrapper resume 검증이 공유.
+    """
+    model_dir = Path(output_path) / "models" / tile_id / "point_cloud"
+    if not model_dir.exists():
+        return None
+    iter_folders = sorted(model_dir.glob("iteration_*"),
+                          key=lambda x: int(x.name.split("_")[1]))
+    if not iter_folders:
+        return None
+    folder = iter_folders[-1]
+    exact = folder / "point_cloud.ply"
+    if exact.exists():
+        return exact
+    candidates = sorted(folder.glob("point_cloud*.ply"))
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def merge_final_scene(output_path, filter_mode: str = "bbox"):
     """완료 타일들의 최종 point_cloud.ply 를 하나의 scene PLY 로 머지.
 
@@ -207,19 +227,7 @@ def merge_final_scene(output_path, filter_mode: str = "bbox"):
         return None
 
     def find_final_ply(tile_id: str):
-        model_dir = output_path / "models" / tile_id / "point_cloud"
-        if not model_dir.exists():
-            return None
-        iter_folders = sorted(model_dir.glob("iteration_*"),
-                              key=lambda x: int(x.name.split("_")[1]))
-        if not iter_folders:
-            return None
-        folder = iter_folders[-1]
-        exact = folder / "point_cloud.ply"
-        if exact.exists():
-            return exact
-        candidates = sorted(folder.glob("point_cloud*.ply"))
-        return candidates[0] if len(candidates) == 1 else None
+        return find_final_tile_ply(output_path, tile_id)
 
     bboxes = {tid: BBox.from_string(info["bbox"]) for tid, info in completed.items()}
 
@@ -375,6 +383,7 @@ class TileInfo:
     ply_path: Optional[str] = None  # Path to pre-trained gaussians PLY (for Category 3 OOM resume)
     oom_type: Optional[str] = None  # "gpu" (exit 42) or "ram" (exit -9)
     oom_category: Optional[int] = None  # OOM category: 1=early, 2=mid, 3=densification
+    retry_count: int = 0  # wrapper 재시작(resume) 시 failed → pending 강등 횟수
 
 
 class AdaptiveTileTrainer:
@@ -399,12 +408,19 @@ class AdaptiveTileTrainer:
         self.ply_dir = self.output_path / "ply"
         self.ply_dir.mkdir(parents=True, exist_ok=True)
 
-        # 매 실행마다 visualizations 폴더 전체 삭제 후 재생성
+        # Resume 판단: state 파일이 있고 --fresh_start 가 아니면 이어서 진행
+        # (무인 장기 런에서 wrapper/호스트가 죽어도 재실행만으로 이어지게 하는 것이 목적)
+        loaded_state = None
+        if self.state_file.exists() and not getattr(args, "fresh_start", False):
+            loaded_state = self._try_load_state()
+        self.resume_mode = loaded_state is not None
+
+        # fresh 시작일 때만 visualizations 폴더 전체 삭제 후 재생성
         # (count_timeline / cat3_oom / resume / tile_map / tile_split_tree / projection_debug /
         #  gt_compare / render_debug_json / render_debug_png 모두 이 아래에 만들어짐)
         import shutil
         self.viz_root = self.output_path / "visualizations"
-        if self.viz_root.exists():
+        if not self.resume_mode and self.viz_root.exists():
             shutil.rmtree(self.viz_root)
             print(f"[Init] Cleared folder: {self.viz_root}")
         self.viz_root.mkdir(parents=True, exist_ok=True)
@@ -425,9 +441,13 @@ class AdaptiveTileTrainer:
         self.vis_counter = 0  # Counter for visualization filenames
         self.min_successful_level = None  # Track minimum level (smallest = largest tile) that completed successfully
         self.initial_area = None  # Area of the initial tile (level 0)
-        # Always start fresh: clear all output folders
-        self._clear_output_folders()
-        self._init_tiles()
+        if self.resume_mode:
+            self._apply_resume_state(loaded_state)
+            self._vis_cleared = True  # run() 의 lazy clear 방지
+        else:
+            # Fresh start: clear all output folders
+            self._clear_output_folders()
+            self._init_tiles()
 
     def _load_scene_info(self) -> Tuple[BBox, int]:
         """Load point cloud and compute scene bounding box."""
@@ -927,6 +947,7 @@ class AdaptiveTileTrainer:
     def _save_state(self):
         """Save current state to file."""
         state = {
+            "source_path": str(self.source_path),
             "tile_counter": self.tile_counter,
             "vis_counter": self.vis_counter,
             "initial_area": self.initial_area,
@@ -940,13 +961,108 @@ class AdaptiveTileTrainer:
                     "num_cameras": t.num_cameras,
                     "ply_path": t.ply_path,
                     "oom_type": t.oom_type,
-                    "oom_category": t.oom_category
+                    "oom_category": t.oom_category,
+                    "retry_count": t.retry_count,
                 }
                 for tid, t in self.tiles.items()
             }
         }
         with open(self.state_file, "w") as f:
             json.dump(state, f, indent=2)
+
+    MAX_TILE_RETRIES = 2  # resume 시 failed 타일을 pending 으로 되돌리는 최대 횟수
+
+    def _try_load_state(self):
+        """기존 adaptive_state.json 을 읽어 resume 가능하면 dict 반환.
+
+        파싱 실패·source_path 불일치·빈 상태면 파일을 .bak 으로 밀어두고
+        None 을 반환해 fresh start 로 진행 (무인 운영에서 절대 멈추지 않기 위함).
+        """
+        import time
+        import shutil
+        try:
+            with open(self.state_file) as f:
+                state = json.load(f)
+            saved_source = state.get("source_path")
+            if saved_source and saved_source != str(self.source_path):
+                print(f"[Resume] source_path 불일치: state={saved_source}, "
+                      f"현재={self.source_path} — fresh start 로 전환")
+                raise ValueError("source_path mismatch")
+            if not state.get("tiles"):
+                raise ValueError("state has no tiles")
+            return state
+        except Exception as e:
+            backup = self.state_file.parent / f"adaptive_state.json.bak_{int(time.time())}"
+            try:
+                shutil.move(str(self.state_file), str(backup))
+                print(f"[Resume] state 사용 불가 ({e}) — {backup.name} 으로 백업 후 fresh start")
+            except Exception:
+                pass
+            return None
+
+    def _apply_resume_state(self, state: dict):
+        """로드된 state 로 타일 큐 복원 + 검증/강등.
+
+        - completed 인데 최종 PLY 가 없으면 pending 으로 강등 (재학습)
+        - in_progress (크래시 당시 학습 중) 는 pending 으로 강등
+        - failed 는 retry_count < MAX_TILE_RETRIES 일 때만 pending 으로 강등
+        - pending 인데 pre-trained PLY 파일이 사라졌으면 스크래치로 전환 (진행 보장)
+        """
+        self.tile_counter = state.get("tile_counter", 0)
+        self.vis_counter = state.get("vis_counter", 0)
+        self.initial_area = state.get("initial_area")
+        self.min_successful_level = state.get("min_successful_level")
+
+        kept_completed = 0
+        demoted = []
+        missing_final = []
+        lost_pretrained = []
+        for tid, t in state["tiles"].items():
+            info = TileInfo(
+                tile_id=t["tile_id"],
+                bbox=BBox.from_string(t["bbox"]),
+                status=t["status"],
+                fail_iter=t.get("fail_iter"),
+                num_cameras=t.get("num_cameras"),
+                ply_path=t.get("ply_path"),
+                oom_type=t.get("oom_type"),
+                oom_category=t.get("oom_category"),
+                retry_count=t.get("retry_count", 0),
+            )
+            if info.status == "completed":
+                if find_final_tile_ply(self.output_path, tid) is None:
+                    info.status = "pending"
+                    missing_final.append(tid)
+                else:
+                    kept_completed += 1
+            elif info.status == "in_progress":
+                info.status = "pending"
+                demoted.append(tid)
+            elif info.status == "failed" and info.retry_count < self.MAX_TILE_RETRIES:
+                info.retry_count += 1
+                info.status = "pending"
+                demoted.append(f"{tid}(retry {info.retry_count}/{self.MAX_TILE_RETRIES})")
+            if (info.status == "pending" and info.ply_path
+                    and not Path(info.ply_path).exists()):
+                lost_pretrained.append(tid)
+                info.ply_path = None
+            self.tiles[tid] = info
+
+        from collections import Counter
+        counts = Counter(t.status for t in self.tiles.values())
+        print("\n" + "=" * 60)
+        print("[Resume] 기존 state 에서 이어서 진행")
+        print(f"  타일 {len(self.tiles)}개: " +
+              ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+        print(f"  완료 유지(최종 PLY 확인됨): {kept_completed}")
+        if missing_final:
+            print(f"  완료였으나 PLY 소실 → 재학습: {missing_final}")
+        if demoted:
+            print(f"  pending 으로 강등: {demoted}")
+        if lost_pretrained:
+            print(f"  pre-trained PLY 소실 → 스크래치 전환: {lost_pretrained}")
+        print("=" * 60 + "\n")
+        self._save_state()
 
     def _compute_camera_footprints(self) -> List[Optional[np.ndarray]]:
         """
@@ -2359,6 +2475,9 @@ def parse_args():
                         help="Start densification from this iteration (default: 500)")
     parser.add_argument("--densification_interval", type=int, default=100,
                         help="Densification interval (default: 100)")
+    parser.add_argument("--fresh_start", action="store_true",
+                        help="기존 adaptive_state.json 이 있어도 무시하고 처음부터 시작 "
+                             "(기본: state 가 있으면 이어서 진행)")
     parser.add_argument("--child_densify_grad_threshold", type=float, default=None,
                         help="Resume 자식 타일 전용 densify threshold. "
                              "explosive 부모에서 물려받은 자식이 재폭증해 완주 못 하는 것을 방지 "
