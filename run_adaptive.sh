@@ -37,17 +37,16 @@ OUTPUT_PATH="./output/adaptive_test"
 # Auto-detect number of available GPUs
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 GPU_IDS="0,1"  # Container maps physical GPUs to 0,1
-ITERATIONS=2000
+ITERATIONS=30000
 BACKEND="default"
 BSZ=1
 TILE_CROP_MARGIN=100
 SCENE_MARGIN=0.0
 NDC_LIMIT=1.0
-# 현재 실험 세팅: cat3 조기 유발(explosive) + 상속 자식은 정상 threshold 로 완주
-# → 저장/머지/resume/완주/최종머지 풀 사이클 검증. 평상시 스모크로 돌리려면
-#   EXPLOSIVE_DENSIFICATION=false, CHILD_DENSIFY_GRAD_THRESHOLD="" 로 되돌릴 것
-EXPLOSIVE_DENSIFICATION=true
-#EXPLOSIVE_DENSIFICATION=false
+# 현재 세팅: 품질 런 — 정상 threshold, 표준 30k iter (검증 런들은 2026-07 완료)
+# cat3 사이클 재검증이 필요하면 EXPLOSIVE_DENSIFICATION=true + ITERATIONS 축소
+EXPLOSIVE_DENSIFICATION=false
+#EXPLOSIVE_DENSIFICATION=true
 # Densification params (will be overridden if EXPLOSIVE_DENSIFICATION=true)
 DENSIFY_FROM_ITER=500
 DENSIFICATION_INTERVAL=100
@@ -56,7 +55,7 @@ CHILD_DENSIFY_GRAD_THRESHOLD="0.0002"   # resume 자식 전용 threshold (빈 �
 
 # Debug image saving (for off-center projection verification)
 # Set to comma-separated iterations, e.g., "1,100,500,1000" or empty to use defaults
-DEBUG_SAVE_ITERS="1,500,2000,5000,8000"
+DEBUG_SAVE_ITERS="1,1000,7000,15000,30000"
 
 # Visual debugging for projection and crop
 VISUAL_DEBUG=false
