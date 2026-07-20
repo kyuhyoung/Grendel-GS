@@ -2075,6 +2075,36 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # Init dataset
     train_dataset = SceneDataset(scene.getTrainCameras())
     args._num_visible_cameras = len(train_dataset.cameras)
+
+    # Quality 기반 done: epoch_loss(카메라 한 바퀴의 평균 손실) 정체 감지로 조기 종료.
+    # 단일 iter 의 loss 는 카메라마다 달라 비교 불가 → 반드시 에폭(N뷰) 단위 통계로 비교.
+    # epoch_loss 는 all-reduce 된 동일 값에서 계산되므로 모든 rank 가 같은 결정을 내림.
+    quality_done_enabled = (
+        args.adaptive_tile_enabled
+        and os.environ.get("QUALITY_DONE", "0") == "1"
+    )
+    if quality_done_enabled:
+        _qd_min_env = int(os.environ.get("QUALITY_DONE_MIN_ITER", "0"))
+        # densification 종료 전에는 densify 마다 loss 가 출렁여 가짜 정체가 잡히므로 금지
+        quality_done_min_iter = (
+            _qd_min_env if _qd_min_env > 0 else int(opt_args.densify_until_iter) + 1000
+        )
+        quality_done_rel_eps = float(os.environ.get("QUALITY_DONE_REL_EPS", "0.005"))
+        quality_done_patience = int(os.environ.get("QUALITY_DONE_PATIENCE", "2"))
+        _n_cam = max(1, train_dataset.camera_size)
+        # 비교 창은 최소 3에폭, 그리고 한쪽 창이 최소 ~500 iter 가 되도록 (카메라 적은 타일 보호)
+        quality_done_window = max(
+            int(os.environ.get("QUALITY_DONE_WINDOW_EPOCHS", "3")),
+            (500 + _n_cam - 1) // _n_cam,
+        )
+        quality_done_last_epoch = 0
+        quality_done_strikes = 0
+        quality_converged = False
+        utils.print_rank_0(
+            f"[quality-done] enabled: min_iter={quality_done_min_iter}, "
+            f"window={quality_done_window} epochs x2, rel_eps={quality_done_rel_eps}, "
+            f"patience={quality_done_patience} (cameras={_n_cam})"
+        )
     if args.adjust_strategy_warmp_iterations == -1:
         args.adjust_strategy_warmp_iterations = len(train_dataset.cameras)
         # use one epoch to warm up. do not use the first epoch's running time for adjustment of strategy.
@@ -2694,6 +2724,41 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 )
                 # Update Epoch Statistics
                 train_dataset.update_losses(batched_loss_cpu)
+
+                # Quality 기반 done: 새 에폭이 완성될 때마다 최근 K에폭 vs 직전 K에폭
+                # 평균 손실을 비교해 상대 개선율이 임계 미만이면(연속 patience 회) 조기 종료
+                if quality_done_enabled and len(train_dataset.epoch_loss) > quality_done_last_epoch:
+                    quality_done_last_epoch = len(train_dataset.epoch_loss)
+                    _el = train_dataset.epoch_loss
+                    _K = quality_done_window
+                    if iteration >= quality_done_min_iter and len(_el) >= 2 * _K:
+                        _prev = float(sum(_el[-2 * _K:-_K])) / _K
+                        _last = float(sum(_el[-_K:])) / _K
+                        _improve = (_prev - _last) / max(abs(_prev), 1e-12)
+                        if _improve < quality_done_rel_eps:
+                            quality_done_strikes += 1
+                        else:
+                            quality_done_strikes = 0
+                        utils.print_rank_0(
+                            f"[quality-done] epoch {quality_done_last_epoch} (iter {iteration}): "
+                            f"prev_loss={_prev:.6f} last_loss={_last:.6f} "
+                            f"improve={_improve * 100:.3f}% "
+                            f"strikes={quality_done_strikes}/{quality_done_patience}"
+                        )
+                        if quality_done_strikes >= quality_done_patience:
+                            quality_converged = True
+                if quality_done_enabled and quality_converged:
+                    utils.print_rank_0(
+                        f"\n[quality-done] CONVERGED at iteration {iteration} "
+                        f"(epoch {quality_done_last_epoch}/{train_dataset.camera_size} views) "
+                        f"— early done"
+                    )
+                    log_file.write(
+                        f"[quality-done] converged at iter {iteration}, "
+                        f"epoch {quality_done_last_epoch}\n"
+                    )
+                    progress_bar.close()
+                    break
                 # Logging
                 batched_loss_cpu = [round(loss, 6) for loss in batched_loss_cpu]
                 log_string = "iteration[{},{}) loss: {} image: {}\n".format(
@@ -3052,13 +3117,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     if args.adaptive_tile_enabled:
         # 완료 타일 최종 저장. scene.save() 는 rank 0 으로의 collective gather 를
         # 포함하므로 모든 rank 가 함께 호출해야 함 (rank guard 금지)
+        # quality-done 조기 종료 시 실제 마지막 iteration 으로 저장
+        final_iteration = locals().get("iteration", opt_args.iterations)
         utils.print_rank_0(
-            f"[adaptive-tile] Training complete — saving final gaussians at iteration {opt_args.iterations}"
+            f"[adaptive-tile] Training complete — saving final gaussians at iteration {final_iteration}"
         )
         torch.cuda.empty_cache()
-        scene.save(opt_args.iterations)
+        scene.save(final_iteration)
         log_file.write(
-            f"[ITER {opt_args.iterations}] Saving final Gaussians (adaptive mode)\n"
+            f"[ITER {final_iteration}] Saving final Gaussians (adaptive mode)\n"
         )
     if opt_args.iterations not in args.save_iterations:
         end2end_timers.print_time(log_file, opt_args.iterations)

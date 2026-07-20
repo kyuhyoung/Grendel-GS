@@ -379,6 +379,17 @@ fi
 # Disable train_adaptive.py file logging; rely on run_adaptive.log
 export TRAIN_ADAPTIVE_NO_LOG=1
 
+# ============================================
+# Quality 기반 done (epoch loss 정체 감지 조기 종료)
+# ============================================
+# iter 상한(ITERATIONS)은 유지하되, densification 종료 후 에폭 평균 손실이
+# 정체하면 그 타일은 조기 done. 끄려면 QUALITY_DONE=0 으로 실행.
+export QUALITY_DONE="${QUALITY_DONE:-1}"
+export QUALITY_DONE_REL_EPS="${QUALITY_DONE_REL_EPS:-0.005}"   # 창 간 상대 개선율 임계 (0.5%)
+export QUALITY_DONE_PATIENCE="${QUALITY_DONE_PATIENCE:-2}"     # 연속 정체 판정 횟수
+export QUALITY_DONE_WINDOW_EPOCHS="${QUALITY_DONE_WINDOW_EPOCHS:-3}"  # 비교 창(에폭), 최소 500iter 보정됨
+echo "  Quality-based done: ${QUALITY_DONE} (rel_eps=${QUALITY_DONE_REL_EPS}, patience=${QUALITY_DONE_PATIENCE})"
+
 # Build command (use -u for unbuffered output to ensure logs appear immediately)
 CMD="python -u ${SCRIPT_DIR}/scripts/train_adaptive.py"
 CMD+=" --source_path ${SOURCE_PATH}"
