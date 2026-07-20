@@ -404,9 +404,9 @@ def merge_final_scene(output_path, filter_mode: str = "bbox"):
             vals = sorted(losses.values())
             spread = (vals[-1] - vals[0]) / max(vals[0], 1e-9) * 100
             ax.set_title(f"Tile quality heatmap (final epoch loss) | "
-                         f"best={vals[0]:.4f} worst={vals[-1]:.4f} 편차={spread:.0f}%")
+                         f"best={vals[0]:.4f} worst={vals[-1]:.4f} spread={spread:.0f}%")
         else:
-            ax.set_title("Tile quality heatmap (지표 없음 — 구버전 타일)")
+            ax.set_title("Tile quality heatmap (no metrics - legacy tiles)")
         qpng = out_dir / "scene_quality_heatmap.png"
         fig.savefig(qpng, dpi=140, bbox_inches="tight")
         plt.close(fig)
