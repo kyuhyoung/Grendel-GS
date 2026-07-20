@@ -2083,6 +2083,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         args.adaptive_tile_enabled
         and os.environ.get("QUALITY_DONE", "0") == "1"
     )
+    quality_converged = False  # done_info 기록에서 참조하므로 비활성 시에도 정의
     if quality_done_enabled:
         _qd_min_env = int(os.environ.get("QUALITY_DONE_MIN_ITER", "0"))
         # densification 종료 전에는 densify 마다 loss 가 출렁여 가짜 정체가 잡히므로 금지
@@ -3127,6 +3128,24 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         log_file.write(
             f"[ITER {final_iteration}] Saving final Gaussians (adaptive mode)\n"
         )
+        # 타일 품질 지표 기록 — 타일 간 품질 편차 측정/히트맵용.
+        # epoch_loss 는 rank 공통이므로 rank 0 만 기록.
+        if utils.GLOBAL_RANK == 0:
+            try:
+                _el = train_dataset.epoch_loss
+                _tail = _el[-3:] if _el else []
+                done_info = {
+                    "final_iteration": int(final_iteration),
+                    "num_cameras": int(train_dataset.camera_size),
+                    "epochs": len(_el),
+                    "final_epoch_loss": (float(sum(_tail) / len(_tail)) if _tail else None),
+                    "done_reason": "converged" if quality_converged else "iter_end",
+                }
+                with open(os.path.join(args.model_path, "done_info.json"), "w") as f:
+                    json.dump(done_info, f, indent=2)
+                utils.print_rank_0(f"[adaptive-tile] done_info: {done_info}")
+            except Exception as e:
+                print(f"[adaptive-tile] WARNING: done_info 기록 실패: {e}", flush=True)
     if opt_args.iterations not in args.save_iterations:
         end2end_timers.print_time(log_file, opt_args.iterations)
     log_file.write(

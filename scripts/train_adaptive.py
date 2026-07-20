@@ -277,8 +277,16 @@ def merge_final_scene(output_path, filter_mode: str = "bbox"):
         kept = int(keep.sum())
         merged_chunks.append(vertices[keep])
         merged_tids.append(tid)
+        quality = None
+        done_info_path = output_path / "models" / tid / "done_info.json"
+        if done_info_path.exists():
+            try:
+                quality = json.loads(done_info_path.read_text())
+            except Exception:
+                pass
         manifest[tid] = {"source": str(src), "total": total,
-                         "kept": kept, "dropped": total - kept}
+                         "kept": kept, "dropped": total - kept,
+                         "quality": quality}
         print(f"[merge_scene] {tid}: kept {kept:,}/{total:,} from {src.name}", flush=True)
 
     if not merged_chunks:
@@ -345,6 +353,67 @@ def merge_final_scene(output_path, filter_mode: str = "bbox"):
     except Exception as viz_e:
         print(f"[merge_scene] WARNING: top-down viz failed: {viz_e}", flush=True)
 
+    # 타일 품질 히트맵 — 타일 간 편차 가시화 (final_epoch_loss: 초록=좋음, 빨강=나쁨)
+    try:
+        from matplotlib.patches import Rectangle
+        import matplotlib.colors as mcolors
+        losses = {tid: m["quality"]["final_epoch_loss"]
+                  for tid, m in manifest.items()
+                  if m.get("quality") and m["quality"].get("final_epoch_loss") is not None}
+        fig, ax = plt.subplots(figsize=(14, 14))
+        cmap = plt.get_cmap("RdYlGn_r")
+        norm = None
+        if losses:
+            vmin, vmax = min(losses.values()), max(losses.values())
+            if vmax > vmin:
+                norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        all_b = []
+        for tid in merged_tids:
+            b = bboxes[tid]
+            all_b.append(b)
+            loss = losses.get(tid)
+            if loss is None:
+                color = (0.85, 0.85, 0.85, 1.0)  # 지표 없음(구버전 타일) = 회색
+            elif norm is None:
+                color = cmap(0.5)
+            else:
+                color = cmap(norm(loss))
+            ax.add_patch(Rectangle((b.x_min, b.y_min), b.x_max - b.x_min,
+                                   b.y_max - b.y_min, facecolor=color,
+                                   edgecolor="black", linewidth=1.0, alpha=0.9))
+            q = manifest[tid].get("quality") or {}
+            label = f"{tid}\n" + (f"loss={loss:.4f}" if loss is not None else "(n/a)")
+            if q:
+                label += f"\ncams={q.get('num_cameras', '?')} {q.get('done_reason', '')}"
+            ax.text((b.x_min + b.x_max) / 2, (b.y_min + b.y_max) / 2, label,
+                    ha="center", va="center", fontsize=7)
+        for tid, info in state.get("tiles", {}).items():
+            if info.get("status") in ("skipped", "failed"):
+                b = BBox.from_string(info["bbox"])
+                all_b.append(b)
+                ax.add_patch(Rectangle((b.x_min, b.y_min), b.x_max - b.x_min,
+                                       b.y_max - b.y_min, fill=False,
+                                       edgecolor="red", linestyle="--", linewidth=1.5))
+        if all_b:
+            ax.set_xlim(min(b.x_min for b in all_b), max(b.x_max for b in all_b))
+            ax.set_ylim(min(b.y_min for b in all_b), max(b.y_max for b in all_b))
+        ax.set_aspect("equal")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        if losses:
+            vals = sorted(losses.values())
+            spread = (vals[-1] - vals[0]) / max(vals[0], 1e-9) * 100
+            ax.set_title(f"Tile quality heatmap (final epoch loss) | "
+                         f"best={vals[0]:.4f} worst={vals[-1]:.4f} 편차={spread:.0f}%")
+        else:
+            ax.set_title("Tile quality heatmap (지표 없음 — 구버전 타일)")
+        qpng = out_dir / "scene_quality_heatmap.png"
+        fig.savefig(qpng, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[merge_scene] quality heatmap -> {qpng}", flush=True)
+    except Exception as viz_e:
+        print(f"[merge_scene] WARNING: quality heatmap failed: {viz_e}", flush=True)
+
     return out_ply
 
 
@@ -400,6 +469,7 @@ class TileInfo:
     oom_type: Optional[str] = None  # "gpu" (exit 42) or "ram" (exit -9)
     oom_category: Optional[int] = None  # OOM category: 1=early, 2=mid, 3=densification
     retry_count: int = 0  # wrapper 재시작(resume) 시 failed → pending 강등 횟수
+    quality: Optional[dict] = None  # done 시점 품질 지표 (final_epoch_loss 등, done_info.json)
 
 
 class AdaptiveTileTrainer:
@@ -979,6 +1049,7 @@ class AdaptiveTileTrainer:
                     "oom_type": t.oom_type,
                     "oom_category": t.oom_category,
                     "retry_count": t.retry_count,
+                    "quality": t.quality,
                 }
                 for tid, t in self.tiles.items()
             }
@@ -1044,6 +1115,7 @@ class AdaptiveTileTrainer:
                 oom_type=t.get("oom_type"),
                 oom_category=t.get("oom_category"),
                 retry_count=t.get("retry_count", 0),
+                quality=t.get("quality"),
             )
             if info.status == "completed":
                 if find_final_tile_ply(self.output_path, tid) is None:
@@ -2038,6 +2110,17 @@ class AdaptiveTileTrainer:
 
             if exit_code == self.EXIT_CODE_SUCCESS:
                 tile.status = "completed"
+                # 타일 품질 지표 로드 (train_internal 이 저장 시점에 기록)
+                done_info_path = self.output_path / "models" / tile.tile_id / "done_info.json"
+                if done_info_path.exists():
+                    try:
+                        with open(done_info_path) as f:
+                            tile.quality = json.load(f)
+                        print(f"  [quality] final_epoch_loss="
+                              f"{tile.quality.get('final_epoch_loss')} "
+                              f"({tile.quality.get('done_reason')})", flush=True)
+                    except Exception as e:
+                        print(f"  [quality] done_info 읽기 실패: {e}", flush=True)
                 # Track successful tile level (smaller level = larger tile)
                 tile_area = tile.bbox.size[0] * tile.bbox.size[1]
                 tile_level = self._get_tile_level(tile_area)
