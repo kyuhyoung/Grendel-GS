@@ -173,6 +173,22 @@ def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str, strict: b
     return total_count
 
 
+def effective_tile_iterations(base_iterations: int, num_cameras: int,
+                              epoch_cap: int, floor_iters: int = 1500) -> int:
+    """타일별 유효 iteration = min(base, max(epoch_cap × 카메라수, floor)).
+
+    표준 3DGS 의 30k iter 는 카메라 수백 장(≈100~200에폭) 기준.
+    카메라 6장짜리 타일에 30k(=5000에폭)를 돌리면 훈련뷰 암기(과적합)로
+    novel view 가 무너짐 (2026-07-20 tile_0031 실측). 에폭 수를 상한해
+    과적합 구간 진입을 차단한다. epoch_cap=0 은 비활성.
+    floor 는 SH 램프/densify 초기 구간이 최소한 돌 수 있게 하는 하한.
+    """
+    if epoch_cap <= 0 or num_cameras <= 0:
+        return base_iterations
+    cap = max(epoch_cap * num_cameras, floor_iters)
+    return min(base_iterations, cap)
+
+
 def find_final_tile_ply(output_path, tile_id: str):
     """완료 타일의 최종 point_cloud PLY 경로 (없으면 None).
 
@@ -1608,6 +1624,15 @@ class AdaptiveTileTrainer:
         tile_model_path.mkdir(parents=True, exist_ok=True)
         tile_log_path.mkdir(parents=True, exist_ok=True)
 
+        # 에폭 상한: 카메라 적은 타일의 과적합 방지 (iterations ∝ 뷰 수)
+        eff_iterations = effective_tile_iterations(
+            self.args.iterations, len(visible_cameras),
+            getattr(self.args, "epoch_cap", 0))
+        if eff_iterations != self.args.iterations:
+            print(f"  [epoch-cap] cameras={len(visible_cameras)} → iterations "
+                  f"{self.args.iterations} → {eff_iterations} "
+                  f"(cap {self.args.epoch_cap} epochs)", flush=True)
+
         # Clear any leftover OOM signal, ack, and done files from previous runs
         signal_file = self.ply_dir / OOM_SIGNAL_FILENAME
         if signal_file.exists():
@@ -1639,7 +1664,7 @@ class AdaptiveTileTrainer:
             "--source_path", str(self.source_path),
             "--model_path", str(tile_model_path),
             "--log_folder", str(tile_log_path),
-            "--iterations", str(self.args.iterations),
+            "--iterations", str(eff_iterations),
             "--backend", self.args.backend,
             "--bsz", str(self.args.bsz),
             "--adaptive_tile_enabled",
@@ -2475,6 +2500,10 @@ def parse_args():
                         help="Start densification from this iteration (default: 500)")
     parser.add_argument("--densification_interval", type=int, default=100,
                         help="Densification interval (default: 100)")
+    parser.add_argument("--epoch_cap", type=int, default=300,
+                        help="타일별 iteration 상한 = epoch_cap × 카메라 수 (하한 1500). "
+                             "카메라 적은 타일의 과적합 방지. 0=비활성 "
+                             "(표준 3DGS 30k ≈ 100~200 에폭 기준)")
     parser.add_argument("--fresh_start", action="store_true",
                         help="기존 adaptive_state.json 이 있어도 무시하고 처음부터 시작 "
                              "(기본: state 가 있으면 이어서 진행)")

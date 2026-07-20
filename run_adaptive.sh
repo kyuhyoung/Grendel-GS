@@ -42,6 +42,7 @@ OUTPUT_PATH="./output/adaptive_test"
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 GPU_IDS="0,1"  # Container maps physical GPUs to 0,1
 ITERATIONS=30000
+EPOCH_CAP=300    # 타일별 상한 = 300에폭 × 카메라수 (과적합 방지, 0=끄기)
 BACKEND="default"
 BSZ=1
 TILE_CROP_MARGIN=100
@@ -89,6 +90,7 @@ print_usage() {
     echo "  --gpus N            Number of GPUs (default: 4, auto-calculated if --gpu-ids set)"
     echo "  --gpu-ids IDS       Comma-separated GPU IDs, e.g., '0,1,2,3' or '4,5,6,7'"
     echo "  --iterations N      Training iterations per tile (default: 30000)"
+    echo "  --epoch-cap N       Per-tile iteration cap = N epochs x cameras (default: 300, 0=off)"
     echo "  --backend NAME      Rendering backend: gsplat or default (default: default)"
     echo "  --bsz N             Batch size (default: 4)"
     echo "  --crop-margin N     Pixel margin for camera crops (default: 100)"
@@ -130,6 +132,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --iterations)
             ITERATIONS="$2"
+            shift 2
+            ;;
+        --epoch-cap)
+            EPOCH_CAP="$2"
             shift 2
             ;;
         --backend)
@@ -400,6 +406,7 @@ CMD+=" --source_path ${SOURCE_PATH}"
 CMD+=" --output_path ${OUTPUT_PATH}"
 CMD+=" --num_gpus ${NUM_GPUS}"
 CMD+=" --iterations ${ITERATIONS}"
+CMD+=" --epoch_cap ${EPOCH_CAP}"
 CMD+=" --backend ${BACKEND}"
 CMD+=" --bsz ${BSZ}"
 CMD+=" --tile_crop_margin ${TILE_CROP_MARGIN}"
