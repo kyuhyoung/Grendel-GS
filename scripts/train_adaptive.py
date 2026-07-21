@@ -1721,6 +1721,8 @@ class AdaptiveTileTrainer:
             print(f"  [epoch-cap] cameras={len(visible_cameras)} → iterations "
                   f"{self.args.iterations} → {eff_iterations} "
                   f"(cap {self.args.epoch_cap} epochs)", flush=True)
+        print(f"  [lr-rescale] position_lr_max_steps = {eff_iterations} "
+              f"(LR 감쇠를 타일 학습량에 정렬)", flush=True)
 
         # Clear any leftover OOM signal, ack, and done files from previous runs
         signal_file = self.ply_dir / OOM_SIGNAL_FILENAME
@@ -1754,6 +1756,9 @@ class AdaptiveTileTrainer:
             "--model_path", str(tile_model_path),
             "--log_folder", str(tile_log_path),
             "--iterations", str(eff_iterations),
+            # LR 감쇠 길이를 타일의 실제 학습량에 맞춤 (기본 30k 고정이면
+            # 짧은 타일은 감쇠가 덜 된 높은 LR 로 끝나 후반 정련이 부족해짐)
+            "--position_lr_max_steps", str(eff_iterations),
             "--backend", self.args.backend,
             "--bsz", str(self.args.bsz),
             "--adaptive_tile_enabled",
