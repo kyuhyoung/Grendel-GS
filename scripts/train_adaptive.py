@@ -1233,7 +1233,9 @@ class AdaptiveTileTrainer:
         # Status colors (for status indicator circles)
         # Note: "split" is further divided based on fail_iter and oom_type
         status_colors = {
-            "completed": "#4CAF50",           # Green
+            "completed": "#4CAF50",           # Green - 완료 (구버전 데이터, done 사유 미기록)
+            "completed_iter": "#4CAF50",      # Green - 상한(iter) 도달로 완료
+            "completed_conv": "#00897B",      # Teal - loss 정체(converged)로 조기 완료
             "in_progress": "#2196F3",         # Blue
             "pending": "#9E9E9E",             # Gray
             "split_cat1": "#FFEB3B",          # Yellow - Cat 1: early OOM (SSIM on large image)
@@ -1330,6 +1332,15 @@ class AdaptiveTileTrainer:
                     display_status = "split_cat4"
                 else:
                     display_status = "split_gpu_oom"  # fallback for unknown category
+            elif tile.status == "completed":
+                # 완료를 done 사유로 세분: converged(loss 정체) vs iter_end(상한 도달)
+                _reason = (tile.quality or {}).get("done_reason")
+                if _reason == "converged":
+                    display_status = "completed_conv"
+                elif _reason == "iter_end":
+                    display_status = "completed_iter"
+                else:
+                    display_status = "completed"  # 구버전 데이터
             else:
                 display_status = tile.status
             status_color = status_colors.get(display_status, "#9E9E9E")
@@ -1464,12 +1475,17 @@ class AdaptiveTileTrainer:
         ax.set_title(f'Tile Map - {status_summary}{current_info}', fontsize=14, fontweight='bold')
 
         # Add legend for status colors with counts (draw last, on top)
+        legend_labels = {
+            "completed_iter": "Completed (iter cap)",
+            "completed_conv": "Completed (converged)",
+        }
         legend_handles = []
         for status, color in status_colors.items():
             if status in display_status_counts:
                 count = display_status_counts[status]
+                label_name = legend_labels.get(status, status.capitalize())
                 handle = patches.Patch(facecolor=color, edgecolor='white',
-                                       label=f"{status.capitalize()} ({count})")
+                                       label=f"{label_name} ({count})")
                 legend_handles.append(handle)
         legend = ax.legend(handles=legend_handles, loc='upper right', fontsize=10)
         legend.set_zorder(200)
