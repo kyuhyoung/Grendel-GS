@@ -378,15 +378,24 @@ def merge_final_scene(output_path, filter_mode: str = "bbox"):
                 color = cmap(0.5)
             else:
                 color = cmap(norm(loss))
+            q = manifest[tid].get("quality") or {}
+            # done 사유 시각 구분: converged = 파란 굵은 테두리, iter_end = 검정 얇은 테두리
+            _converged = q.get("done_reason") == "converged"
             ax.add_patch(Rectangle((b.x_min, b.y_min), b.x_max - b.x_min,
                                    b.y_max - b.y_min, facecolor=color,
-                                   edgecolor="black", linewidth=1.0, alpha=0.9))
-            q = manifest[tid].get("quality") or {}
+                                   edgecolor=("#1565C0" if _converged else "black"),
+                                   linewidth=(3.0 if _converged else 1.0), alpha=0.9))
             label = f"{tid}\n" + (f"loss={loss:.4f}" if loss is not None else "(n/a)")
             if q:
                 label += f"\ncams={q.get('num_cameras', '?')} {q.get('done_reason', '')}"
             ax.text((b.x_min + b.x_max) / 2, (b.y_min + b.y_max) / 2, label,
                     ha="center", va="center", fontsize=7)
+        ax.legend(handles=[
+            Rectangle((0, 0), 1, 1, fill=False, edgecolor="#1565C0", linewidth=3.0,
+                      label="converged (loss plateau)"),
+            Rectangle((0, 0), 1, 1, fill=False, edgecolor="black", linewidth=1.0,
+                      label="iter_end (cap reached)"),
+        ], loc="upper right", fontsize=8)
         for tid, info in state.get("tiles", {}).items():
             if info.get("status") in ("skipped", "failed"):
                 b = BBox.from_string(info["bbox"])
@@ -1376,6 +1385,14 @@ class AdaptiveTileTrainer:
                         info_parts.append(f"{oom_prefix}{cat_str}@{tile.fail_iter}")
                 if tile.num_cameras is not None:
                     info_parts.append(f"C{tile.num_cameras}")
+                # done 사유 구분: conv@N = loss 정체 조기종료, iter@N = 상한 도달
+                if tile.status == "completed" and tile.quality:
+                    _r = tile.quality.get("done_reason")
+                    _fi = tile.quality.get("final_iteration")
+                    if _r == "converged":
+                        info_parts.append(f"conv@{_fi}")
+                    elif _r == "iter_end":
+                        info_parts.append(f"iter@{_fi}")
                 label_text += f"\n({', '.join(info_parts)})"
 
             text_labels.append((center_x, center_y, label_text, font_size,
