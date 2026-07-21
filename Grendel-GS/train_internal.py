@@ -2095,10 +2095,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if _qd_pat_env:
             quality_done_patience = int(_qd_pat_env)
         else:
-            # patience = 카메라 수 power function (dnq: 2뷰→90에폭, 30뷰→20에폭, clamp[5,100])
+            # patience = 카메라 수 power function (2뷰→60에폭, 30뷰→15에폭, clamp[5,100])
+            # 기존 dnq fitting (2뷰→90, 30뷰→20):
+            # _b = _math.log(90.0 / 20.0) / _math.log(2.0 / 30.0)
+            # _a = 90.0 / (2.0 ** _b)
             import math as _math
-            _b = _math.log(90.0 / 20.0) / _math.log(2.0 / 30.0)
-            _a = 90.0 / (2.0 ** _b)
+            _b = _math.log(60.0 / 15.0) / _math.log(2.0 / 30.0)
+            _a = 60.0 / (2.0 ** _b)
             _cc = float(min(max(_n_cam, 2), 30))
             quality_done_patience = max(5, min(int(_a * (_cc ** _b)), 100))
         quality_best_epoch_loss = float("inf")
