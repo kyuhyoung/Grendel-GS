@@ -60,7 +60,10 @@ CHILD_DENSIFY_GRAD_THRESHOLD="0.0002"   # resume 자식 전용 threshold (빈 �
 
 # Debug image saving (for off-center projection verification)
 # Set to comma-separated iterations, e.g., "1,100,500,1000" or empty to use defaults
-DEBUG_SAVE_ITERS="1,1000,7000,15000,30000"
+# GT 비교 이미지 저장 시점: 타일별 상한 대비 % (모든 타일이 같은 진행률에서 5장씩)
+# --debug-save-iters 로 절대 iter 목록을 주면 그쪽이 우선
+DEBUG_SAVE_PCTS="0,10,30,60,100"
+DEBUG_SAVE_ITERS=""
 
 # Visual debugging for projection and crop
 VISUAL_DEBUG=false
@@ -376,13 +379,14 @@ echo "  Explosive densification: ${EXPLOSIVE_DENSIFICATION}"
 echo "  Densify from iter: ${DENSIFY_FROM_ITER}"
 echo "  Densification interval: ${DENSIFICATION_INTERVAL}"
 echo "  Densify grad threshold: ${DENSIFY_GRAD_THRESHOLD}"
-echo "  Debug save iters: ${DEBUG_SAVE_ITERS:-'default (1,100,500,1000)'}"
+echo "  Debug save: ${DEBUG_SAVE_ITERS:-pcts ${DEBUG_SAVE_PCTS} (of per-tile cap)}"
 echo "  OOM ACK timeout: ${OOM_ACK_TIMEOUT}s"
 echo "  NCCL timeout: ${NCCL_TIMEOUT_OVERRIDE}s"
 echo "============================================"
 echo ""
 
 # Export debug save iterations for train_internal.py
+export DEBUG_SAVE_PCTS="${DEBUG_SAVE_PCTS}"
 if [[ -n "$DEBUG_SAVE_ITERS" ]]; then
     export DEBUG_SAVE_ITERS="${DEBUG_SAVE_ITERS}"
 fi

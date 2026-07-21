@@ -1234,8 +1234,22 @@ def should_save_debug_images(iteration: int, args) -> bool:
     By default, saves for the first N iterations where N = number of visible cameras.
     This ensures all views are captured (each camera appears once in first N iters).
     """
-    # Check environment variable for explicit iteration list
+    # 타일별 상한 대비 상대 시점(%) 저장 — 타일마다 상한이 달라도 균등하게 남도록.
+    # 예: "0,10,30,60,100" → iter 1, 10%, 30%, 60%, 상한. DEBUG_SAVE_ITERS(절대값)가
+    # 설정돼 있으면 그쪽이 우선.
     debug_iters_str = os.environ.get("DEBUG_SAVE_ITERS", "")
+    debug_pcts_str = os.environ.get("DEBUG_SAVE_PCTS", "")
+    if not debug_iters_str and debug_pcts_str:
+        try:
+            total = int(getattr(args, "iterations", 0))
+            if total > 0:
+                pcts = [float(x.strip()) for x in debug_pcts_str.split(",")]
+                targets = {max(1, round(total * p / 100.0)) for p in pcts}
+                return iteration in targets
+        except ValueError:
+            pass
+
+    # Check environment variable for explicit iteration list
     if debug_iters_str:
         try:
             debug_iters = [int(x.strip()) for x in debug_iters_str.split(",")]
