@@ -2085,26 +2085,30 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     )
     quality_converged = False  # done_info 기록에서 참조하므로 비활성 시에도 정의
     if quality_done_enabled:
-        _qd_min_env = int(os.environ.get("QUALITY_DONE_MIN_ITER", "0"))
-        # densification 종료 전에는 densify 마다 loss 가 출렁여 가짜 정체가 잡히므로 금지
-        quality_done_min_iter = (
-            _qd_min_env if _qd_min_env > 0 else int(opt_args.densify_until_iter) + 1000
-        )
-        quality_done_rel_eps = float(os.environ.get("QUALITY_DONE_REL_EPS", "0.005"))
-        quality_done_patience = int(os.environ.get("QUALITY_DONE_PATIENCE", "2"))
+        # dnq ConvergenceDetector 이식 (etc/Grendel-GS dnq 브랜치, user 검증 설계):
+        # best 에폭 평균 + patience — 개선(= best 보다 threshold 이상 낮은 에폭 평균)이
+        # patience 에폭 연속 없으면 조기 done. densification 게이트 없음 (dnq 실전 검증).
+        quality_done_min_iter = int(os.environ.get("QUALITY_DONE_MIN_ITER", "1000"))
+        quality_done_threshold = float(os.environ.get("QUALITY_DONE_LOSS_THRESHOLD", "0.0001"))
         _n_cam = max(1, train_dataset.camera_size)
-        # 비교 창은 최소 3에폭, 그리고 한쪽 창이 최소 ~500 iter 가 되도록 (카메라 적은 타일 보호)
-        quality_done_window = max(
-            int(os.environ.get("QUALITY_DONE_WINDOW_EPOCHS", "3")),
-            (500 + _n_cam - 1) // _n_cam,
-        )
+        _qd_pat_env = os.environ.get("QUALITY_DONE_PATIENCE", "").strip()
+        if _qd_pat_env:
+            quality_done_patience = int(_qd_pat_env)
+        else:
+            # patience = 카메라 수 power function (dnq: 2뷰→90에폭, 30뷰→20에폭, clamp[5,100])
+            import math as _math
+            _b = _math.log(90.0 / 20.0) / _math.log(2.0 / 30.0)
+            _a = 90.0 / (2.0 ** _b)
+            _cc = float(min(max(_n_cam, 2), 30))
+            quality_done_patience = max(5, min(int(_a * (_cc ** _b)), 100))
+        quality_best_epoch_loss = float("inf")
+        quality_best_epoch_num = 0
+        quality_epochs_since_improvement = 0
         quality_done_last_epoch = 0
-        quality_done_strikes = 0
-        quality_converged = False
         utils.print_rank_0(
-            f"[quality-done] enabled: min_iter={quality_done_min_iter}, "
-            f"window={quality_done_window} epochs x2, rel_eps={quality_done_rel_eps}, "
-            f"patience={quality_done_patience} (cameras={_n_cam})"
+            f"[quality-done] enabled (best+patience): min_iter={quality_done_min_iter}, "
+            f"threshold={quality_done_threshold}, patience={quality_done_patience} epochs "
+            f"(cameras={_n_cam}, epoch={_n_cam} iters)"
         )
     if args.adjust_strategy_warmp_iterations == -1:
         args.adjust_strategy_warmp_iterations = len(train_dataset.cameras)
@@ -2726,28 +2730,28 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 # Update Epoch Statistics
                 train_dataset.update_losses(batched_loss_cpu)
 
-                # Quality 기반 done: 새 에폭이 완성될 때마다 최근 K에폭 vs 직전 K에폭
-                # 평균 손실을 비교해 상대 개선율이 임계 미만이면(연속 patience 회) 조기 종료
+                # Quality 기반 done (dnq best+patience): 새로 완성된 에폭마다
+                # best 대비 threshold 이상 개선 여부를 판정, patience 에폭 연속 무개선이면 종료
                 if quality_done_enabled and len(train_dataset.epoch_loss) > quality_done_last_epoch:
-                    quality_done_last_epoch = len(train_dataset.epoch_loss)
                     _el = train_dataset.epoch_loss
-                    _K = quality_done_window
-                    if iteration >= quality_done_min_iter and len(_el) >= 2 * _K:
-                        _prev = float(sum(_el[-2 * _K:-_K])) / _K
-                        _last = float(sum(_el[-_K:])) / _K
-                        _improve = (_prev - _last) / max(abs(_prev), 1e-12)
-                        if _improve < quality_done_rel_eps:
-                            quality_done_strikes += 1
+                    for _e_idx in range(quality_done_last_epoch, len(_el)):
+                        _e_avg = float(_el[_e_idx])
+                        if _e_avg < quality_best_epoch_loss - quality_done_threshold:
+                            quality_best_epoch_loss = _e_avg
+                            quality_best_epoch_num = _e_idx + 1
+                            quality_epochs_since_improvement = 0
                         else:
-                            quality_done_strikes = 0
-                        utils.print_rank_0(
-                            f"[quality-done] epoch {quality_done_last_epoch} (iter {iteration}): "
-                            f"prev_loss={_prev:.6f} last_loss={_last:.6f} "
-                            f"improve={_improve * 100:.3f}% "
-                            f"strikes={quality_done_strikes}/{quality_done_patience}"
-                        )
-                        if quality_done_strikes >= quality_done_patience:
-                            quality_converged = True
+                            quality_epochs_since_improvement += 1
+                    quality_done_last_epoch = len(_el)
+                    utils.print_rank_0(
+                        f"[quality-done] epoch {quality_done_last_epoch} (iter {iteration}): "
+                        f"avg={float(_el[-1]):.6f} best={quality_best_epoch_loss:.6f}"
+                        f"@E{quality_best_epoch_num} "
+                        f"no_improve={quality_epochs_since_improvement}/{quality_done_patience}"
+                    )
+                    if (iteration >= quality_done_min_iter
+                            and quality_epochs_since_improvement >= quality_done_patience):
+                        quality_converged = True
                 if quality_done_enabled and quality_converged:
                     utils.print_rank_0(
                         f"\n[quality-done] CONVERGED at iteration {iteration} "
@@ -3141,6 +3145,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     "final_epoch_loss": (float(sum(_tail) / len(_tail)) if _tail else None),
                     "done_reason": "converged" if quality_converged else "iter_end",
                 }
+                if quality_done_enabled and quality_best_epoch_loss != float("inf"):
+                    done_info["best_epoch_loss"] = float(quality_best_epoch_loss)
+                    done_info["best_epoch_num"] = int(quality_best_epoch_num)
+                    done_info["patience_epochs"] = int(quality_done_patience)
                 with open(os.path.join(args.model_path, "done_info.json"), "w") as f:
                     json.dump(done_info, f, indent=2)
                 utils.print_rank_0(f"[adaptive-tile] done_info: {done_info}")

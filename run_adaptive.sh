@@ -390,15 +390,16 @@ fi
 export TRAIN_ADAPTIVE_NO_LOG=1
 
 # ============================================
-# Quality 기반 done (epoch loss 정체 감지 조기 종료)
+# Quality 기반 done — dnq ConvergenceDetector 방식 (best 에폭 평균 + patience)
 # ============================================
-# iter 상한(ITERATIONS)은 유지하되, densification 종료 후 에폭 평균 손실이
-# 정체하면 그 타일은 조기 done. 끄려면 QUALITY_DONE=0 으로 실행.
+# best 에폭 평균보다 threshold 이상 개선되는 에폭이 patience 회 연속 없으면 조기 done.
+# patience 빈 값 = 카메라 수 power function (2뷰→90에폭, 30뷰→20에폭).
+# iter 상한(에폭 캡)은 그대로 병행. 끄려면 QUALITY_DONE=0.
 export QUALITY_DONE="${QUALITY_DONE:-1}"
-export QUALITY_DONE_REL_EPS="${QUALITY_DONE_REL_EPS:-0.005}"   # 창 간 상대 개선율 임계 (0.5%)
-export QUALITY_DONE_PATIENCE="${QUALITY_DONE_PATIENCE:-2}"     # 연속 정체 판정 횟수
-export QUALITY_DONE_WINDOW_EPOCHS="${QUALITY_DONE_WINDOW_EPOCHS:-3}"  # 비교 창(에폭), 최소 500iter 보정됨
-echo "  Quality-based done: ${QUALITY_DONE} (rel_eps=${QUALITY_DONE_REL_EPS}, patience=${QUALITY_DONE_PATIENCE})"
+export QUALITY_DONE_LOSS_THRESHOLD="${QUALITY_DONE_LOSS_THRESHOLD:-0.0001}"  # 개선 인정 절대 임계
+export QUALITY_DONE_PATIENCE="${QUALITY_DONE_PATIENCE:-}"                    # 빈 값 = 카메라수 기반 자동
+export QUALITY_DONE_MIN_ITER="${QUALITY_DONE_MIN_ITER:-1000}"                # 검사 시작 iter
+echo "  Quality-based done: ${QUALITY_DONE} (best+patience, threshold=${QUALITY_DONE_LOSS_THRESHOLD}, patience=${QUALITY_DONE_PATIENCE:-auto-by-cams})"
 
 # Build command (use -u for unbuffered output to ensure logs appear immediately)
 CMD="python -u ${SCRIPT_DIR}/scripts/train_adaptive.py"
