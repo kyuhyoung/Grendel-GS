@@ -399,6 +399,7 @@ export QUALITY_DONE="${QUALITY_DONE:-1}"
 export QUALITY_DONE_LOSS_THRESHOLD="${QUALITY_DONE_LOSS_THRESHOLD:-0.0001}"  # 개선 인정 절대 임계
 export QUALITY_DONE_PATIENCE="${QUALITY_DONE_PATIENCE:-}"                    # 빈 값 = 카메라수 기반 자동
 export QUALITY_DONE_MIN_ITER="${QUALITY_DONE_MIN_ITER:-1000}"                # 검사 시작 iter
+export QUALITY_DONE_RESET_GRACE="${QUALITY_DONE_RESET_GRACE:-500}"           # opacity reset 후 카운트 제외 구간(iter)
 echo "  Quality-based done: ${QUALITY_DONE} (best+patience, threshold=${QUALITY_DONE_LOSS_THRESHOLD}, patience=${QUALITY_DONE_PATIENCE:-auto-by-cams})"
 
 # Build command (use -u for unbuffered output to ensure logs appear immediately)

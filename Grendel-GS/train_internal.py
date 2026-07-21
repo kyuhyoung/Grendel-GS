@@ -2104,6 +2104,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             _a = 60.0 / (2.0 ** _b)
             _cc = float(min(max(_n_cam, 2), 30))
             quality_done_patience = max(5, min(int(_a * (_cc ** _b)), 100))
+        # Opacity reset 직후 회복 구간은 무개선 카운트에서 제외 (grace).
+        # 리셋은 loss 를 인위적으로 튀게 하므로, 회복이 patience 보다 느리면
+        # 가짜 CONVERGED 가 발생 (7/21 iter 3240 실측). 회복 중 개선(기록 갱신)은 그대로 인정.
+        quality_done_reset_grace = int(os.environ.get("QUALITY_DONE_RESET_GRACE", "500"))
+        _qd_reset_interval = max(1, int(getattr(opt_args, "opacity_reset_interval", 3000)))
+        _qd_reset_until = int(getattr(opt_args, "opacity_reset_until_iter",
+                                      getattr(opt_args, "densify_until_iter", 15000)))
         quality_best_epoch_loss = float("inf")
         quality_best_epoch_num = 0
         quality_epochs_since_improvement = 0
@@ -2111,7 +2118,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         utils.print_rank_0(
             f"[quality-done] enabled (best+patience): min_iter={quality_done_min_iter}, "
             f"threshold={quality_done_threshold}, patience={quality_done_patience} epochs "
-            f"(cameras={_n_cam}, epoch={_n_cam} iters)"
+            f"(cameras={_n_cam}, epoch={_n_cam} iters), "
+            f"reset_grace={quality_done_reset_grace} iters after each opacity reset "
+            f"(interval={_qd_reset_interval}, until={_qd_reset_until})"
         )
     if args.adjust_strategy_warmp_iterations == -1:
         args.adjust_strategy_warmp_iterations = len(train_dataset.cameras)
@@ -2737,20 +2746,30 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 # best 대비 threshold 이상 개선 여부를 판정, patience 에폭 연속 무개선이면 종료
                 if quality_done_enabled and len(train_dataset.epoch_loss) > quality_done_last_epoch:
                     _el = train_dataset.epoch_loss
+                    _in_grace = False
                     for _e_idx in range(quality_done_last_epoch, len(_el)):
                         _e_avg = float(_el[_e_idx])
+                        # 이 에폭이 opacity reset 직후 grace 구간에 걸치는지
+                        _e_iter = (_e_idx + 1) * _n_cam
+                        _in_grace = (
+                            _e_iter >= _qd_reset_interval
+                            and (_e_iter % _qd_reset_interval) <= quality_done_reset_grace
+                            and _e_iter <= _qd_reset_until + quality_done_reset_grace
+                        )
                         if _e_avg < quality_best_epoch_loss - quality_done_threshold:
                             quality_best_epoch_loss = _e_avg
                             quality_best_epoch_num = _e_idx + 1
                             quality_epochs_since_improvement = 0
-                        else:
+                        elif not _in_grace:
                             quality_epochs_since_improvement += 1
+                        # grace 중 무개선 에폭은 카운트하지 않음 (회복 시간 보장)
                     quality_done_last_epoch = len(_el)
                     utils.print_rank_0(
                         f"[quality-done] epoch {quality_done_last_epoch} (iter {iteration}): "
                         f"avg={float(_el[-1]):.6f} best={quality_best_epoch_loss:.6f}"
                         f"@E{quality_best_epoch_num} "
                         f"no_improve={quality_epochs_since_improvement}/{quality_done_patience}"
+                        + (" (reset-grace)" if _in_grace else "")
                     )
                     if (iteration >= quality_done_min_iter
                             and quality_epochs_since_improvement >= quality_done_patience):
