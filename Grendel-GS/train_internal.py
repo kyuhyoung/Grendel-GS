@@ -2105,6 +2105,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         # patience 에폭 연속 없으면 조기 done. densification 게이트 없음 (dnq 실전 검증).
         quality_done_min_iter = int(os.environ.get("QUALITY_DONE_MIN_ITER", "1000"))
         quality_done_threshold = float(os.environ.get("QUALITY_DONE_LOSS_THRESHOLD", "0.0001"))
+        # 조기 졸업 품질 게이트 (opt-in): best 가 이 값 이하일 때만 converged 허용.
+        # 미설정(기본)이면 게이트 없음. 기준 미달 타일은 정체해도 상한까지 학습.
+        _qd_max_env = os.environ.get("QUALITY_DONE_MAX_LOSS", "").strip()
+        quality_done_max_loss = float(_qd_max_env) if _qd_max_env else None
         _n_cam = max(1, train_dataset.camera_size)
         _qd_pat_env = os.environ.get("QUALITY_DONE_PATIENCE", "").strip()
         if _qd_pat_env:
@@ -2787,7 +2791,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         + (" (reset-grace)" if _in_grace else "")
                     )
                     if (iteration >= quality_done_min_iter
-                            and quality_epochs_since_improvement >= quality_done_patience):
+                            and quality_epochs_since_improvement >= quality_done_patience
+                            and (quality_done_max_loss is None
+                                 or quality_best_epoch_loss <= quality_done_max_loss)):
                         quality_converged = True
                 if quality_done_enabled and quality_converged:
                     utils.print_rank_0(

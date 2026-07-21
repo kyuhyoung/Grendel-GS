@@ -812,6 +812,9 @@ class GaussianModel:
             tmp_dir = os.path.dirname(path) or "."
             fd, tmp_path = tempfile.mkstemp(prefix=".tmp_ply_", suffix=".ply", dir=tmp_dir)
             os.close(fd)
+            # mkstemp 는 umask 무시하고 항상 0600 으로 생성 — 이 모드가 os.replace 후
+            # 최종 PLY 에 남아 호스트 일반 계정이 못 읽는 문제(7/20)의 근본 원인.
+            os.chmod(tmp_path, 0o644)
             PlyData([el]).write(tmp_path)
             # fsync to reduce chance of partial file after abrupt termination
             try:
