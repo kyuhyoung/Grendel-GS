@@ -1183,8 +1183,9 @@ def save_debug_images(
 
         cam_name = camera.image_name.replace("/", "_").replace("\\", "_")
         num_visible = getattr(args, '_num_visible_cameras', 0)
-        # Format: tile_xxxx_view_NN_of_MM_cam_zzzz_gpuW_compare.png
-        prefix = f"{tile_id}_view{iteration:02d}of{num_visible:02d}_cam{cam_name}_gpu{rank}"
+        # Format: tile_xxxx_iterNNNNN_camsMM_cam_zzzz_gpuW_compare.png
+        # (구명 viewNNofMM 은 "MM 뷰 중 NN번째"로 오독됨 — NN 은 iteration 이었음)
+        prefix = f"{tile_id}_iter{iteration:05d}_cams{num_visible:02d}_cam{cam_name}_gpu{rank}"
 
         # Combine GT (left/top) and Rendered (right/bottom) into single image
         local_rendered_clamped = local_rendered.clamp(0.0, 1.0).cpu()
