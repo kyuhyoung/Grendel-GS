@@ -55,9 +55,10 @@ EXPLOSIVE_DENSIFICATION=false
 #EXPLOSIVE_DENSIFICATION=true
 # Densification params (will be overridden if EXPLOSIVE_DENSIFICATION=true)
 DENSIFY_FROM_ITER=500
-DENSIFICATION_INTERVAL=100
-DENSIFY_GRAD_THRESHOLD=0.0002
-CHILD_DENSIFY_GRAD_THRESHOLD="0.0002"   # resume 자식 전용 threshold (빈 값 = 부모와 동일)
+# 아래 셋은 환경변수로 덮어쓰기 가능 (프로브/실험용)
+DENSIFICATION_INTERVAL="${DENSIFICATION_INTERVAL:-100}"
+DENSIFY_GRAD_THRESHOLD="${DENSIFY_GRAD_THRESHOLD:-0.0002}"
+CHILD_DENSIFY_GRAD_THRESHOLD="${CHILD_DENSIFY_GRAD_THRESHOLD:-0.0002}"   # resume 자식 전용 threshold (빈 값 = 부모와 동일)
 
 # Debug image saving (for off-center projection verification)
 # Set to comma-separated iterations, e.g., "1,100,500,1000" or empty to use defaults
