@@ -43,6 +43,7 @@ NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 GPU_IDS="0,1"  # Container maps physical GPUs to 0,1
 ITERATIONS=30000
 EPOCH_CAP=300    # 타일별 상한 = 300에폭 × 카메라수 (과적합 방지, 0=끄기)
+SCHEDULE_ALIGN=true  # densify/opacity 스케줄을 타일 학습량에 비례 정렬 (후반 refinement 확보)
 BACKEND="default"
 BSZ=1
 TILE_CROP_MARGIN=100
@@ -414,6 +415,9 @@ CMD+=" --output_path ${OUTPUT_PATH}"
 CMD+=" --num_gpus ${NUM_GPUS}"
 CMD+=" --iterations ${ITERATIONS}"
 CMD+=" --epoch_cap ${EPOCH_CAP}"
+if [[ "${SCHEDULE_ALIGN}" != true ]]; then
+    CMD+=" --disable_schedule_align"
+fi
 CMD+=" --backend ${BACKEND}"
 CMD+=" --bsz ${BSZ}"
 CMD+=" --tile_crop_margin ${TILE_CROP_MARGIN}"

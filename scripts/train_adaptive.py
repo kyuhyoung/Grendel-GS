@@ -189,6 +189,30 @@ def effective_tile_iterations(base_iterations: int, num_cameras: int,
     return min(base_iterations, cap)
 
 
+def aligned_schedule(eff_iterations: int):
+    """타일 학습량(eff_iterations)에 densify/opacity 스케줄을 비례 정렬.
+
+    표준 3DGS(30k) 비율을 그대로 적용:
+      densify_from = 500/30000, densify_until = 15000/30000(=0.5),
+      opacity_reset_interval = 3000/30000(=0.1).
+    eff=30000 이면 정확히 vanilla 값으로 환원(sanity).
+
+    핵심 효과: densify_until = eff/2 로 두어 학습 후반(eff/2 ~ eff)이
+    densification·opacity reset 이 꺼진 **정련(refinement) 단계**가 되게 함.
+    기존에는 densify_until 기본값 15000 > eff 라 짧은 타일은 정련 단계가
+    전혀 없었음(큰 loss 하락이 일어나는 구간을 통째로 놓침).
+
+    Returns: (densify_from, densify_until, opacity_reset_interval)
+    """
+    frac = eff_iterations / 30000.0
+    densify_from = max(int(round(500 * frac)), 100)
+    densify_until = int(round(15000 * frac))
+    opacity_reset = max(int(round(3000 * frac)), 500)
+    # densify_from < densify_until 보장
+    densify_from = min(densify_from, max(densify_until - 100, 1))
+    return densify_from, densify_until, opacity_reset
+
+
 def find_final_tile_ply(output_path, tile_id: str):
     """완료 타일의 최종 point_cloud PLY 경로 (없으면 None).
 
@@ -1760,9 +1784,23 @@ class AdaptiveTileTrainer:
 
         # Ensure densify_from_iter is at least 2x the number of visible cameras
         num_visible = len(visible_cameras) if visible_cameras else 1
-        effective_densify_from = max(self.args.densify_from_iter, 2 * num_visible)
-        if effective_densify_from != self.args.densify_from_iter:
-            print(f"  [Adjusted densify_from_iter: {self.args.densify_from_iter} -> {effective_densify_from} (2 x {num_visible} cameras)]")
+
+        # 스케줄 정렬: densify/opacity 를 타일 학습량에 비례 (refinement 단계 확보)
+        if not getattr(self.args, "disable_schedule_align", False):
+            sd_from, sd_until, op_reset = aligned_schedule(eff_iterations)
+            effective_densify_from = max(sd_from, 2 * num_visible)
+            effective_densify_until = sd_until
+            effective_opacity_reset = op_reset
+            print(f"  [schedule-align] densify_from={effective_densify_from} "
+                  f"densify_until={effective_densify_until} "
+                  f"opacity_reset_interval={effective_opacity_reset} "
+                  f"(refinement: {effective_densify_until}~{eff_iterations})", flush=True)
+        else:
+            effective_densify_from = max(self.args.densify_from_iter, 2 * num_visible)
+            effective_densify_until = self.args.densify_until_iter
+            effective_opacity_reset = self.args.opacity_reset_interval
+            if effective_densify_from != self.args.densify_from_iter:
+                print(f"  [Adjusted densify_from_iter: {self.args.densify_from_iter} -> {effective_densify_from} (2 x {num_visible} cameras)]")
 
         cmd = [
             "torchrun",
@@ -1785,6 +1823,8 @@ class AdaptiveTileTrainer:
             "--tile_crop_margin", str(self.args.tile_crop_margin),
             "--ndc_limit", str(self.args.ndc_limit),
             "--densify_from_iter", str(effective_densify_from),
+            "--densify_until_iter", str(effective_densify_until),
+            "--opacity_reset_interval", str(effective_opacity_reset),
             "--densification_interval", str(self.args.densification_interval),
             "--densify_grad_threshold", str(
                 self.args.child_densify_grad_threshold
@@ -2621,6 +2661,13 @@ def parse_args():
                         help="Start densification from this iteration (default: 500)")
     parser.add_argument("--densification_interval", type=int, default=100,
                         help="Densification interval (default: 100)")
+    parser.add_argument("--densify_until_iter", type=int, default=15000,
+                        help="Densification 종료 iter (schedule_align 시 무시됨)")
+    parser.add_argument("--opacity_reset_interval", type=int, default=3000,
+                        help="Opacity reset 주기 (schedule_align 시 무시됨)")
+    parser.add_argument("--disable_schedule_align", action="store_true",
+                        help="densify/opacity 스케줄을 타일 학습량에 비례 정렬하지 않음 "
+                             "(기본: 정렬 ON — 후반 refinement 단계 확보)")
     parser.add_argument("--epoch_cap", type=int, default=300,
                         help="타일별 iteration 상한 = epoch_cap × 카메라 수 (하한 1500). "
                              "카메라 적은 타일의 과적합 방지. 0=비활성 "
