@@ -2790,7 +2790,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         f"no_improve={quality_epochs_since_improvement}/{quality_done_patience}"
                         + (" (reset-grace)" if _in_grace else "")
                     )
+                    # opacity reset 가 아직 활성인 구간에서는 converged 금지:
+                    # reset 직후 저장하면 opacity 가 리셋된(투명) 상태로 굳어 타일이
+                    # 검게 나옴(2026-07-22 실측). reset 이 멈춘 refinement 구간에서만 허용.
+                    _past_resets = iteration > _qd_reset_until
                     if (iteration >= quality_done_min_iter
+                            and _past_resets
                             and quality_epochs_since_improvement >= quality_done_patience
                             and (quality_done_max_loss is None
                                  or quality_best_epoch_loss <= quality_done_max_loss)):
