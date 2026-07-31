@@ -156,7 +156,7 @@ def save_per_rank_cat3_viz(
         )
         fig.tight_layout()
 
-        path = out_dir / f"cat3_iter{iteration}_tile{tile_id}_rank{rank}.png"
+        path = out_dir / f"cat3_iter{iteration}_{tile_id}_rank{rank}.png"
         fig.savefig(path, dpi=110)
         plt.close(fig)
         return str(path)
@@ -596,7 +596,7 @@ def save_resume_viz(
         fig.tight_layout()
 
         suffix = f"_iter{iteration}" if iteration is not None else ""
-        path = out_dir / f"resume_tile{tile_id}{suffix}_rank{rank}.png"
+        path = out_dir / f"resume_{tile_id}{suffix}_rank{rank}.png"
         fig.savefig(path, dpi=110)
         plt.close(fig)
         return str(path)

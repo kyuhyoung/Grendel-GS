@@ -73,27 +73,40 @@ def check_gaussians_visibility(gaussian_xyz, cameras, verbose=True):
         if not np.any(valid_depth):
             continue
 
-        # Get intrinsics from FoV
-        fx = W / (2 * np.tan(cam.FoVx / 2))
-        fy = H / (2 * np.tan(cam.FoVy / 2))
-        # Use actual principal point if available (for off-center/cropped cameras)
-        cx = cam._cx if hasattr(cam, '_cx') and cam._cx is not None else W / 2
-        cy = cam._cy if hasattr(cam, '_cy') and cam._cy is not None else H / 2
+        # Get intrinsics from FoV.
+        # 크롭 카메라 주의: cam.FoVx/FoVy 와 _cx/_cy 는 원본(full) 이미지 기준이고
+        # W/H 는 크롭 크기다. 좌표계를 섞으면 안 되므로, 크롭 카메라는
+        # full-image 픽셀 좌표로 투영한 뒤 crop 경계 [x_min, x_max) 로 판정한다.
+        crop = getattr(cam, '_crop_info', None)
+        if crop is not None:
+            full_w = getattr(cam, '_orig_width', W)
+            full_h = getattr(cam, '_orig_height', H)
+            fx = full_w / (2 * np.tan(cam.FoVx / 2))
+            fy = full_h / (2 * np.tan(cam.FoVy / 2))
+            cx = cam._cx if getattr(cam, '_cx', None) is not None else full_w / 2
+            cy = cam._cy if getattr(cam, '_cy', None) is not None else full_h / 2
+            x_lo, x_hi = crop.x_min, crop.x_max
+            y_lo, y_hi = crop.y_min, crop.y_max
+        else:
+            fx = W / (2 * np.tan(cam.FoVx / 2))
+            fy = H / (2 * np.tan(cam.FoVy / 2))
+            cx = cam._cx if getattr(cam, '_cx', None) is not None else W / 2
+            cy = cam._cy if getattr(cam, '_cy', None) is not None else H / 2
+            x_lo, x_hi, y_lo, y_hi = 0, W, 0, H
 
-        if verbose and utils.GLOBAL_RANK == 0:
-            is_offcenter = (hasattr(cam, '_cx') and cam._cx is not None)
-            if is_offcenter:
-                print(f"[visibility-check] Camera {cam.image_name}: W={W}, H={H}, cx={cx:.1f}, cy={cy:.1f} (off-center)", flush=True)
+        if verbose and utils.GLOBAL_RANK == 0 and crop is not None:
+            print(f"[visibility-check] Camera {cam.image_name}: crop=({x_lo},{y_lo})-({x_hi},{y_hi}), "
+                  f"fx={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (full-image coords)", flush=True)
 
-        # Project to 2D
+        # Project to 2D (full-image pixel coords for cropped cameras)
         x_2d = (xyz_cam[:, 0] / xyz_cam[:, 2]) * fx + cx
         y_2d = (xyz_cam[:, 1] / xyz_cam[:, 2]) * fy + cy
 
-        # Check if within image bounds (the camera has already been cropped)
+        # Check if within the region this camera actually renders
         in_bounds = (
             valid_depth &
-            (x_2d >= 0) & (x_2d < W) &
-            (y_2d >= 0) & (y_2d < H)
+            (x_2d >= x_lo) & (x_2d < x_hi) &
+            (y_2d >= y_lo) & (y_2d < y_hi)
         )
 
         visible_mask |= in_bounds

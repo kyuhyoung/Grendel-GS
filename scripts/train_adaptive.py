@@ -1038,7 +1038,9 @@ class AdaptiveTileTrainer:
         self._save_state()
 
     def _next_tile_id(self) -> str:
-        tile_id = f"tile_{self.tile_counter:04d}"
+        # 8자리 고정폭: ID 는 부모×2+1 이라 레벨마다 2배로 커진다(level 8 에서 이미
+        # 33954). 4자리면 자릿수가 섞여 정렬이 깨지므로 level 26 까지 안전한 8자리로 둔다.
+        tile_id = f"tile_{self.tile_counter:08d}"
         self.tile_counter += 1
         return tile_id
 
@@ -1402,7 +1404,8 @@ class AdaptiveTileTrainer:
             # Font size based on tile size (1.5x larger)
             font_size = min(12, max(7.5, min(bbox.size[0], bbox.size[1]) / 50 * 1.5))
 
-            label_text = tile_id.replace("tile_", "")
+            # ID 가 8자리 고정폭이라 그대로 쓰면 "00000015" 로 라벨이 지저분해짐 → 앞 0 제거
+            label_text = tile_id.replace("tile_", "").lstrip("0") or "0"
             if tile_id == current_tile_id:
                 label_text = f"► {label_text} ◄"
                 font_size = 15
@@ -1536,7 +1539,8 @@ class AdaptiveTileTrainer:
     def _visualize_split_tree(self):
         """타일 분할 트리 (parent → children) PNG 저장.
 
-        타일 ID 규칙 ``tile_{N:04d}`` 기준으로 부모(``(N-1)//2``)를 추론.
+        타일 ID 규칙 ``tile_{N:08d}`` 기준으로 부모(``(N-1)//2``)를 추론.
+        (자릿수는 표기용일 뿐 파싱은 int 변환이라 폭에 무관)
         노드 색상은 status / oom_category, 라벨에 fail_iter, num_cameras 표시.
         """
         if not self.tiles:
@@ -2460,7 +2464,7 @@ class AdaptiveTileTrainer:
                                 rank_files = [p for p in rank_files if Path(p).exists()]
                                 if not rank_files:
                                     continue
-                                out_png = viz_dir / f"cat3_iter{iter_for_viz}_tile{tile_id_for_viz}_child{child_label}_merged.png"
+                                out_png = viz_dir / f"cat3_iter{iter_for_viz}_{tile_id_for_viz}_child{child_label}_merged.png"
                                 save_merged_cat3_viz(
                                     rank_files,
                                     iteration=iter_for_viz,

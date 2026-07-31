@@ -780,8 +780,8 @@ def handle_oom_signal_from_other_rank(
         return False
     # Use same tile ID generation as handle_adaptive_tile_oom()
     tile_num = int(tile_id.split("_")[-1]) if "_" in tile_id else 0
-    tile_a_id = f"tile_{tile_num * 2 + 1:04d}"
-    tile_b_id = f"tile_{tile_num * 2 + 2:04d}"
+    tile_a_id = f"tile_{tile_num * 2 + 1:08d}"
+    tile_b_id = f"tile_{tile_num * 2 + 2:08d}"
 
     # Use the signal iteration for file naming (matches signaling rank's files)
     use_iteration = signal_iteration
@@ -1506,8 +1506,8 @@ def handle_adaptive_tile_oom(
 
     # Generate new tile IDs
     tile_num = int(tile_id.split("_")[-1]) if "_" in tile_id else 0
-    tile_a_id = f"tile_{tile_num * 2 + 1:04d}"
-    tile_b_id = f"tile_{tile_num * 2 + 2:04d}"
+    tile_a_id = f"tile_{tile_num * 2 + 1:08d}"
+    tile_b_id = f"tile_{tile_num * 2 + 2:08d}"
 
     # Determine OOM category
     has_pretrained = bool(getattr(args, "pretrained_ply", ""))
@@ -2134,6 +2134,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         quality_best_epoch_num = 0
         quality_epochs_since_improvement = 0
         quality_done_last_epoch = 0
+        # best epoch 의 가우시안 CPU 스냅샷 (종료 시 final 대신 이걸 저장).
+        # converge 는 best 이후 patience 만큼 지나 멈추므로 final 이 best 보다 살짝 나쁨.
+        # refinement 구간(reset 종료 후)에서만 스냅샷 → 개수 고정 + densify 구간의 잦은 복사 방지.
+        quality_best_snapshot = None
         utils.print_rank_0(
             f"[quality-done] enabled (best+patience): min_iter={quality_done_min_iter}, "
             f"threshold={quality_done_threshold}, patience={quality_done_patience} epochs "
@@ -2230,8 +2234,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 # Generate new tile IDs
                 tile_num = int(current_tile_id.split("_")[-1]) if "_" in current_tile_id else 0
                 base_id = "_".join(current_tile_id.split("_")[:-1]) if "_" in current_tile_id else "tile"
-                tile_a_id = f"{base_id}_{(tile_num * 2 + 1):04d}"
-                tile_b_id = f"{base_id}_{(tile_num * 2 + 2):04d}"
+                tile_a_id = f"{base_id}_{(tile_num * 2 + 1):08d}"
+                tile_b_id = f"{base_id}_{(tile_num * 2 + 2):08d}"
                 
                 print(f"[robust-oom] Rank {rank} saving split tiles: {tile_a_id}, {tile_b_id}", flush=True)
                 
@@ -2269,6 +2273,54 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     )
                 except Exception as viz_e:
                     print(f"[robust-oom] Rank {rank} viz skipped: {viz_e}", flush=True)
+
+            # adaptive_tile_state.json fallback 기록 (2026-07-24 실측 버그 수정).
+            # 이 콜백은 robust-oom monitor 스레드에서 실행되고 직후 os._exit(42) 로
+            # 프로세스를 죽인다. 그래서 메인스레드의 handle_adaptive_tile_oom 이 state 를
+            # 쓰기 전에 사살되는 레이스가 실제로 발생했다 — tile_1056 은 자식 PLY
+            # 774만 가우시안을 정상 저장하고도 state 가 없어 분할이 무산되고 타일이
+            # failed 로, PLY 는 고아가 됐다 (이 런의 Cat3 OOM 17회 중 1회).
+            # 메인스레드가 이미 썼다면 건드리지 않는다 (카테고리 판정은 그쪽이 정확).
+            try:
+                if tile_bbox_str is not None and (count_a + count_b) > 0:
+                    _state_file = Path(
+                        getattr(args, "tile_state_file", "")
+                        or (tile_output_dir / "adaptive_tile_state.json")
+                    )
+                    if not _state_file.exists():
+                        _pfx_a = str(tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{iteration}")
+                        _pfx_b = str(tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{iteration}")
+                        _state = {
+                            "oom_occurred": True,
+                            "oom_cause": "Increased gaussians from densification",
+                            # 자식 PLY 가 저장됐다는 것 자체가 Cat3(resume 가능) 신호
+                            "oom_category": 3,
+                            "original_tile_id": current_tile_id,
+                            "original_tile_bbox": tile_bbox.to_string(),
+                            "iteration": iteration,
+                            "num_ranks": utils.WORLD_SIZE,
+                            "tile_a": {
+                                "tile_id": tile_a_id,
+                                "bbox": tile_a.to_string(),
+                                "ply_path": _pfx_a if count_a > 0 else None,
+                                "ply_is_prefix": True,
+                                "gaussian_count_local": int(count_a),
+                                "status": "pending",
+                            },
+                            "tile_b": {
+                                "tile_id": tile_b_id,
+                                "bbox": tile_b.to_string(),
+                                "ply_path": _pfx_b if count_b > 0 else None,
+                                "ply_is_prefix": True,
+                                "gaussian_count_local": int(count_b),
+                                "status": "pending",
+                            },
+                        }
+                        with open(_state_file, "w") as _f:
+                            json.dump(_state, _f, indent=2)
+                        print(f"[robust-oom] Rank {rank} wrote FALLBACK OOM state -> {_state_file}", flush=True)
+            except Exception as _se:
+                print(f"[robust-oom] Rank {rank} WARNING: fallback state write failed: {_se}", flush=True)
 
             # Write done file for robust handler so wrapper can wait/merge
             try:
@@ -2353,6 +2405,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         range(1, opt_args.iterations + 1),
         desc="Training progress",
         disable=(utils.LOCAL_RANK != 0),
+        # 로그 파일(비-TTY)에서는 tqdm 이 매 갱신마다 새 줄을 찍어 로그의 41% 를
+        # 진행바가 차지했다(2026-07-24). 최소 10초 간격 + 100 iter 마다로 억제.
+        # 터미널에서는 캐리지리턴으로 제자리 갱신되므로 체감 차이 없음.
+        mininterval=10.0,
+        miniters=100,
     )
     progress_bar.update(start_from_this_iteration - 1)
     num_trained_batches = 0
@@ -2766,6 +2823,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 if quality_done_enabled and len(train_dataset.epoch_loss) > quality_done_last_epoch:
                     _el = train_dataset.epoch_loss
                     _in_grace = False
+                    _best_updated = False
                     for _e_idx in range(quality_done_last_epoch, len(_el)):
                         _e_avg = float(_el[_e_idx])
                         # 이 에폭이 opacity reset 직후 grace 구간에 걸치는지
@@ -2779,10 +2837,24 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             quality_best_epoch_loss = _e_avg
                             quality_best_epoch_num = _e_idx + 1
                             quality_epochs_since_improvement = 0
+                            _best_updated = True
                         elif not _in_grace:
                             quality_epochs_since_improvement += 1
                         # grace 중 무개선 에폭은 카운트하지 않음 (회복 시간 보장)
                     quality_done_last_epoch = len(_el)
+                    # best 가 이번에 갱신됐고 refinement 구간(densify/reset 종료 후)이면
+                    # 현재 가우시안을 CPU 스냅샷. 종료 시 이 스냅샷을 final 대신 저장.
+                    # iter > _qd_reset_until → densify 끝나 개수 고정 (restore 시 shape 일치 보장).
+                    if _best_updated and iteration > _qd_reset_until:
+                        with torch.no_grad():
+                            quality_best_snapshot = {
+                                "xyz": gaussians._xyz.detach().cpu(),
+                                "features_dc": gaussians._features_dc.detach().cpu(),
+                                "features_rest": gaussians._features_rest.detach().cpu(),
+                                "opacity": gaussians._opacity.detach().cpu(),
+                                "scaling": gaussians._scaling.detach().cpu(),
+                                "rotation": gaussians._rotation.detach().cpu(),
+                            }
                     utils.print_rank_0(
                         f"[quality-done] epoch {quality_done_last_epoch} (iter {iteration}): "
                         f"avg={float(_el[-1]):.6f} best={quality_best_epoch_loss:.6f}"
@@ -2793,7 +2865,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     # opacity reset 가 아직 활성인 구간에서는 converged 금지:
                     # reset 직후 저장하면 opacity 가 리셋된(투명) 상태로 굳어 타일이
                     # 검게 나옴(2026-07-22 실측). reset 이 멈춘 refinement 구간에서만 허용.
-                    _past_resets = iteration > _qd_reset_until
+                    #
+                    # grace 를 반드시 더해야 한다(2026-07-24 실측): aligned_schedule 이
+                    # densify_until=15000*frac, opacity_reset=3000*frac 을 주므로 비가 정확히 5,
+                    # 즉 마지막 reset 이 densify_until 에 정확히 떨어진다. 그런데
+                    # _qd_reset_until = densify_until + bsz 라 게이트가 reset 겨우 2 iter 뒤에
+                    # 열렸고, patience 가 이미 포화된 타일은 즉시 발화해 리셋된(투명) 상태로
+                    # 저장됐다. 실측: tile_16980 이 reset(5400) 18 iter 뒤인 5418 에 converged,
+                    # 저장 PLY 516만개 전부 sigmoid(opacity)<0.46 (정상 타일은 max=1.0).
+                    _past_resets = iteration > _qd_reset_until + quality_done_reset_grace
                     if (iteration >= quality_done_min_iter
                             and _past_resets
                             and quality_epochs_since_improvement >= quality_done_patience
@@ -3175,6 +3255,32 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         utils.print_rank_0(
             f"[adaptive-tile] Training complete — saving final gaussians at iteration {final_iteration}"
         )
+        # best epoch 스냅샷이 있으면 final 대신 그걸 저장 (converge 는 best 뒤 patience 만큼
+        # 지나 멈추므로 final 이 best 보다 살짝 나쁨). 모든 rank 가 각자 로컬 스냅샷을 복원한 뒤
+        # scene.save(collective) 를 호출해야 하므로 rank guard 금지. shape 일치할 때만 복원.
+        _best_snap = locals().get("quality_best_snapshot", None)
+        if _best_snap is not None:
+            try:
+                with torch.no_grad():
+                    _dev = gaussians._xyz.device
+                    if gaussians._xyz.shape[0] == _best_snap["xyz"].shape[0]:
+                        gaussians._xyz.data = _best_snap["xyz"].to(_dev)
+                        gaussians._features_dc.data = _best_snap["features_dc"].to(_dev)
+                        gaussians._features_rest.data = _best_snap["features_rest"].to(_dev)
+                        gaussians._opacity.data = _best_snap["opacity"].to(_dev)
+                        gaussians._scaling.data = _best_snap["scaling"].to(_dev)
+                        gaussians._rotation.data = _best_snap["rotation"].to(_dev)
+                        utils.print_rank_0(
+                            f"[quality-done] restored BEST snapshot "
+                            f"(epoch {quality_best_epoch_num}, loss {quality_best_epoch_loss:.6f}) for final save"
+                        )
+                    else:
+                        utils.print_rank_0(
+                            f"[quality-done] WARNING: best snapshot count mismatch "
+                            f"({_best_snap['xyz'].shape[0]} vs {gaussians._xyz.shape[0]}) — saving final state"
+                        )
+            except Exception as _be:
+                utils.print_rank_0(f"[quality-done] best snapshot restore failed ({_be}) — saving final state")
         torch.cuda.empty_cache()
         scene.save(final_iteration)
         log_file.write(
@@ -3193,6 +3299,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     "final_epoch_loss": (float(sum(_tail) / len(_tail)) if _tail else None),
                     "done_reason": "converged" if quality_converged else "iter_end",
                 }
+                # 실제 저장된 상태가 best 스냅샷인지(=best_epoch_loss 가 저장분의 loss)
+                done_info["saved_best_snapshot"] = bool(locals().get("quality_best_snapshot", None) is not None)
                 if quality_done_enabled and quality_best_epoch_loss != float("inf"):
                     done_info["best_epoch_loss"] = float(quality_best_epoch_loss)
                     done_info["best_epoch_num"] = int(quality_best_epoch_num)

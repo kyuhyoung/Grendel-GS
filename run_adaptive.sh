@@ -409,6 +409,21 @@ export QUALITY_DONE_RESET_GRACE="${QUALITY_DONE_RESET_GRACE:-500}"           # o
 export QUALITY_DONE_MAX_LOSS="${QUALITY_DONE_MAX_LOSS:-}"                    # 조기 졸업 품질 게이트 (빈 값=끔, 예: 0.08)
 echo "  Quality-based done: ${QUALITY_DONE} (best+patience, threshold=${QUALITY_DONE_LOSS_THRESHOLD}, patience=${QUALITY_DONE_PATIENCE:-auto-by-cams})"
 
+# fused SSIM (Taming 3DGS): 동일 수식의 융합 커널. 0=기존 pixelwise 경로.
+# import 실패/런타임 오류 시 코드가 자동으로 기존 경로로 폴백하므로 켜두는 것이 기본.
+export FUSED_SSIM="${FUSED_SSIM:-1}"
+echo "  Fused SSIM: ${FUSED_SSIM}"
+
+# CUDA 캐싱 할당자 파편화 완화 (2026-07-24 실측 근거).
+#   증상: OOM 시점에 allocated 16.8GB / reserved 22.9GB / free 51MB — 실사용은 16.8GB 인데
+#         6GB 가 조각나 못 쓰는 상태로, 1.1GB 요청이 실패해 "Cat 2 단편화 OOM" 이 반복됐다.
+#   max_split_size_mb        : 이보다 큰 블록은 쪼개지 않아 대형(≈1GB) 할당 자리를 보존
+#   garbage_collection_threshold : reserved 가 용량의 80% 를 넘으면 OOM 을 기다리지 않고 선제 회수
+#   ※ expandable_segments 는 torch 2.0.0 에서 미지원(Unrecognized option) — 실측 확인함.
+#   효과가 없거나 역효과면 PYTORCH_CUDA_ALLOC_CONF= (빈 값) 으로 끄면 된다.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF-garbage_collection_threshold:0.8,max_split_size_mb:512}"
+echo "  CUDA alloc conf: ${PYTORCH_CUDA_ALLOC_CONF:-(off)}"
+
 # Build command (use -u for unbuffered output to ensure logs appear immediately)
 CMD="python -u ${SCRIPT_DIR}/scripts/train_adaptive.py"
 CMD+=" --source_path ${SOURCE_PATH}"

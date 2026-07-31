@@ -1474,7 +1474,7 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
                     "pts_max": pts_max,
                     "pts": pts.tolist() if n_pts > 0 else [],
                 }
-                dump_path = dump_dir / f"scalar_iter{cur_iter}_tile{tile_id}_cam{cam_name}_rk{utils.GLOBAL_RANK}.json"
+                dump_path = dump_dir / f"scalar_iter{cur_iter}_{tile_id}_cam{cam_name}_rk{utils.GLOBAL_RANK}.json"
                 with open(dump_path, "w") as f:
                     json.dump(dump, f)
             # Optional PNG visualization when points are very few
@@ -1510,7 +1510,7 @@ def render_final(batched_screenspace_pkg, batched_strategies, tile_size=16):
                         py = int(y * scale)
                         r = 2
                         draw.ellipse((px - r, py - r, px + r, py + r), fill=(255, 0, 0))
-                fname = f"scalar_iter{cur_iter}_tile{tile_id}_cam{cam_name}_rk{utils.GLOBAL_RANK}.png"
+                fname = f"scalar_iter{cur_iter}_{tile_id}_cam{cam_name}_rk{utils.GLOBAL_RANK}.png"
                 out_path = vis_dir / fname
                 try:
                     canvas.save(str(out_path))

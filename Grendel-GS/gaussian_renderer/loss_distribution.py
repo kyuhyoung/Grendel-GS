@@ -1,7 +1,7 @@
 import torch
 import utils.general_utils as utils
 import torch.distributed as dist
-from utils.loss_utils import pixelwise_l1_with_mask, pixelwise_ssim_with_mask
+from utils.loss_utils import pixelwise_l1_with_mask, pixelwise_ssim_with_mask, fused_ssim_sum
 import time
 import diff_gaussian_rasterization
 
@@ -2570,10 +2570,16 @@ def final_system_loss_computation(
     )
     Ll1 = pixelwise_Ll1.sum() / (utils.get_num_pixels() * 3)
     # utils.check_initial_gpu_memory_usage("after l1_loss")
-    pixelwise_ssim_loss = pixelwise_ssim_with_mask(
-        local_image_rect, local_image_rect_gt, local_image_rect_pixels_compute_locally
-    )
-    ssim_loss = pixelwise_ssim_loss.sum() / (utils.get_num_pixels() * 3)
+    # fused SSIM 경로 (FUSED_SSIM=1): 이 함수의 마스크는 all-ones 라 sum-동치 계산 가능.
+    # None 반환 시(비활성/제약 위반/런타임 오류) 기존 pixelwise 경로로 폴백.
+    _fused_sum = fused_ssim_sum(local_image_rect, local_image_rect_gt)
+    if _fused_sum is not None:
+        ssim_loss = _fused_sum / (utils.get_num_pixels() * 3)
+    else:
+        pixelwise_ssim_loss = pixelwise_ssim_with_mask(
+            local_image_rect, local_image_rect_gt, local_image_rect_pixels_compute_locally
+        )
+        ssim_loss = pixelwise_ssim_loss.sum() / (utils.get_num_pixels() * 3)
 
     torch.cuda.synchronize()
     statistic_collector["forward_loss_time"] = (time.time() - start_time) * 1000
@@ -2584,6 +2590,20 @@ def final_system_loss_computation(
 
     # DEBUG: Print loss details
     cur_iter = utils.get_cur_iter()
+
+    # [loss-timing] fused SSIM 실전 이득 측정용 (2026-07-24 추가).
+    # forward_loss_time 은 L1+SSIM 계산에 걸린 ms. L1 경로는 변하지 않으므로
+    # legacy 런과 fused 런의 이 값 차이가 곧 SSIM 개선폭이다.
+    # 위에서 이미 synchronize 한 값을 재사용하므로 추가 오버헤드 없음.
+    if cur_iter is not None and cur_iter % 100 == 0 and utils.LOCAL_RANK == 0:
+        print(
+            f"[loss-timing] iter={cur_iter} forward_loss="
+            f"{statistic_collector['forward_loss_time']:.1f}ms "
+            f"({local_image_rect.shape[-2]}x{local_image_rect.shape[-1]}, "
+            f"fused_ssim={_fused_sum is not None})",
+            flush=True,
+        )
+
     total_loss = (1.0 - args.lambda_dssim) * Ll1 + args.lambda_dssim * (1.0 - ssim_loss)
 
     # Print every 500 iterations OR when loss is suspicious (close to 0.2)
@@ -2684,7 +2704,7 @@ def batched_loss_computation(
                 # Overlay minimal text
                 text = f"LOSS-ZERO\\niter={cur_iter} rank={utils.GLOBAL_RANK}\\ntile={tile_id}\\ncam={camera.image_name}"
                 draw.text((10, 10), text, fill=(0, 0, 0))
-                fname = f"losszero_iter{cur_iter}_tile{tile_id}_cam{camera.image_name}_rk{utils.GLOBAL_RANK}.png"
+                fname = f"losszero_iter{cur_iter}_{tile_id}_cam{camera.image_name}_rk{utils.GLOBAL_RANK}.png"
                 out_path = vis_dir / fname
                 try:
                     canvas.save(str(out_path))
@@ -2709,7 +2729,7 @@ def batched_loss_computation(
                     "img_h": int(cam_h),
                     "note": "loss-zero scalar image; no rendered pixels",
                 }
-                meta_path = vis_dir / f"losszero_iter{cur_iter}_tile{tile_id}_cam{camera.image_name}_rk{utils.GLOBAL_RANK}.json"
+                meta_path = vis_dir / f"losszero_iter{cur_iter}_{tile_id}_cam{camera.image_name}_rk{utils.GLOBAL_RANK}.json"
                 try:
                     with open(meta_path, "w") as f:
                         json.dump(meta, f)

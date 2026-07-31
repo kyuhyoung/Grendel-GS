@@ -103,7 +103,7 @@ class AdaptiveTileManager:
     def _new_id(self) -> str:
         """Generate a new unique tile ID."""
         self.tile_counter += 1
-        return f"tile_{self.tile_counter:04d}"
+        return f"tile_{self.tile_counter:08d}"
 
     def _calc_area(self, bbox: BBox) -> float:
         """Calculate the XY area of a bounding box (ignoring Z)."""
