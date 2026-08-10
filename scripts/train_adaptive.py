@@ -2277,11 +2277,27 @@ class AdaptiveTileTrainer:
                 # Category 2: memory fragmentation, not a size problem.
                 # Retry the same tile — the torchrun process already exited,
                 # so GPU memory is freed and fragmentation is gone.
+                #
+                # 2026-08-10 진행 기반 재시도 정책. 완주 런 3개의 실측:
+                #   동일 iteration 재발(96→96→96→96, 103→103→103, 145→145→145→145)은
+                #   한 번도 성공 못 함 — 파편화가 아니라 결정론적 용량 초과라 재시도가
+                #   순수 낭비(스모크 런 벽시계의 10.3%). 반면 전진한 경우(125→153)는
+                #   재시도가 Cat3 도달(=가우시안 회수)로 이어짐.
+                # → 규칙: 직전 시도보다 iteration 이 "전진했을 때만" 재시도를 계속한다.
                 MAX_CAT2_RETRIES = 3
                 if oom_category == 2:
                     cat2_retries = getattr(tile, '_cat2_retries', 0)
-                    if cat2_retries < MAX_CAT2_RETRIES:
+                    prev_iter = getattr(tile, '_cat2_last_iter', None)
+                    no_progress = (prev_iter is not None
+                                   and oom_iteration is not None
+                                   and oom_iteration <= prev_iter)
+                    if no_progress:
+                        print(f"  [Category 2] No progress across retries "
+                              f"(iter {prev_iter} -> {oom_iteration}): deterministic "
+                              f"capacity limit, not fragmentation. Splitting now.", flush=True)
+                    elif cat2_retries < MAX_CAT2_RETRIES:
                         tile._cat2_retries = cat2_retries + 1
+                        tile._cat2_last_iter = oom_iteration
                         tile.status = "pending"
                         tile.fail_iter = None
                         tile.oom_type = None
@@ -2308,13 +2324,24 @@ class AdaptiveTileTrainer:
                     completed += 1
                     continue
 
-                # Split tile
-                bbox_a, bbox_b = tile.bbox.split()
-
                 # Use tile IDs from state file if available (ensures PLY filename matches tile ID)
                 # Note: use "or {}" because get() returns None if key exists but value is None
                 tile_a_info = (oom_info.get("tile_a") or {}) if oom_info else {}
                 tile_b_info = (oom_info.get("tile_b") or {}) if oom_info else {}
+
+                # Split tile.
+                # ⚠ 자식 bbox 는 반드시 state 에 기록된 값을 그대로 쓴다.
+                # train_internal.py 가 그 bbox 로 가우시안을 걸러 PLY 를 저장했기 때문에,
+                # 여기서 다시 계산하면 (median 분할일 때) PLY 내용과 타일 영역이 어긋나
+                # 자식이 자기 bbox 밖 가우시안을 물려받고 자식 간 겹침/빈틈이 생긴다.
+                # 에러 없이 씬만 망가지는 종류라 재계산은 폴백으로만 남긴다.
+                if tile_a_info.get("bbox") and tile_b_info.get("bbox"):
+                    bbox_a = BBox.from_string(tile_a_info["bbox"])
+                    bbox_b = BBox.from_string(tile_b_info["bbox"])
+                    print(f"  [Using child bboxes from state (median-aware split)]", flush=True)
+                else:
+                    # Cat1/Cat2 등 state 에 bbox 가 없는 경로 — 기존대로 중점 분할
+                    bbox_a, bbox_b = tile.bbox.split()
 
                 if tile_a_info.get("tile_id") and tile_b_info.get("tile_id"):
                     # Use IDs from train_internal.py to match PLY filenames

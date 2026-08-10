@@ -71,31 +71,91 @@ class TileBBox:
             self.z_min <= point[2] <= self.z_max
         )
 
-    def split(self) -> Tuple["TileBBox", "TileBBox"]:
-        """Split the tile along the longest horizontal axis (X or Y only, never Z)."""
+    def split_axis_index(self) -> int:
+        """분할에 쓸 축. X(0) 또는 Y(1) 중 긴 쪽. Z 는 절대 쓰지 않는다."""
+        return 0 if (self.x_max - self.x_min) >= (self.y_max - self.y_min) else 1
+
+    def median_cut(self, points: np.ndarray, max_ratio: float = 0.65) -> float:
+        """분할 축 좌표의 median 을 clamp 해서 절단 위치를 돌려준다.
+
+        분산 학습에서 각 rank 가 이걸 따로 부르면 값이 갈라진다. 반드시 한 rank 가
+        계산해 공유 메모리로 전파하고, 나머지는 split(cut=...) 으로 받아 써야 한다.
+        """
+        axis_idx = self.split_axis_index()
+        lo = self.x_min if axis_idx == 0 else self.y_min
+        hi = self.x_max if axis_idx == 0 else self.y_max
+        med = float(np.median(np.asarray(points)[:, axis_idx]))
+        span = hi - lo
+        return min(max(med, lo + (1.0 - max_ratio) * span), lo + max_ratio * span)
+
+    def split(self, points: Optional[np.ndarray] = None,
+              cut: Optional[float] = None,
+              max_ratio: float = 0.65) -> Tuple["TileBBox", "TileBBox"]:
+        """Split the tile along the longest horizontal axis (X or Y only, never Z).
+
+        인자 없음 (기본): 기하 중점 분할. 기존 동작과 완전히 동일.
+        cut 지정: 그 위치에서 분할 (다른 rank 가 계산해 전파한 값을 받는 경로).
+        points 지정: 그 좌표들의 median 에서 분할 → 자식이 가우시안을 반반씩 물려받음.
+                    (단일 프로세스/테스트용. 분산에서는 cut 을 쓸 것)
+
+        왜 median 인가 (2026-08-07 실측):
+          중점 분할은 이 장면에서 자식 가우시안이 늘 32:68 로 갈렸다
+          (tile_3 iter153 = 32.1/67.9, tile_9 iter1007 = 31.1/68.9).
+          분할이 멈추는 조건은 "메모리에 들어가느냐"이고 그걸 정하는 건 큰 자식이므로,
+          한 번 쪼개도 68% 로만 줄어 단계가 배로 든다(710만→100만: 6단계 vs median 3단계).
+          그 여파로 밀집 혈통이 MIN_TILE_SIZE 까지 내려가 skipped → 최종 씬에 구멍.
+
+        max_ratio: median 이 한쪽으로 쏠렸을 때의 안전장치. 중점 분할은 자식 폭이
+          항상 부모의 50% 라 MIN_TILE_SIZE 도달이 수학적으로 보장되는데, median 은
+          그 보장이 없다(가우시안이 한 점에 몰리면 큰 자식이 부모의 95% → 재귀가 안 끝남).
+          큰 자식이 부모 폭의 max_ratio 를 넘지 않도록 절단 위치를 잘라 종료를 보장한다.
+          기본 0.65 는 실측된 중점 분할의 큰 자식 비율(0.68)보다 타이트하게 잡은 값 —
+          최악의 경우에도 지금보다 나빠지지 않는다.
+
+        ⚠ 호출자 주의: 분산 학습에서는 rank 마다 자기 shard 만 갖고 있으므로 각자
+          median 을 내면 값이 갈라진다. rank 별로 다른 bbox 로 필터링하면 데이터가
+          조용히 깨지므로, 호출부에서 절단 위치를 broadcast 로 일치시켜야 한다.
+        """
         dx = self.x_max - self.x_min
         dy = self.y_max - self.y_min
-        
+
         # Only split along X or Y axis, never Z
         if dx >= dy:
-            # Split along X axis
-            mid = (self.x_min + self.x_max) / 2
+            split_axis, axis_idx = "X", 0
+            lo, hi = self.x_min, self.x_max
+        else:
+            split_axis, axis_idx = "Y", 1
+            lo, hi = self.y_min, self.y_max
+
+        mid = (lo + hi) / 2
+        cut_mode = "midpoint"
+
+        if cut is not None:
+            mid = float(cut)
+            cut_mode = "median(shared)"
+        elif points is not None and len(points) > 0:
+            mid = self.median_cut(points, max_ratio)
+            med = float(np.median(np.asarray(points)[:, axis_idx]))
+            cut_mode = "median" if mid == med else f"median-clamped({max_ratio:.2f})"
+
+        if axis_idx == 0:
             tile_a = TileBBox(self.x_min, self.y_min, self.z_min, mid, self.y_max, self.z_max)
             tile_b = TileBBox(mid, self.y_min, self.z_min, self.x_max, self.y_max, self.z_max)
-            split_axis = "X"
         else:
-            # Split along Y axis
-            mid = (self.y_min + self.y_max) / 2
             tile_a = TileBBox(self.x_min, self.y_min, self.z_min, self.x_max, mid, self.z_max)
             tile_b = TileBBox(self.x_min, mid, self.z_min, self.x_max, self.y_max, self.z_max)
-            split_axis = "Y"
-        
+
         # Debug: validate split results
         print(f"[DEBUG] Original bbox: {self.to_string()}")
-        print(f"[DEBUG] Split axis: {split_axis} (X={dx:.2f}, Y={dy:.2f})")
+        print(f"[DEBUG] Split axis: {split_axis} (X={dx:.2f}, Y={dy:.2f}), cut={mid:.4f} [{cut_mode}]")
+        if points is not None and len(points) > 0:
+            n_a = int((np.asarray(points)[:, axis_idx] <= mid).sum())
+            n_tot = len(points)
+            print(f"[DEBUG] Gaussian balance (local sample): A {n_a:,} ({100.0*n_a/n_tot:.1f}%) / "
+                  f"B {n_tot-n_a:,} ({100.0*(n_tot-n_a)/n_tot:.1f}%)")
         print(f"[DEBUG] Tile A: {tile_a.to_string()}")
         print(f"[DEBUG] Tile B: {tile_b.to_string()}")
-        
+
         return (tile_a, tile_b)
 
     def to_string(self) -> str:

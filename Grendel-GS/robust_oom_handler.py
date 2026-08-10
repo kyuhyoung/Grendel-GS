@@ -31,6 +31,13 @@ class OOMState:
     cause: str = ""
     rank_who_detected: int = -1
     timestamp: float = 0.0
+    # Cat3 median 분할 절단 위치. 감지한 rank 가 자기 shard 의 median 으로 계산해
+    # 여기에 실어 보내고, 나머지 rank 는 이 값을 그대로 써서 자식 bbox 를 만든다.
+    # rank 마다 따로 median 을 내면 bbox 가 갈라져 필터 결과가 조용히 어긋나므로
+    # 반드시 이 경로로 일치시킨다. None = 기존 중점 분할.
+    # (OOM 핸들러 안에서는 rank 들이 backward() 에 묶여 있을 수 있어 collective 를
+    #  쓸 수 없다. 그래서 broadcast 대신 이미 있는 공유 메모리에 얹었다.)
+    split_cut: Optional[float] = None
 
 class RobustOOMHandler:
     """
@@ -284,11 +291,12 @@ class RobustOOMHandler:
             # Serialize state to JSON
             state_json = json.dumps({
                 'detected': state.detected,
-                'category': state.category, 
+                'category': state.category,
                 'iteration': state.iteration,
                 'cause': state.cause,
                 'rank_who_detected': state.rank_who_detected,
-                'timestamp': state.timestamp
+                'timestamp': state.timestamp,
+                'split_cut': state.split_cut
             })
             
             # Atomic write to shared memory
@@ -313,10 +321,12 @@ class RobustOOMHandler:
             return OOMState(
                 detected=state_dict['detected'],
                 category=state_dict['category'],
-                iteration=state_dict['iteration'], 
+                iteration=state_dict['iteration'],
                 cause=state_dict['cause'],
                 rank_who_detected=state_dict['rank_who_detected'],
-                timestamp=state_dict['timestamp']
+                timestamp=state_dict['timestamp'],
+                # .get(): 구버전 state 와 섞여도 깨지지 않게
+                split_cut=state_dict.get('split_cut')
             )
             
         except Exception as e:
@@ -378,17 +388,37 @@ class RobustOOMHandler:
             print(f"[robust-oom] Rank {self.rank} category {category} OOM signal handled, continuing adaptive tiling", flush=True)
             return
     
-    def detect_oom(self, iteration: int, category: int, cause: str, *, kill_process_group: bool = True, signal_self: bool = True, save_self: bool = True):
+    def detect_oom(self, iteration: int, category: int, cause: str, *, kill_process_group: bool = True, signal_self: bool = True, save_self: bool = True, split_cut: Optional[float] = None):
         """
         Detect OOM - GUARANTEE all ranks save PLY files.
-        
-        Strategy: 
-        1. Write OOM signal to shared memory 
+
+        Strategy:
+        1. Write OOM signal to shared memory
         2. Send SIGUSR1 to ALL ranks in process group
         3. Each rank immediately saves PLY upon receiving signal
+
+        split_cut: Cat3 median 분할 절단 위치. 여기 실어두면 다른 rank 들이
+          공유 메모리에서 같은 값을 읽어 동일한 자식 bbox 를 만든다.
         """
         print(f"[robust-oom] Rank {self.rank} detected OOM: category={category}, iter={iteration}, cause={cause}", flush=True)
-        
+
+        # 2026-08-10 동시 감지 레이스: 두 rank 가 거의 동시에 OOM 을 감지하면 각자
+        # 자기 shard 의 median 으로 cut 을 계산해 서로 다른 값을 쓰려 든다. 나중에
+        # 쓴 쪽이 이기면 rank 별로 다른 자식 bbox 로 필터하는 무결성 붕괴 가능
+        # (실측: median2 런에서 rank1=-484.33, rank2=-487.61 동시 발행 — clamp 가
+        # 우연히 같은 값으로 눌러 무해했음). 먼저 실린 cut 이 있으면 그것을 유지한다.
+        try:
+            existing = self._read_oom_state()
+            if existing.detected and existing.split_cut is not None:
+                if split_cut is not None and split_cut != existing.split_cut:
+                    print(f"[robust-oom] Rank {self.rank} keeping FIRST split cut "
+                          f"{existing.split_cut:.4f} (discarding own {split_cut:.4f})", flush=True)
+                split_cut = existing.split_cut
+        except Exception:
+            pass
+        if split_cut is not None:
+            print(f"[robust-oom] Rank {self.rank} publishing median split cut = {split_cut:.4f}", flush=True)
+
         try:
             if not signal_self:
                 self.allow_self_sigusr1 = False
@@ -398,6 +428,7 @@ class RobustOOMHandler:
                 category=category,
                 iteration=iteration,
                 cause=cause,
+                split_cut=split_cut,
                 rank_who_detected=self.rank,
                 timestamp=time.time()
             )
@@ -544,14 +575,31 @@ def get_robust_oom_handler() -> Optional[RobustOOMHandler]:
     """Get the global robust OOM handler instance.""" 
     return _robust_oom_handler
 
-def detect_oom_robust(iteration: int, category: int, cause: str, *, kill_process_group: bool = True, signal_self: bool = True, save_self: bool = True):
+def detect_oom_robust(iteration: int, category: int, cause: str, *, kill_process_group: bool = True, signal_self: bool = True, save_self: bool = True, split_cut: Optional[float] = None):
     """Detect OOM using robust handler."""
     handler = get_robust_oom_handler()
     if handler:
-        handler.detect_oom(iteration, category, cause, kill_process_group=kill_process_group, signal_self=signal_self, save_self=save_self)
+        handler.detect_oom(iteration, category, cause, kill_process_group=kill_process_group, signal_self=signal_self, save_self=save_self, split_cut=split_cut)
     else:
         print(f"[robust-oom] FATAL: OOM handler not initialized", flush=True)
         sys.exit(1)
+
+
+def get_published_split_cut() -> Optional[float]:
+    """공유 메모리에 실린 Cat3 median 절단 위치를 읽는다.
+
+    저장 경로(save_ply_callback 등)에서 자식 bbox 를 만들기 직전에 호출한다.
+    None 이면 기존 중점 분할로 동작 — 핸들러 미초기화, 구버전 state, Cat1/2 모두
+    이 경로로 안전하게 떨어진다.
+    """
+    handler = get_robust_oom_handler()
+    if handler is None:
+        return None
+    try:
+        return handler._read_oom_state().split_cut
+    except Exception as e:
+        print(f"[robust-oom] WARNING: failed to read split_cut, falling back to midpoint: {e}", flush=True)
+        return None
 
 def check_oom_signal_robust() -> Optional[Dict[str, Any]]:
     """Check OOM signal using robust handler."""

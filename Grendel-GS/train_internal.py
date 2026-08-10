@@ -13,10 +13,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 # Import robust OOM handler
 from robust_oom_handler import (
-    initialize_robust_oom_handler, 
+    initialize_robust_oom_handler,
     get_robust_oom_handler,
     detect_oom_robust,
-    check_oom_signal_robust
+    check_oom_signal_robust,
+    get_published_split_cut
 )
 from utils.loss_utils import l1_loss
 from gaussian_renderer import (
@@ -117,24 +118,24 @@ def _sigterm_handler(signum, frame):
     print(f"\n[{ts}] [SIGTERM] Rank {rank} received SIGTERM signal!", flush=True)
 
     # Check if save is already in progress (via signal check in main loop)
-    # If so, let that save complete - don't try to save again
+    # If so, let that save complete - don't try to save again.
+    #
+    # 2026-08-07 (iter1002 tile_99 rank0 유실 사후 수정): 여기서 기다리면 안 된다.
+    # 저장이 "메인 스레드"에서 진행 중일 때 SIGTERM 핸들러는 그 저장 프레임 위에
+    # 얹혀 실행되므로, 핸들러가 spin-wait 하는 동안 밑에 깔린 저장은 한 발짝도
+    # 못 나간다 → 60초를 통째로 허비한 뒤 sys.exit 이 저장을 죽였다.
+    # 핸들러가 그냥 return 하면 중단됐던 저장이 그 지점부터 재개된다.
+    # (monitor 스레드 저장인 경우에도 return 이 안전하다 — 저장은 별도 스레드에서
+    #  계속되고, 종료는 torchrun 의 grace period 가 관장한다.)
     if _OOM_SAVE_IN_PROGRESS:
-        print(f"[SIGTERM] Rank {rank}: Save already in progress, waiting for completion...", flush=True)
+        print(f"[SIGTERM] Rank {rank}: Save already in progress - returning to let it resume/finish", flush=True)
         if _SIGTERM_LOG_FILE:
             try:
-                _SIGTERM_LOG_FILE.write(f"[SIGTERM] Rank {rank}: Save in progress, exiting without duplicate save\n")
+                _SIGTERM_LOG_FILE.write(f"[SIGTERM] Rank {rank}: Save in progress, handler returns (no duplicate save)\n")
                 _SIGTERM_LOG_FILE.flush()
             except:
                 pass
-        # Wait briefly for save to complete (up to 60s)
-        # This gives the main save process time to finish
-        import time
-        for _ in range(60):
-            if not _OOM_SAVE_IN_PROGRESS:
-                print(f"[SIGTERM] Rank {rank}: Save completed, exiting", flush=True)
-                break
-            time.sleep(1)
-        sys.exit(EXIT_CODE_OOM)
+        return
 
     if _SIGTERM_GAUSSIANS is None or _SIGTERM_ARGS is None:
         print(f"[SIGTERM] Rank {rank}: No gaussian state registered, exiting immediately", flush=True)
@@ -713,6 +714,57 @@ def get_acked_ranks(args, world_size: int, signaling_rank: int) -> list:
     return acked
 
 
+# ── Cat3 median 분할 ──────────────────────────────────────────────────────
+# 중점 분할은 이 장면에서 자식 가우시안이 늘 32:68 로 갈렸다(2026-08-07 실측:
+# tile_3 iter153 = 32.1/67.9, tile_9 iter1007 = 31.1/68.9). 분할 종료 조건은
+# "메모리에 들어가느냐"이고 그걸 정하는 건 큰 자식이므로, 68% 로만 줄면 단계가
+# 배로 든다(710만→100만: 6단계 vs median 3단계). 그 여파로 밀집 혈통이
+# MIN_TILE_SIZE 까지 내려가 skipped 되고 최종 씬에 구멍이 남는다.
+MEDIAN_SPLIT_ENABLED = os.environ.get("MEDIAN_SPLIT", "1") != "0"
+MEDIAN_SPLIT_MAX_RATIO = float(os.environ.get("MEDIAN_SPLIT_MAX_RATIO", "0.65"))
+# median 추정에 쓸 최대 표본. OOM 직후라 메모리가 없으므로 전량 정렬(torch.median)
+# 대신 등간격 표본을 쓴다. median 추정에는 이 정도면 충분하고 할당이 작다.
+MEDIAN_SPLIT_SAMPLE = 200_000
+
+
+def compute_median_split_cut(gaussians, tile_bbox) -> Optional[float]:
+    """이 rank 의 가우시안으로 Cat3 분할 절단 위치를 계산한다.
+
+    감지한 rank 만 호출하고, 결과는 공유 메모리(OOMState.split_cut)로 전파된다.
+    각 rank 가 따로 부르면 값이 갈라져 자식 bbox 가 어긋나므로 그러면 안 된다.
+
+    실패하면 None 을 돌려 기존 중점 분할로 떨어진다 — OOM 직후 경로라 여기서
+    예외가 새어나가면 PLY 저장 자체를 잃는다. 품질 개선이 데이터 보존보다
+    우선할 수 없다.
+    """
+    if not MEDIAN_SPLIT_ENABLED:
+        return None
+    try:
+        axis = tile_bbox.split_axis_index()
+        xyz = gaussians.get_xyz
+        n = xyz.shape[0]
+        if n == 0:
+            return None
+        coords = xyz[:, axis]
+        if n > MEDIAN_SPLIT_SAMPLE:
+            coords = coords[:: (n // MEDIAN_SPLIT_SAMPLE + 1)]
+        med = float(torch.median(coords.detach()).item())
+        lo = tile_bbox.x_min if axis == 0 else tile_bbox.y_min
+        hi = tile_bbox.x_max if axis == 0 else tile_bbox.y_max
+        span = hi - lo
+        r = MEDIAN_SPLIT_MAX_RATIO
+        cut = min(max(med, lo + (1.0 - r) * span), lo + r * span)
+        pos = 100.0 * (cut - lo) / span if span > 0 else 50.0
+        print(f"[median-split] rank={utils.GLOBAL_RANK} axis={'XY'[axis]} "
+              f"n={n:,} sample={coords.shape[0]:,} median={med:.4f} -> cut={cut:.4f} "
+              f"({pos:.1f}% of parent{'' if cut == med else ', CLAMPED'})", flush=True)
+        return cut
+    except Exception as e:
+        print(f"[median-split] WARNING: rank={utils.GLOBAL_RANK} failed to compute median cut "
+              f"({e}); falling back to midpoint split", flush=True)
+        return None
+
+
 def handle_oom_signal_from_other_rank(
     signal_data: dict,
     gaussians,
@@ -771,7 +823,8 @@ def handle_oom_signal_from_other_rank(
     parent_level = getattr(args, "tile_level", 0)
     child_level = parent_level + 1
     # Safely handle tile split
-    split_result = tile_bbox.split()
+    # 감지한 rank 가 공유 메모리에 실어둔 median 절단 위치를 쓴다 (없으면 중점).
+    split_result = tile_bbox.split(cut=get_published_split_cut())
     if isinstance(split_result, tuple) and len(split_result) == 2:
         tile_a, tile_b = split_result
     else:
@@ -904,9 +957,11 @@ def handle_oom_signal_from_other_rank(
     # Include per-child counts for merge validation
     write_oom_done(args, utils.GLOBAL_RANK, total_saved, count_a=count_a, count_b=count_b)
 
-    # Clear save-in-progress flag
-    _OOM_SAVE_IN_PROGRESS = False
-    print(f"[oom-signal] Rank {utils.GLOBAL_RANK}: Save completed (flag cleared)", flush=True)
+    # 2026-08-07: 플래그를 내리지 않는다. 이 뒤에 다른 rank 들의 저장 완료를
+    # 기다리는 긴 구간(최대 PLY_WAIT_TIMEOUT)이 있는데, 거기서 SIGTERM 이 오면
+    # 플래그가 False 일 경우 이미 끝난 저장을 처음부터 다시 시작한다.
+    # 이 프로세스는 저장 후 종료뿐이므로 재저장이 필요한 경로가 없다.
+    print(f"[oom-signal] Rank {utils.GLOBAL_RANK}: Save completed (flag kept - blocks duplicate saves)", flush=True)
 
     # CRITICAL: Wait for ALL saving ranks to finish before exiting
     # This includes:
@@ -1359,6 +1414,8 @@ def handle_adaptive_tile_oom(
         print(f"\n[robust-oom] Rank {utils.GLOBAL_RANK} IMMEDIATE robust OOM signal (iter={iteration}, cat={oom_category_early})", flush=True)
         # Do NOT kill the process group here; we still need to write state files.
         # Also avoid handling SIGUSR1 on the detecting rank so it can finish state write.
+        # 자식 bbox 절단 위치를 여기서 정해 공유 메모리에 실어 보낸다. 다른 rank 들이
+        # 같은 값을 읽어야 필터 결과가 어긋나지 않는다.
         detect_oom_robust(
             iteration,
             oom_category_early,
@@ -1366,6 +1423,7 @@ def handle_adaptive_tile_oom(
             kill_process_group=False,
             signal_self=False,
             save_self=False,
+            split_cut=compute_median_split_cut(gaussians, tile_bbox),
         )
         robust_used = True
     else:
@@ -1490,7 +1548,8 @@ def handle_adaptive_tile_oom(
         utils.print_rank_0(f"[adaptive-tile] Splitting along {split_axis} axis (dy={dy:.1f} > dx={dx:.1f}): mid={mid:.2f}")
 
     # Split the tile
-    split_result = tile_bbox.split()
+    # 감지한 rank 가 공유 메모리에 실어둔 median 절단 위치를 쓴다 (없으면 중점).
+    split_result = tile_bbox.split(cut=get_published_split_cut())
     if isinstance(split_result, tuple) and len(split_result) == 2:
         tile_a, tile_b = split_result
     else:
@@ -1537,6 +1596,7 @@ def handle_adaptive_tile_oom(
                 kill_process_group=False,
                 signal_self=False,
                 save_self=False,
+                split_cut=compute_median_split_cut(gaussians, tile_bbox),
             )
             robust_used = True
         else:
@@ -1620,9 +1680,18 @@ def handle_adaptive_tile_oom(
         ply_prefix_a = str(tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{iteration}")
         ply_prefix_b = str(tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{iteration}")
 
+        # 2026-08-07: 중복 저장 방지 플래그. 이 경로(감지 rank 본인의 메인스레드 저장)가
+        # 플래그를 안 세워서, 저장 도중 SIGTERM 이 오면 핸들러가 "저장 안 하고 있네"로
+        # 판단해 전체 저장을 처음부터 다시 시작했다. 그 재시작이 종료 시한을 넘겨
+        # 마지막 자식(A) rank 파일이 유실됨 (iter1002 tile_99 rank0, 457만 개 상속 실패).
+        global _OOM_SAVE_IN_PROGRESS
+        _OOM_SAVE_IN_PROGRESS = True
+        print(f"  [oom-save] Rank {utils.GLOBAL_RANK}: save started (flag set - SIGTERM will not duplicate)", flush=True)
+
         # IMPORTANT: Save tile B FIRST, then tile A
         # Reason: Child B tends to be larger due to non-uniform gaussian distribution.
         # If SIGKILL arrives during save, we want the larger tile (B) to be saved first.
+        # (median 분할 후에는 A≈B 이므로 이 순서의 이점은 줄었지만 유지 — 순서 자체는 무해)
 
         # Save tile B first - directly to final path (no temp file to avoid race condition)
         # save_ply with local_only=True appends _rank{N} to the path
@@ -2187,6 +2256,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # PLY save callback for robust OOM handler
     def save_ply_callback(iteration: int, rank: int) -> bool:
         """Save PLY files for robust OOM handler. Returns True if successful."""
+        # 2026-08-07: monitor 스레드 저장도 중복 방지 플래그를 세운다.
+        # 이게 없으면 저장 도중 메인스레드에 SIGTERM 이 오면 같은 저장을
+        # 처음부터 또 시작해 (1) I/O 2배 (2) 종료 시한 초과로 파일 유실 위험.
+        global _OOM_SAVE_IN_PROGRESS
+        _OOM_SAVE_IN_PROGRESS = True
         try:
             # Get tile split configuration
             tile_output_dir = Path(getattr(args, "tile_output_dir", "") or args.model_path)
@@ -2219,8 +2293,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     tile_bbox = tile_bbox_str
                 
                 print(f"[robust-oom] Rank {rank} about to call split() on {tile_bbox}", flush=True)
-                # Split and save tiles
-                split_result = tile_bbox.split()
+                # Split and save tiles.
+                # 감지한 rank 가 공유 메모리에 실어둔 median 절단 위치를 쓴다 (없으면 중점).
+                # 모든 rank 가 같은 값을 읽어야 자식 bbox 가 일치한다 — 각자 median 을
+                # 내면 rank 별로 다른 영역을 걸러 저장해 데이터가 조용히 어긋난다.
+                split_result = tile_bbox.split(cut=get_published_split_cut())
                 print(f"[robust-oom] Rank {rank} split() returned: {split_result}, type: {type(split_result)}", flush=True)
                 
                 # Safely unpack split result
