@@ -27,8 +27,16 @@ from gsplat import (
     rasterize_to_pixels,
 )
 from scene.gaussian_model import GaussianModel
+import os
 import utils.general_utils as utils
 import torch.distributed.nn.functional as dist_func
+
+
+# 2026-08-10 off-center 로그 게이팅: 크롭 타일에서는 모든 카메라가 off-center 라
+# 이 print 가 iteration×camera 마다 찍혀 로그의 지배 소음원이 됨 (완주 런에서
+# 98,843줄 = 126MB 로그의 주범). 검증엔 유용하므로 삭제 대신 env 스위치로.
+# 켜려면 OFFCENTER_LOG=1.
+_OFFCENTER_LOG = os.environ.get("OFFCENTER_LOG", "0") == "1"
 
 
 def get_proj_offsets(camera, verbose=False):
@@ -48,7 +56,7 @@ def get_proj_offsets(camera, verbose=False):
         offset_x = camera._proj_offset_x
         offset_y = camera._proj_offset_y
         
-        if verbose or (abs(offset_x) > 1e-6 or abs(offset_y) > 1e-6):
+        if verbose or (_OFFCENTER_LOG and (abs(offset_x) > 1e-6 or abs(offset_y) > 1e-6)):
             cam_name = getattr(camera, 'image_name', 'unknown')
             p02 = offset_x / 2.0
             p12 = offset_y / 2.0
@@ -67,7 +75,7 @@ def get_proj_offsets(camera, verbose=False):
         offset_x, offset_y = 2.0 * p02, 2.0 * p12
 
         # Log if off-center (non-zero offsets)
-        if verbose or (abs(offset_x) > 1e-6 or abs(offset_y) > 1e-6):
+        if verbose or (_OFFCENTER_LOG and (abs(offset_x) > 1e-6 or abs(offset_y) > 1e-6)):
             cam_name = getattr(camera, 'image_name', 'unknown')
             print(f"[off-center] Camera {cam_name}: proj_offset=({offset_x:.6f}, {offset_y:.6f}), P[0,2]={p02:.6f}, P[1,2]={p12:.6f}")
 

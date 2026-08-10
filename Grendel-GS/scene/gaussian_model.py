@@ -1339,6 +1339,30 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        # 2026-08-10 경계 밖 densification 차단 (DENSIFY_INSIDE_BBOX=0 으로 끔).
+        # 실측(7/27 최종 런): 학습된 가우시안의 22.1%(18.8M/84.9M)가 병합 때 폐기됐고,
+        # 그 정체는 타일 경계 밖 얇은 껍질(경계거리 중앙값 = 타일 변의 3~8%, XY 100%).
+        # 원인 = crop margin 이 보여주는 경계 밖 픽셀을 설명하려는 증식.
+        # 처방 = 중심이 tile bbox 밖인 가우시안은 grad 를 0 으로 → clone/split 후보에서
+        # 제외. 존재·렌더(컨텍스트)·프루닝은 그대로 — 증식만 막는다.
+        if os.environ.get("DENSIFY_INSIDE_BBOX", "1") != "0":
+            tile_bbox_str = getattr(args, "tile_bbox", None)
+            if tile_bbox_str:
+                if getattr(self, "_densify_bbox", None) is None:
+                    from scene.adaptive_tile_utils import TileBBox
+                    self._densify_bbox = (TileBBox.from_string(tile_bbox_str)
+                                          if isinstance(tile_bbox_str, str) else tile_bbox_str)
+                bb = self._densify_bbox
+                xyz = self.get_xyz
+                outside = ~((xyz[:, 0] >= bb.x_min) & (xyz[:, 0] <= bb.x_max)
+                            & (xyz[:, 1] >= bb.y_min) & (xyz[:, 1] <= bb.y_max)
+                            & (xyz[:, 2] >= bb.z_min) & (xyz[:, 2] <= bb.z_max))
+                n_out = int(outside.sum().item())
+                if n_out:
+                    grads[outside] = 0.0
+                    utils.get_log_file().write(
+                        f"[densify-mask] {n_out:,} out-of-bbox gaussians excluded from densification\n")
+
         densification_stats = {}
         densification_stats["view_space_grad"] = grads.mean().item()
         densification_stats["view_space_grad_max"] = grads.max().item()
