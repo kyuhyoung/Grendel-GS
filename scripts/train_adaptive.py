@@ -2614,12 +2614,55 @@ class AdaptiveTileTrainer:
                 self._generate_visual_debug_for_tile(bbox_b, tile_b_id)
 
             else:
-                # Other failures - mark as failed and continue
-                print(f"[Tile {tile.tile_id}] Failed with exit code {exit_code}", flush=True)
-                print(f"  Marking tile as FAILED and continuing...", flush=True)
-                tile.status = "failed"
-                self._save_state()
-                completed += 1
+                # Other failures (non-OOM exit).
+                #
+                # 2026-08-11 인프라 실패 재시도. 실측: 8/11 면적 팔 런에서 타일 2개가
+                # "ProcessGroupNCCL ... no GPUs found!" 로 학습 0 iteration 에 죽어
+                # 영구 FAILED = 최종 씬의 구멍이 됐다. 원인은 컨테이너의 일시적 GPU
+                # 유실(호스트 cgroup 이벤트로 장치 연결이 끊기는 알려진 고질병) —
+                # 같은 타일이 재개 런에서는 무수정으로 정상 완주했다(일시성 실증).
+                # 미션은 "어떤 GPU 에서든 무인 완주" — 딸꾹질하는 환경도 그 범위다.
+                # OOM 과 같은 철학으로: 예방하려 들지 말고, 분류하고 재시도한다.
+                #   1) 비 OOM 실패는 즉시 FAILED 가 아니라 최대 2회 재큐잉.
+                #      (일시 장애는 1회로 충분함이 실증됐고, 결정론적 버그면 3회
+                #       모두 몇 초 내에 죽어 비용이 거의 없다)
+                #   2) 재시도 전 nvidia-smi 로 환경 생사 확인 — GPU 가 아예 안 보이면
+                #      컨테이너 자체가 죽은 것이므로 재시도가 무의미. 특수 코드 77 로
+                #      종료해 바깥 감시 루프(run_forever.sh)가 컨테이너를 재기동하게 한다.
+                INFRA_MAX_RETRIES = 2
+                infra_retries = getattr(tile, '_infra_retries', 0)
+
+                gpu_alive = True
+                try:
+                    subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                                   timeout=30, check=True)
+                except Exception:
+                    gpu_alive = False
+
+                if not gpu_alive:
+                    print(f"[Tile {tile.tile_id}] Failed (exit {exit_code}) and "
+                          f"nvidia-smi sees NO GPUs — container lost device access.", flush=True)
+                    print(f"  Exiting with code 77 so an outer supervisor can restart "
+                          f"the container. State is saved; rerun resumes here.", flush=True)
+                    tile.status = "pending"   # 재기동 후 이 타일부터 재개
+                    self._save_state()
+                    sys.exit(77)
+                elif infra_retries < INFRA_MAX_RETRIES:
+                    tile._infra_retries = infra_retries + 1
+                    tile.status = "pending"
+                    print(f"[Tile {tile.tile_id}] Failed with exit code {exit_code} "
+                          f"(non-OOM; likely transient infra).", flush=True)
+                    print(f"  [INFRA RETRY] Re-queueing same tile "
+                          f"({tile._infra_retries}/{INFRA_MAX_RETRIES})...", flush=True)
+                    self._save_state()
+                    continue
+                else:
+                    print(f"[Tile {tile.tile_id}] Failed with exit code {exit_code} "
+                          f"after {INFRA_MAX_RETRIES} infra retries.", flush=True)
+                    print(f"  Marking tile as FAILED and continuing...", flush=True)
+                    tile.status = "failed"
+                    self._save_state()
+                    completed += 1
 
         # Final visualization showing all completed tiles
         try:
