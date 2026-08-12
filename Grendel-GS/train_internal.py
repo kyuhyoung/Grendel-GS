@@ -765,6 +765,26 @@ def compute_median_split_cut(gaussians, tile_bbox) -> Optional[float]:
         return None
 
 
+def _resolve_split_cut(tile_bbox):
+    """분할 규칙 통일 (2026-08-12): 어떤 분류든 '지금 손에 있는 가우시안 분포의
+    median' 에서 자른다. 우선순위: (1) 공유메모리에 실린 cut (Cat3 — rank 간
+    일치 필수), (2) 이 rank 의 가우시안으로 즉석 계산 (Cat1/2 — PLY 저장이 없어
+    rank 간 bbox 일치가 필수는 아니므로 로컬 shard median 으로 충분).
+    초기(무정보) 분포에서는 median ≈ 중점 근처에 그어질 뿐이며(실측: 초기 절단
+    후 최종 질량 3/97 vs 중점 4/96 — 동급), 규칙의 특례를 없애는 것이 목적.
+    실패/비활성 시 None → 중점."""
+    cut = get_published_split_cut()
+    if cut is not None:
+        return cut
+    try:
+        g = _SIGTERM_GAUSSIANS
+        if g is not None and tile_bbox is not None:
+            return compute_median_split_cut(g, tile_bbox)
+    except Exception:
+        pass
+    return None
+
+
 def handle_oom_signal_from_other_rank(
     signal_data: dict,
     gaussians,
@@ -824,7 +844,7 @@ def handle_oom_signal_from_other_rank(
     child_level = parent_level + 1
     # Safely handle tile split
     # 감지한 rank 가 공유 메모리에 실어둔 median 절단 위치를 쓴다 (없으면 중점).
-    split_result = tile_bbox.split(cut=get_published_split_cut())
+    split_result = tile_bbox.split(cut=_resolve_split_cut(tile_bbox))
     if isinstance(split_result, tuple) and len(split_result) == 2:
         tile_a, tile_b = split_result
     else:
@@ -1549,7 +1569,7 @@ def handle_adaptive_tile_oom(
 
     # Split the tile
     # 감지한 rank 가 공유 메모리에 실어둔 median 절단 위치를 쓴다 (없으면 중점).
-    split_result = tile_bbox.split(cut=get_published_split_cut())
+    split_result = tile_bbox.split(cut=_resolve_split_cut(tile_bbox))
     if isinstance(split_result, tuple) and len(split_result) == 2:
         tile_a, tile_b = split_result
     else:
@@ -2297,7 +2317,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 # 감지한 rank 가 공유 메모리에 실어둔 median 절단 위치를 쓴다 (없으면 중점).
                 # 모든 rank 가 같은 값을 읽어야 자식 bbox 가 일치한다 — 각자 median 을
                 # 내면 rank 별로 다른 영역을 걸러 저장해 데이터가 조용히 어긋난다.
-                split_result = tile_bbox.split(cut=get_published_split_cut())
+                split_result = tile_bbox.split(cut=_resolve_split_cut(tile_bbox))
                 print(f"[robust-oom] Rank {rank} split() returned: {split_result}, type: {type(split_result)}", flush=True)
                 
                 # Safely unpack split result
