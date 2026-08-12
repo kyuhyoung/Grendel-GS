@@ -1789,8 +1789,17 @@ class AdaptiveTileTrainer:
                 return tile
         return None
 
-    def _run_torchrun(self, tile: TileInfo, visible_cameras: List[str]) -> int:
-        """Run torchrun for a single tile."""
+    def _run_torchrun(self, tile: TileInfo, visible_cameras: List[str],
+                      gpu_ids: Optional[List[int]] = None,
+                      master_port: Optional[int] = None) -> int:
+        """Run torchrun for a single tile.
+
+        gpu_ids/master_port (2026-08-12 병렬 스케줄러): GPU 부분집합에서 실행.
+        None 이면 기존과 동일하게 전체 GPU 사용 (직렬 폴백 경로).
+        """
+        # 조정 파일(signal/ack/done/state) 타일별 스코핑 — 병렬 실행 시 크로스톡 방지
+        coord = self.ply_dir / f"coord_{tile.tile_id}"
+        coord.mkdir(parents=True, exist_ok=True)
         tile_model_path = self.output_path / "models" / tile.tile_id
         tile_log_path = self.output_path / "logs" / tile.tile_id
         tile_model_path.mkdir(parents=True, exist_ok=True)
@@ -1808,16 +1817,16 @@ class AdaptiveTileTrainer:
               f"(LR 감쇠를 타일 학습량에 정렬)", flush=True)
 
         # Clear any leftover OOM signal, ack, and done files from previous runs
-        signal_file = self.ply_dir / OOM_SIGNAL_FILENAME
+        signal_file = coord / OOM_SIGNAL_FILENAME
         if signal_file.exists():
             signal_file.unlink()
             print(f"  [Cleared leftover OOM signal file]")
         # Clear ack files (used for dynamic waiting during OOM coordination)
-        for ack_file in self.ply_dir.glob("oom_ack_rank*.json"):
+        for ack_file in coord.glob("oom_ack_rank*.json"):
             ack_file.unlink()
             print(f"  [Cleared leftover ack file: {ack_file.name}]")
         # Clear done files
-        for done_file in self.ply_dir.glob("oom_done_rank*.json"):
+        for done_file in coord.glob("oom_done_rank*.json"):
             done_file.unlink()
             print(f"  [Cleared leftover done file: {done_file.name}]")
 
@@ -1845,9 +1854,11 @@ class AdaptiveTileTrainer:
             if effective_densify_from != self.args.densify_from_iter:
                 print(f"  [Adjusted densify_from_iter: {self.args.densify_from_iter} -> {effective_densify_from} (2 x {num_visible} cameras)]")
 
+        nproc = len(gpu_ids) if gpu_ids else self.args.num_gpus
         cmd = [
             "torchrun",
-            f"--nproc_per_node={self.args.num_gpus}",
+            f"--nproc_per_node={nproc}",
+            *( [f"--master_port={master_port}"] if master_port else [] ),
             str(self.grendel_dir / "train.py"),
             "--source_path", str(self.source_path),
             "--model_path", str(tile_model_path),
@@ -1906,6 +1917,8 @@ class AdaptiveTileTrainer:
         # TORCH_NCCL_ASYNC_ERROR_HANDLING=1: Store errors and throw as Python exceptions
         # instead of calling std::terminate() which kills the process immediately
         env = os.environ.copy()
+        if gpu_ids:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
         env["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
         # Also set NCCL debug level for better diagnostics
         env["NCCL_DEBUG"] = "WARN"
@@ -1939,8 +1952,8 @@ class AdaptiveTileTrainer:
                 pass
 
         # Check for OOM via state file (torchrun returns 1 even when worker exits with 42)
-        state_file = self.ply_dir / "adaptive_tile_state.json"
-        signal_file = self.ply_dir / OOM_SIGNAL_FILENAME
+        state_file = coord / "adaptive_tile_state.json"
+        signal_file = coord / OOM_SIGNAL_FILENAME
         oom_info = None
 
         # First, check adaptive_tile_state.json (written by Category 3 OOM with full info)
@@ -1966,14 +1979,14 @@ class AdaptiveTileTrainer:
                         signal_file.unlink()
                         print(f"  [Cleared OOM signal file]")
                     # Clear ack files (used for dynamic waiting during OOM coordination)
-                    for ack_file in self.ply_dir.glob("oom_ack_rank*.json"):
+                    for ack_file in coord.glob("oom_ack_rank*.json"):
                         ack_file.unlink()
                         print(f"  [Cleared ack file: {ack_file.name}]")
 
                     # Read expected counts from done files BEFORE clearing them
                     # This is used for validation during merge
                     num_ranks = oom_info.get("num_ranks", 1)
-                    expected_counts = read_expected_counts_from_done_files(self.ply_dir, num_ranks)
+                    expected_counts = read_expected_counts_from_done_files(coord, num_ranks)
                     if expected_counts['ranks_found'] > 0:
                         print(f"  [Validation] Expected counts from {expected_counts['ranks_found']} rank(s):")
                         print(f"    Child A: {expected_counts['count_a']:,} gaussians")
@@ -1982,7 +1995,7 @@ class AdaptiveTileTrainer:
                         oom_info['expected_counts'] = expected_counts
 
                     # Clear done files
-                    for done_file in self.ply_dir.glob("oom_done_rank*.json"):
+                    for done_file in coord.glob("oom_done_rank*.json"):
                         done_file.unlink()
                         print(f"  [Cleared done file: {done_file.name}]")
                     return self.EXIT_CODE_OOM, oom_info
@@ -2014,6 +2027,788 @@ class AdaptiveTileTrainer:
 
         return result_code, oom_info
 
+    def _handle_tile_result(self, tile: TileInfo, exit_code: int, oom_info, tile_area: float):
+        """타일 프로세스 종료 후 결과 처리 (분류·분할·재큐잉·완료 기록).
+
+        2026-08-12 병렬 스케줄러를 위해 run() 루프에서 무변경 추출.
+        상태 변경은 반드시 메인 스레드에서만 이 메서드를 호출할 것.
+        반환: ("next", completed_delta) — 호출측이 completed 에 가산.
+        """
+        completed_delta = 0
+
+        # Count timeline 시각화: 매 타일 종료 후 두 aggregate PNG 갱신 (best-effort)
+        #  - all_tiles_timeline.png: x=학습 iter, 각 타일 색 분리
+        #  - oom_progression.png:    x=타일 처리 순서, wrapper 시퀀스 뷰
+        try:
+            count_dir = Path(self.args.output_path) / "visualizations" / "count_timeline"
+            if count_dir.exists() and any(count_dir.glob("*_rank*.jsonl")):
+                sys.path.insert(0, str(ROOT / "Grendel-GS"))
+                from utils.oom_viz import save_all_tiles_timeline_viz, save_oom_progression_viz
+
+                agg_png = count_dir / "all_tiles_timeline.png"
+                save_all_tiles_timeline_viz(count_dir, out_path=agg_png, target_count=None)
+                prog_png = count_dir / "oom_progression.png"
+                save_oom_progression_viz(count_dir, out_path=prog_png)
+                print(f"  [viz] timeline updated -> {agg_png.name}, {prog_png.name}", flush=True)
+        except Exception as _ct_viz_e:
+            print(f"  [viz] count timeline skipped: {_ct_viz_e}", flush=True)
+
+        # Tile split tree 매 타일 처리 후 갱신 (best-effort)
+        try:
+            self._visualize_split_tree()
+        except Exception as _tree_e:
+            print(f"  [viz] tile split tree skipped: {_tree_e}", flush=True)
+
+        # Log exit code for debugging
+        print(f"\n[Tile {tile.tile_id}] torchrun exit_code = {exit_code}", flush=True)
+        print(f"  oom_info = {oom_info}", flush=True)
+        print(f"  EXIT_CODE_OOM = {self.EXIT_CODE_OOM}", flush=True)
+        print(f"  Recognized OOM codes: {self.EXIT_CODE_OOM}, -9, 143, -15, 137", flush=True)
+        if oom_info and oom_info.get("abort") == "render_debug":
+            print("  [Render debug] Aborting adaptive run due to render debug abort.", flush=True)
+            sys.exit(1)
+
+        if exit_code == self.EXIT_CODE_SUCCESS:
+            tile.status = "completed"
+            # 타일 품질 지표 로드 (train_internal 이 저장 시점에 기록)
+            done_info_path = self.output_path / "models" / tile.tile_id / "done_info.json"
+            if done_info_path.exists():
+                try:
+                    with open(done_info_path) as f:
+                        tile.quality = json.load(f)
+                    print(f"  [quality] final_epoch_loss="
+                          f"{tile.quality.get('final_epoch_loss')} "
+                          f"({tile.quality.get('done_reason')})", flush=True)
+                except Exception as e:
+                    print(f"  [quality] done_info 읽기 실패: {e}", flush=True)
+            # Track successful tile level (smaller level = larger tile)
+            tile_area = tile.bbox.size[0] * tile.bbox.size[1]
+            tile_level = self._get_tile_level(tile_area)
+            if self.min_successful_level is None or tile_level < self.min_successful_level:
+                self.min_successful_level = tile_level
+                print(f"  [Success] Updated min successful level: {tile_level} (area: {tile_area:.1f})")
+            self._save_state()
+            completed_delta += 1
+            print(f"[Tile {tile.tile_id}] Completed successfully (level {tile_level}).")
+
+            # Copy completed PLY to ply folder with informative name
+            self._save_completed_ply(tile, tile_level)
+
+        elif exit_code == self.EXIT_CODE_OOM or exit_code == -9 or exit_code in (143, -15, 137):
+            # exit_code meanings:
+            #   42: EXIT_CODE_OOM (explicit OOM handling)
+            #   -9: SIGKILL (OS killed due to RAM OOM)
+            #   143: SIGTERM (128+15, torchrun shutdown - likely OOM from another rank)
+            #   -15: SIGTERM (negative signal)
+            #   137: SIGKILL (128+9, torchrun shutdown)
+            # Determine OOM type
+            is_ram_oom = (exit_code == -9)
+            is_sigterm = (exit_code in (143, -15, 137))
+            if is_sigterm:
+                print(f"[Tile {tile.tile_id}] SIGTERM/SIGKILL exit ({exit_code}) - treating as OOM", flush=True)
+            oom_type_str = "RAM" if is_ram_oom else "GPU"
+
+            # RAM OOM: wait for OS to reclaim memory from dead processes
+            if is_ram_oom:
+                import gc
+                import psutil
+
+                gc.collect()  # Force Python garbage collection
+
+                # Wait until RAM usage drops below 70%
+                max_wait = 300  # Maximum wait time: 5 minutes
+                waited = 0
+                mem = psutil.virtual_memory()
+                print(f"\n[RAM OOM] Current RAM usage: {mem.percent:.1f}%", flush=True)
+
+                while mem.percent > 70 and waited < max_wait:
+                    print(f"[RAM OOM] RAM usage {mem.percent:.1f}% > 70%, waiting... ({waited}s/{max_wait}s)", flush=True)
+                    time.sleep(10)
+                    waited += 10
+                    gc.collect()
+                    mem = psutil.virtual_memory()
+
+                if mem.percent > 70:
+                    print(f"[RAM OOM] WARNING: RAM still at {mem.percent:.1f}% after {max_wait}s, proceeding anyway...", flush=True)
+                else:
+                    print(f"[RAM OOM] RAM usage dropped to {mem.percent:.1f}%, resuming.", flush=True)
+
+            oom_iteration = oom_info.get("iteration") if oom_info else None
+            oom_category = oom_info.get("oom_category") if oom_info else None
+
+            print("\n" + "#" * 60, flush=True)
+            print(f"###  {oom_type_str} OOM DETECTED - SPLITTING TILE  ###", flush=True)
+            print("#" * 60, flush=True)
+            tile_area = tile.bbox.size[0] * tile.bbox.size[1]
+            tile_level = self._get_tile_level(tile_area)
+            print(f"[Tile {tile.tile_id}] {oom_type_str} OOM at iteration {oom_iteration}, level={tile_level}, splitting...", flush=True)
+            tile.fail_iter = oom_iteration
+            tile.oom_type = "ram" if is_ram_oom else "gpu"
+            tile.oom_category = oom_category
+
+            # Category 4: pre-trained gaussians too large before densification.
+            # Split and reuse parent PLY — no new PLY saving needed.
+            if oom_category == 4:
+                print(f"  [Category 4] Pre-trained gaussians too large (iter {oom_iteration}, before densification).", flush=True)
+                print(f"  Splitting tile. Children will reuse parent PLY filtered by bbox.", flush=True)
+
+            # Category 2: memory fragmentation, not a size problem.
+            # Retry the same tile — the torchrun process already exited,
+            # so GPU memory is freed and fragmentation is gone.
+            #
+            # 2026-08-10 진행 기반 재시도 정책. 완주 런 3개의 실측:
+            #   동일 iteration 재발(96→96→96→96, 103→103→103, 145→145→145→145)은
+            #   한 번도 성공 못 함 — 파편화가 아니라 결정론적 용량 초과라 재시도가
+            #   순수 낭비(스모크 런 벽시계의 10.3%). 반면 전진한 경우(125→153)는
+            #   재시도가 Cat3 도달(=가우시안 회수)로 이어짐.
+            # → 규칙: 직전 시도보다 iteration 이 "전진했을 때만" 재시도를 계속한다.
+            MAX_CAT2_RETRIES = 3
+            if oom_category == 2:
+                cat2_retries = getattr(tile, '_cat2_retries', 0)
+                prev_iter = getattr(tile, '_cat2_last_iter', None)
+                no_progress = (prev_iter is not None
+                               and oom_iteration is not None
+                               and oom_iteration <= prev_iter)
+                if no_progress:
+                    print(f"  [Category 2] No progress across retries "
+                          f"(iter {prev_iter} -> {oom_iteration}): deterministic "
+                          f"capacity limit, not fragmentation. Splitting now.", flush=True)
+                elif cat2_retries < MAX_CAT2_RETRIES:
+                    tile._cat2_retries = cat2_retries + 1
+                    tile._cat2_last_iter = oom_iteration
+                    tile.status = "pending"
+                    tile.fail_iter = None
+                    tile.oom_type = None
+                    tile.oom_category = None
+                    print(f"  [Category 2 RETRY] Memory fragmentation OOM at iter {oom_iteration}.", flush=True)
+                    print(f"  Retrying same tile ({tile._cat2_retries}/{MAX_CAT2_RETRIES})...", flush=True)
+                    print("#" * 60 + "\n", flush=True)
+                    self._save_state()
+                    return ("next", completed_delta)
+                else:
+                    print(f"  [Category 2] Exhausted {MAX_CAT2_RETRIES} retries, falling through to split.", flush=True)
+            # Check minimum tile size before splitting
+            MIN_TILE_SIZE = 50.0  # Minimum size in world units
+            tile_size = tile.bbox.size
+            min_dim = min(tile_size)
+
+            if min_dim < MIN_TILE_SIZE:
+                print(f"  WARNING: Tile is already very small: ({tile_size[0]:.1f}, {tile_size[1]:.1f}, {tile_size[2]:.1f})", flush=True)
+                print(f"  Cannot split further (min dimension {min_dim:.1f} < {MIN_TILE_SIZE})", flush=True)
+                print(f"  Marking tile as SKIPPED (too small to process)", flush=True)
+                print("#" * 60 + "\n", flush=True)
+                tile.status = "skipped"
+                self._save_state()
+                completed_delta += 1
+                return ("next", completed_delta)
+
+            # Use tile IDs from state file if available (ensures PLY filename matches tile ID)
+            # Note: use "or {}" because get() returns None if key exists but value is None
+            tile_a_info = (oom_info.get("tile_a") or {}) if oom_info else {}
+            tile_b_info = (oom_info.get("tile_b") or {}) if oom_info else {}
+
+            # Split tile.
+            # ⚠ 자식 bbox 는 반드시 state 에 기록된 값을 그대로 쓴다.
+            # train_internal.py 가 그 bbox 로 가우시안을 걸러 PLY 를 저장했기 때문에,
+            # 여기서 다시 계산하면 (median 분할일 때) PLY 내용과 타일 영역이 어긋나
+            # 자식이 자기 bbox 밖 가우시안을 물려받고 자식 간 겹침/빈틈이 생긴다.
+            # 에러 없이 씬만 망가지는 종류라 재계산은 폴백으로만 남긴다.
+            if tile_a_info.get("bbox") and tile_b_info.get("bbox"):
+                bbox_a = BBox.from_string(tile_a_info["bbox"])
+                bbox_b = BBox.from_string(tile_b_info["bbox"])
+                print(f"  [Using child bboxes from state (median-aware split)]", flush=True)
+            elif oom_category == 4 and tile.ply_path:
+                # 2026-08-12 사다리 2단: Cat4(상속분이 로드 시점에 초과)는 부모의
+                # 학습된 가우시안이 "디스크"에 있다 — Cat3 와 같은 원리로 그 분포의
+                # median 에서 자른다. 중점으로 자르면 7/16 의 cat4 연쇄(밀집 자식
+                # 재즉사 → 재분할 → skipped 전멸)가 재발한다. 실패 시 중점 폴백.
+                bbox_a, bbox_b = self._median_split_from_ply(tile)
+                print(f"  [Cat4: median split from inherited PLY]", flush=True)
+            else:
+                # Cat1/Cat2 등 잴 분포가 무정보인 경로 — 중점 분할 (사다리 3단 fallback)
+                bbox_a, bbox_b = tile.bbox.split()
+
+            if tile_a_info.get("tile_id") and tile_b_info.get("tile_id"):
+                # Use IDs from train_internal.py to match PLY filenames
+                tile_a_id = tile_a_info["tile_id"]
+                tile_b_id = tile_b_info["tile_id"]
+                # Update counter to avoid future collisions
+                a_num = int(tile_a_id.split("_")[-1]) if "_" in tile_a_id else 0
+                b_num = int(tile_b_id.split("_")[-1]) if "_" in tile_b_id else 0
+                self.tile_counter = max(self.tile_counter, a_num + 1, b_num + 1)
+                print(f"  [Using tile IDs from state: {tile_a_id}, {tile_b_id}]", flush=True)
+            else:
+                # Fallback to sequential counter
+                tile_a_id = self._next_tile_id()
+                tile_b_id = self._next_tile_id()
+
+            # Calculate sizes for display
+            size_a = bbox_a.size
+            size_b = bbox_b.size
+
+            tile.status = "split"
+
+            # Calculate levels for new tiles
+            area_a = size_a[0] * size_a[1]
+            area_b = size_b[0] * size_b[1]
+            level_a = self._get_tile_level(area_a)
+            level_b = self._get_tile_level(area_b)
+
+            print(f"  Original tile: {tile.tile_id} (level {tile_level})", flush=True)
+            print(f"  Split into:", flush=True)
+            print(f"    {tile_a_id}: size=({size_a[0]:.1f}, {size_a[1]:.1f}, {size_a[2]:.1f}), level={level_a}", flush=True)
+            print(f"    {tile_b_id}: size=({size_b[0]:.1f}, {size_b[1]:.1f}, {size_b[2]:.1f}), level={level_b}", flush=True)
+
+            # For Category 3 OOM (increased gaussians), use saved PLY for resume
+            # For Category 4 OOM (pre-trained too large), reuse parent's PLY
+            ply_path_a = None
+            ply_path_b = None
+            if oom_category == 4 and tile.ply_path:
+                # Reuse parent's PLY — children will filter by their bbox on load
+                ply_path_a = tile.ply_path
+                ply_path_b = tile.ply_path
+                print(f"\n  >>> CATEGORY 4 OOM: Reusing parent PLY for children <<<", flush=True)
+                print(f"    Parent PLY: {tile.ply_path}", flush=True)
+
+            elif oom_category == 3 and oom_info:
+                print(f"\n  >>> CATEGORY 3 OOM: Pre-trained gaussians will be used <<<", flush=True)
+                tile_a_info = oom_info.get("tile_a") or {}
+                tile_b_info = oom_info.get("tile_b") or {}
+                num_ranks = oom_info.get("num_ranks", 1)
+
+                # Check if PLY files need to be merged (distributed save with local_only=True)
+                ply_prefix_a = tile_a_info.get("ply_path")
+                ply_prefix_b = tile_b_info.get("ply_path")
+                is_prefix_a = tile_a_info.get("ply_is_prefix", False)
+                is_prefix_b = tile_b_info.get("ply_is_prefix", False)
+
+                # Merge rank files if needed
+                # Try BOTH tiles before failing - so we at least save what we can
+                merge_errors = []
+                count_a = 0
+                count_b = 0
+
+                # Wait for PLY files to be saved (configurable timeout)
+                if num_ranks > 1:
+                    wait_timeout = int(os.environ.get('PLY_WAIT_TIMEOUT', 3600))  # Default 1 hour
+                    print(f"  [Waiting] Checking for PLY files from {num_ranks} ranks (timeout: {wait_timeout}s)...", flush=True)
+                    wait_start = time.time()
+                    check_interval = 5  # Check every 5 seconds
+                        
+                    while time.time() - wait_start < wait_timeout:
+                        # Check if all rank files exist
+                        all_exist = True
+                        for prefix in [ply_prefix_a, ply_prefix_b]:
+                            if prefix and prefix != "None":
+                                for rank in range(num_ranks):
+                                    rank_file = f"{prefix}_rank{rank}.ply"
+                                    if not Path(rank_file).exists():
+                                        all_exist = False
+                                        break
+                            if not all_exist:
+                                break
+                            
+                        if all_exist:
+                            print(f"    All PLY files found after {time.time() - wait_start:.1f}s", flush=True)
+                            break
+                            
+                        time.sleep(check_interval)
+                    else:
+                        print(f"    WARNING: Timeout after {wait_timeout}s waiting for PLY files", flush=True)
+
+                # Try Tile A merge
+                if ply_prefix_a and is_prefix_a and num_ranks > 1:
+                    print(f"  [Merging] Tile A: {num_ranks} rank files...", flush=True)
+                    merged_path_a = f"{ply_prefix_a}_merged.ply"
+                    try:
+                        count_a = merge_ply_files(ply_prefix_a, num_ranks, merged_path_a, strict=True)
+                        ply_path_a = merged_path_a
+                        print(f"    Merged {count_a:,} gaussians -> {merged_path_a}", flush=True)
+                    except MergeError as e:
+                        merge_errors.append(f"Tile A: {e}")
+                        print(f"    FAILED: {e}", flush=True)
+                elif ply_prefix_a and not is_prefix_a:
+                    # Single file path (legacy or single-GPU)
+                    if Path(ply_prefix_a).exists():
+                        ply_path_a = ply_prefix_a
+                    else:
+                        merge_errors.append(f"Tile A: PLY file not found: {ply_prefix_a}")
+
+                # Try Tile B merge (even if Tile A failed)
+                if ply_prefix_b and is_prefix_b and num_ranks > 1:
+                    print(f"  [Merging] Tile B: {num_ranks} rank files...", flush=True)
+                    merged_path_b = f"{ply_prefix_b}_merged.ply"
+                    try:
+                        count_b = merge_ply_files(ply_prefix_b, num_ranks, merged_path_b, strict=True)
+                        ply_path_b = merged_path_b
+                        print(f"    Merged {count_b:,} gaussians -> {merged_path_b}", flush=True)
+                    except MergeError as e:
+                        merge_errors.append(f"Tile B: {e}")
+                        print(f"    FAILED: {e}", flush=True)
+                elif ply_prefix_b and not is_prefix_b:
+                    # Single file path (legacy or single-GPU)
+                    if Path(ply_prefix_b).exists():
+                        ply_path_b = ply_prefix_b
+                    else:
+                        merge_errors.append(f"Tile B: PLY file not found: {ply_prefix_b}")
+
+                # Cat3 merged 시각화 (best-effort, multi-rank 인 경우만)
+                try:
+                    if num_ranks > 1 and is_prefix_a and is_prefix_b and tile_a_info.get("bbox") and tile_b_info.get("bbox"):
+                        sys.path.insert(0, str(ROOT / "Grendel-GS"))
+                        from utils.oom_viz import save_merged_cat3_viz
+                        from scene.adaptive_tile_utils import TileBBox as _TBB
+                        parent_bbox_obj = tile.bbox
+                        tile_a_bbox_obj = _TBB.from_string(tile_a_info["bbox"])
+                        tile_b_bbox_obj = _TBB.from_string(tile_b_info["bbox"])
+                        iter_for_viz = oom_info.get("iteration", 0) if isinstance(oom_info, dict) else 0
+                        tile_id_for_viz = getattr(tile, "tile_id", "tile")
+                        viz_dir = Path(self.args.output_path) / "visualizations" / "cat3_oom"
+                        viz_dir.mkdir(parents=True, exist_ok=True)
+
+                        for child_label, child_prefix, child_bbox in [
+                            ("A", ply_prefix_a, tile_a_bbox_obj),
+                            ("B", ply_prefix_b, tile_b_bbox_obj),
+                        ]:
+                            if not child_prefix:
+                                return ("next", completed_delta)
+                            rank_files = [f"{child_prefix}_rank{r}.ply" for r in range(num_ranks)]
+                            rank_files = [p for p in rank_files if Path(p).exists()]
+                            if not rank_files:
+                                return ("next", completed_delta)
+                            out_png = viz_dir / f"cat3_iter{iter_for_viz}_{tile_id_for_viz}_child{child_label}_merged.png"
+                            save_merged_cat3_viz(
+                                rank_files,
+                                iteration=iter_for_viz,
+                                tile_id=f"{tile_id_for_viz}_child{child_label}",
+                                parent_bbox=parent_bbox_obj,
+                                tile_a=tile_a_bbox_obj,
+                                tile_b=tile_b_bbox_obj,
+                                out_path=out_png,
+                            )
+                            print(f"  [viz] saved merged Cat3 viz -> {out_png}", flush=True)
+                except Exception as _viz_e:
+                    print(f"  [viz] merged Cat3 viz skipped: {_viz_e}", flush=True)
+
+                # If any merge failed, try to use partial results
+                if merge_errors:
+                    print(f"\n{'!'*60}", flush=True)
+                    print(f"  WARNING: Category 3 OOM PLY merge partially failed!", flush=True)
+                    for err in merge_errors:
+                        print(f"  - {err}", flush=True)
+                    print(f"  ", flush=True)
+                    print(f"  This indicates that some GPU ranks did not complete saving.", flush=True)
+                    print(f"  Possible causes:", flush=True)
+                    print(f"    1. Ranks were killed before completing PLY save", flush=True)
+                    print(f"    2. Disk space or I/O error during save", flush=True)
+                    print(f"    3. SIGTERM timeout too short", flush=True)
+                    print(f"  ", flush=True)
+                    # Show which merges succeeded (if any)
+                    if ply_path_a:
+                        print(f"  [Partial success] Tile A merged: {ply_path_a}", flush=True)
+                    if ply_path_b:
+                        print(f"  [Partial success] Tile B merged: {ply_path_b}", flush=True)
+                    print(f"  ", flush=True)
+                        
+                    # Allow partial results if at least one tile has data
+                    if ply_path_a or ply_path_b:
+                        print(f"  [PARTIAL SUCCESS] Continuing with available PLY files:", flush=True)
+                        if ply_path_a:
+                            print(f"    - Tile A: {ply_path_a}", flush=True)
+                        if ply_path_b:
+                            print(f"    - Tile B: {ply_path_b}", flush=True)
+                        print(f"  Note: Missing rank data will result in incomplete gaussians", flush=True)
+                        print(f"{'!'*60}\n", flush=True)
+                    else:
+                        print(f"  FATAL: No PLY files available at all. Cannot continue.", flush=True)
+                        print(f"{'!'*60}\n", flush=True)
+                        sys.exit(1)
+
+                if ply_path_a or ply_path_b:
+                    print(f"  [Category 3 Resume] Child tiles will load pre-trained gaussians:", flush=True)
+                    if ply_path_a:
+                        print(f"    {tile_a_id} -> {ply_path_a}", flush=True)
+                    if ply_path_b:
+                        print(f"    {tile_b_id} -> {ply_path_b}", flush=True)
+
+                    # Validate merged counts against expected counts from done files
+                    expected_counts = oom_info.get('expected_counts')
+                    if expected_counts and expected_counts.get('ranks_found', 0) == num_ranks:
+                        print(f"\n  [Validation] Checking merged gaussian counts...")
+                        expected_a = expected_counts.get('count_a', 0)
+                        expected_b = expected_counts.get('count_b', 0)
+                        actual_a = count_a if (ply_prefix_a and is_prefix_a) else 0
+                        actual_b = count_b if (ply_prefix_b and is_prefix_b) else 0
+
+                        valid = True
+                        if expected_a > 0:
+                            if actual_a == expected_a:
+                                print(f"    ✓ Child A: {actual_a:,} == expected {expected_a:,}")
+                            else:
+                                print(f"    ✗ Child A: {actual_a:,} != expected {expected_a:,} (diff: {actual_a - expected_a:+,})")
+                                valid = False
+                        if expected_b > 0:
+                            if actual_b == expected_b:
+                                print(f"    ✓ Child B: {actual_b:,} == expected {expected_b:,}")
+                            else:
+                                print(f"    ✗ Child B: {actual_b:,} != expected {expected_b:,} (diff: {actual_b - expected_b:+,})")
+                                valid = False
+
+                        if valid:
+                            print(f"    [Validation PASSED] All gaussian counts match!")
+                            # Write validation info for load-time check
+                            if ply_path_a:
+                                val_file_a = Path(ply_path_a).with_suffix('.validation.json')
+                                with open(val_file_a, 'w') as f:
+                                    json.dump({'expected_count': actual_a, 'num_ranks': num_ranks}, f)
+                            if ply_path_b:
+                                val_file_b = Path(ply_path_b).with_suffix('.validation.json')
+                                with open(val_file_b, 'w') as f:
+                                    json.dump({'expected_count': actual_b, 'num_ranks': num_ranks}, f)
+                        else:
+                            print(f"    [Validation FAILED] Gaussian count mismatch detected!")
+                            print(f"    This may indicate incomplete saves or merge issues.")
+                    elif expected_counts:
+                        print(f"\n  [Validation] Skipped: only {expected_counts.get('ranks_found', 0)}/{num_ranks} done files found")
+                else:
+                    # This should not happen - Category 3 OOM should always have PLY paths
+                    print(f"\n{'!'*60}", flush=True)
+                    print(f"  FATAL ERROR: Category 3 OOM but no PLY paths in oom_info!", flush=True)
+                    print(f"  tile_a_info: {tile_a_info}", flush=True)
+                    print(f"  tile_b_info: {tile_b_info}", flush=True)
+                    print(f"{'!'*60}\n", flush=True)
+                    sys.exit(1)
+            else:
+                print(f"  Category {oom_category} OOM: Child tiles will start from scratch", flush=True)
+
+            print("#" * 60 + "\n", flush=True)
+
+            # Insert split tiles at the beginning so they are processed immediately
+            # Rebuild tiles dict with split tiles first
+            new_tiles = {}
+            new_tiles[tile_a_id] = TileInfo(tile_a_id, bbox_a, "pending", ply_path=ply_path_a)
+            new_tiles[tile_b_id] = TileInfo(tile_b_id, bbox_b, "pending", ply_path=ply_path_b)
+            for tid, t in self.tiles.items():
+                new_tiles[tid] = t
+            self.tiles = new_tiles
+
+            self._save_state()
+                
+            # Generate visual debug for new tiles after OOM split
+            self._generate_visual_debug_for_tile(bbox_a, tile_a_id)
+            self._generate_visual_debug_for_tile(bbox_b, tile_b_id)
+
+        else:
+            # Other failures (non-OOM exit).
+            #
+            # 2026-08-11 인프라 실패 재시도. 실측: 8/11 면적 팔 런에서 타일 2개가
+            # "ProcessGroupNCCL ... no GPUs found!" 로 학습 0 iteration 에 죽어
+            # 영구 FAILED = 최종 씬의 구멍이 됐다. 원인은 컨테이너의 일시적 GPU
+            # 유실(호스트 cgroup 이벤트로 장치 연결이 끊기는 알려진 고질병) —
+            # 같은 타일이 재개 런에서는 무수정으로 정상 완주했다(일시성 실증).
+            # 미션은 "어떤 GPU 에서든 무인 완주" — 딸꾹질하는 환경도 그 범위다.
+            # OOM 과 같은 철학으로: 예방하려 들지 말고, 분류하고 재시도한다.
+            #   1) 비 OOM 실패는 즉시 FAILED 가 아니라 최대 2회 재큐잉.
+            #      (일시 장애는 1회로 충분함이 실증됐고, 결정론적 버그면 3회
+            #       모두 몇 초 내에 죽어 비용이 거의 없다)
+            #   2) 재시도 전 nvidia-smi 로 환경 생사 확인 — GPU 가 아예 안 보이면
+            #      컨테이너 자체가 죽은 것이므로 재시도가 무의미. 특수 코드 77 로
+            #      종료해 바깥 감시 루프(run_forever.sh)가 컨테이너를 재기동하게 한다.
+            INFRA_MAX_RETRIES = 2
+            infra_retries = getattr(tile, '_infra_retries', 0)
+
+            gpu_alive = True
+            try:
+                subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                               timeout=30, check=True)
+            except Exception:
+                gpu_alive = False
+
+            if not gpu_alive:
+                print(f"[Tile {tile.tile_id}] Failed (exit {exit_code}) and "
+                      f"nvidia-smi sees NO GPUs — container lost device access.", flush=True)
+                print(f"  Exiting with code 77 so an outer supervisor can restart "
+                      f"the container. State is saved; rerun resumes here.", flush=True)
+                tile.status = "pending"   # 재기동 후 이 타일부터 재개
+                self._save_state()
+                sys.exit(77)
+            elif infra_retries < INFRA_MAX_RETRIES:
+                tile._infra_retries = infra_retries + 1
+                tile.status = "pending"
+                print(f"[Tile {tile.tile_id}] Failed with exit code {exit_code} "
+                      f"(non-OOM; likely transient infra).", flush=True)
+                print(f"  [INFRA RETRY] Re-queueing same tile "
+                      f"({tile._infra_retries}/{INFRA_MAX_RETRIES})...", flush=True)
+                self._save_state()
+                return ("next", completed_delta)
+            else:
+                print(f"[Tile {tile.tile_id}] Failed with exit code {exit_code} "
+                      f"after {INFRA_MAX_RETRIES} infra retries.", flush=True)
+                print(f"  Marking tile as FAILED and continuing...", flush=True)
+                tile.status = "failed"
+                self._save_state()
+                completed_delta += 1
+
+        return ("next", completed_delta)
+
+    def _prepare_tile(self, tile: TileInfo):
+        """타일 선택 후 발사 전 단계: 표시·레벨 검사·선제 분할·카메라 계산.
+        2026-08-12 병렬 스케줄러용 무변경 추출.
+        반환: (action, completed_delta, visible_cameras, tile_area)
+          action "launch" = 발사 진행, "next" = 이 타일은 여기서 종결(선제분할 등).
+        """
+        completed_delta = 0
+        print("\n" + "=" * 60, flush=True)
+        print(f">>>  STARTING TILE: {tile.tile_id}  <<<", flush=True)
+        print("=" * 60, flush=True)
+        print(f"  BBox: {tile.bbox.to_string()}", flush=True)
+        print(f"  Size: ({tile.bbox.size[0]:.1f}, {tile.bbox.size[1]:.1f}, {tile.bbox.size[2]:.1f})", flush=True)
+
+        # Print level info
+        tile_area = tile.bbox.size[0] * tile.bbox.size[1]
+        current_level = self._get_tile_level(tile_area)
+        print(f"  Area: {tile_area:.1f}, Level: {current_level}", flush=True)
+        print(f"  [Level tracking] min_successful_level: {self.min_successful_level}", flush=True)
+
+        # Clear visualizations folder only once at the very beginning
+        if not hasattr(self, '_vis_cleared'):
+            self._clear_visualizations()
+            self._vis_cleared = True
+
+        # Visualize tile map before starting this tile
+        try:
+            self._visualize_tile_map(current_tile_id=tile.tile_id)
+        except Exception as e:
+            print(f"  [Visualization ERROR] {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+        # Compute visible cameras
+        visible_cameras = self._compute_visible_cameras(
+            tile.bbox, self.args.tile_crop_margin,
+            tile_id=tile.tile_id, visual_debug=self.args.visual_debug
+        )
+        tile.num_cameras = len(visible_cameras)
+        print(f"  Visible cameras: {len(visible_cameras)} / {len(self.cam_infos)}")
+        if visible_cameras:
+            print(f"    Names: {visible_cameras[:5]}{'...' if len(visible_cameras) > 5 else ''}")
+
+        
+        # If visual_debug_only, generate images for all levels up to target
+        if self.args.visual_debug_only:
+            print(f"  [Visual Debug] Generated images for level {current_level}")
+            print(f"  Debug images saved to: {self.output_path}/visualizations/projection_debug/{tile.tile_id}/")
+            
+            if current_level == self.args.visual_debug_level:
+                print("\n" + "=" * 60)
+                print(f"Visual Debug Complete! Generated images for levels 0-{current_level}")
+                print("Exiting (--visual-debug-only mode)")
+                print("=" * 60)
+                sys.exit(0)
+            elif current_level < self.args.visual_debug_level:
+                print(f"  [Visual Debug] Continuing to level {current_level + 1} (target: level {self.args.visual_debug_level})")
+                # Simulate OOM to force split for reaching next level
+                print(f"  [Visual Debug] Simulating OOM to split tile")
+                
+                # Split tile logic (same as preemptive split)
+                bbox_a, bbox_b = tile.bbox.split()
+                tile_a_id = self._next_tile_id()
+                tile_b_id = self._next_tile_id()
+                
+                tile.status = "split"
+                tile.fail_iter = 0  # Mark as visual debug split
+                tile.oom_type = "visual_debug"
+                
+                # Create child tiles
+                child_a = TileInfo(tile_a_id, bbox_a, "pending")
+                child_b = TileInfo(tile_b_id, bbox_b, "pending")
+                
+                # Add to tiles dict and save state
+                self.tiles[tile_a_id] = child_a
+                self.tiles[tile_b_id] = child_b
+                self._save_state()
+                
+                print(f"  Split into {tile_a_id} and {tile_b_id} for visual debug")
+                return ("next", completed_delta, None, 0.0)
+
+        if len(visible_cameras) == 0:
+            print(f"  [Warning] No cameras see this tile, skipping...")
+            tile.status = "completed"
+            self._save_state()
+            completed_delta += 1
+            return ("next", completed_delta, None, 0.0)
+
+        # Preemptive split based on level:
+        # - If we know level N succeeds, try level N-1 (one step larger)
+        # - But don't try level N-2 or larger (2+ steps), split immediately
+        tile_area = tile.bbox.size[0] * tile.bbox.size[1]
+        current_level = self._get_tile_level(tile_area)
+
+        should_preemptive_split = False
+        if self.min_successful_level is not None:
+            # min_successful_level - 1 = one step larger (allowed to try)
+            # min_successful_level - 2 or less = two+ steps larger (preemptive split)
+            allowed_level = self.min_successful_level - 1
+            level_diff = self.min_successful_level - current_level
+            print(f"  [Level check] current={current_level}, min_success={self.min_successful_level}, allowed={allowed_level}, diff={level_diff}", flush=True)
+            if current_level < self.min_successful_level - 1:
+                should_preemptive_split = True
+                print(f"  [Level check] WILL PREEMPTIVE SPLIT (level {current_level} < allowed {allowed_level})", flush=True)
+            else:
+                print(f"  [Level check] OK to try (level {current_level} >= allowed {allowed_level})", flush=True)
+        else:
+            print(f"  [Level check] No successful level yet, will try this tile", flush=True)
+
+        if should_preemptive_split:
+            print("\n" + "#" * 60, flush=True)
+            print("###  PREEMPTIVE SPLIT (2+ levels larger than known successful)  ###", flush=True)
+            print("#" * 60, flush=True)
+            print(f"  Current tile level: {current_level}")
+            print(f"  Min successful level: {self.min_successful_level}")
+            print(f"  (Level {self.min_successful_level - 1} would be tried, but {current_level} is too large)")
+
+            # Check minimum tile size before splitting
+            MIN_TILE_SIZE = 50.0
+            tile_size = tile.bbox.size
+            min_dim = min(tile_size[0], tile_size[1])
+
+            if min_dim < MIN_TILE_SIZE:
+                print(f"  Cannot split further (min dimension {min_dim:.1f} < {MIN_TILE_SIZE})")
+                print(f"  Will attempt training anyway...")
+            else:
+                # Split tile without attempting training
+                bbox_a, bbox_b = tile.bbox.split()
+                tile_a_id = self._next_tile_id()
+                tile_b_id = self._next_tile_id()
+
+                tile.status = "split"
+                tile.fail_iter = 0  # Mark as preemptive split (iter 0)
+
+                # Calculate levels for new tiles
+                size_a = bbox_a.size
+                size_b = bbox_b.size
+                area_a = size_a[0] * size_a[1]
+                area_b = size_b[0] * size_b[1]
+                level_a = self._get_tile_level(area_a)
+                level_b = self._get_tile_level(area_b)
+
+                print(f"  Split into:", flush=True)
+                print(f"    {tile_a_id}: size=({size_a[0]:.1f}, {size_a[1]:.1f}, {size_a[2]:.1f}), level={level_a}", flush=True)
+                print(f"    {tile_b_id}: size=({size_b[0]:.1f}, {size_b[1]:.1f}, {size_b[2]:.1f}), level={level_b}", flush=True)
+                print("#" * 60 + "\n", flush=True)
+
+                new_tiles = {}
+                new_tiles[tile_a_id] = TileInfo(tile_a_id, bbox_a, "pending")
+                new_tiles[tile_b_id] = TileInfo(tile_b_id, bbox_b, "pending")
+                for tid, t in self.tiles.items():
+                    new_tiles[tid] = t
+                self.tiles = new_tiles
+
+                self._save_state()
+                
+                # Generate visual debug for new tiles
+                self._generate_visual_debug_for_tile(bbox_a, tile_a_id)
+                self._generate_visual_debug_for_tile(bbox_b, tile_b_id)
+                
+                return ("next", completed_delta, None, 0.0)
+
+        # Mark as in_progress
+        tile.status = "in_progress"
+        self._save_state()
+
+        # Run training
+        return ("launch", completed_delta, visible_cameras, tile_area)
+
+    def _group_size_for(self, tile: TileInfo, free_count: int) -> int:
+        """타일에 배정할 GPU 수 — '아는 값의 산수'로 피할 수 있는 OOM 은 피한다.
+
+        (2026-08-12 v3, user 교정 반영) 원칙: densification 성장의 OOM 만
+        필연으로 감수하고, 발사 전에 계산 가능한 두 가지는 산수로 맞춘다.
+          k_img: 이미지 작업셋. 실측 앵커 — 루트(1.96억px×30캠)가 ws=3 즉사,
+                 ws=8 생존 → rank 당 픽셀·캠 예산 = 루트총량/8.
+                 타일의 몫은 면적 비율로 근사(크롭이 면적에 비례).
+          k_inh: 상속 가우시안. 실측 앵커 — 24GB 1장이 상속 ~2.5M + 성장
+                 여유를 감당 (스모크 런 rank 보유 2.3~3.4M 관찰).
+        k = max(둘) — 부족 배정으로 '피할 수 있던' Cat1/Cat4 를 만들지 않는다.
+        """
+        import math
+        # 이미지 예산: 루트 전량(픽셀×캠) 의 1/8 이 rank 1개 한계 실측
+        root_load = 17310.0 * 11310.0 * 30.0
+        tile_frac = (tile.bbox.size[0] * tile.bbox.size[1]) / max(self.initial_area, 1e-9)
+        cams = tile.num_cameras or 30
+        tile_load = root_load * tile_frac * (cams / 30.0)
+        k_img = math.ceil(tile_load / (root_load / 8.0))
+        # 상속 예산: PLY 크기 → 개수 (≈230 B/gaussian) → 2.5M/GPU
+        k_inh = 1
+        if tile.ply_path:
+            try:
+                n_inh = os.path.getsize(tile.ply_path) / 230.0
+                k_inh = math.ceil(n_inh / 2_500_000.0)
+            except OSError:
+                pass
+        k = max(1, k_img, k_inh)
+        return min(self.args.num_gpus, k)
+    def _run_parallel(self, max_tiles: int) -> int:
+        """병렬 타일 스케줄러 (2026-08-12, 배꼽 1위 '직렬 큐' 제거).
+
+        구조: 실행(_run_torchrun)만 스레드로 — 선택·준비·결과 처리(상태 변경
+        전부)는 이 메인 스레드가 독점한다. 조정 파일은 coord_{tile_id}/ 로
+        격리돼 있고(선행 커밋), shm 은 torchrun ppid 기반이라 원래 격리됨.
+        """
+        import threading, queue
+        free = list(range(self.args.num_gpus))
+        results: "queue.Queue" = queue.Queue()
+        inflight = 0
+        completed = 0
+        port_seq = 0
+        parked = None   # 자원 부족으로 미룬 타일 (선택 순서 보존)
+
+        while completed < max_tiles:
+            # ── 채우기: 자원이 있고 대기 타일이 있는 한 계속 발사 ──
+            while free:
+                tile = parked or self._get_next_tile()
+                parked = None
+                if tile is None:
+                    break
+                action, delta, vis, area = self._prepare_tile(tile)
+                completed += delta
+                if action != "launch":
+                    continue
+                k = self._group_size_for(tile, len(free))
+                if k > len(free):
+                    parked = tile        # 큰 타일인데 자원 부족 → 회수 대기
+                    break
+                gpus = [free.pop(0) for _ in range(k)]
+                port = 29600 + (port_seq % 200)
+                port_seq += 1
+                print(f"[sched] {tile.tile_id} -> GPUs {gpus} (port {port}, "
+                      f"inflight {inflight+1})", flush=True)
+
+                def _worker(t=tile, g=gpus, v=vis, a=area, p=port):
+                    try:
+                        code, oom = self._run_torchrun(t, v, gpu_ids=g, master_port=p)
+                    except Exception as e:
+                        print(f"[sched] {t.tile_id} launcher exception: {e}", flush=True)
+                        code, oom = 1, None
+                    results.put((t, g, a, code, oom))
+                threading.Thread(target=_worker, daemon=True).start()
+                inflight += 1
+
+            if inflight == 0:
+                if parked is None and self._get_next_tile() is None:
+                    print("\n[Done] No more pending tiles.")
+                    break
+                # parked 만 남고 자원도 전부 자유 → k<=num_gpus 이므로 다음 루프에서 발사됨
+                continue
+
+            # ── 회수: 끝난 타일 하나 처리 (상태 변경은 여기, 메인 스레드) ──
+            tile, gpus, area, code, oom = results.get()
+            free.extend(gpus)
+            inflight -= 1
+            status, delta = self._handle_tile_result(tile, code, oom, area)
+            completed += delta
+        return completed
+
     def run(self):
         """Main training loop."""
         print("\n" + "=" * 60)
@@ -2030,686 +2825,27 @@ class AdaptiveTileTrainer:
         max_tiles = 1000  # Safety limit
         completed = 0
 
-        while completed < max_tiles:
+        # 병렬 스케줄러 (SCHED_PARALLEL=0 으로 끄면 기존 직렬 경로 — A/B 용)
+        # 2026-08-12 기본 비활성 (user 판정): 성장 OOM 은 예측 불가(r=0.28)라
+        # "필요한 만큼 배정"이 원리적으로 불가능 — 부족 배정은 분할을 제조해
+        # 병렬 이득을 상쇄한다. 성장-지배 구간에선 전-GPU 몰빵(직렬)이 보수적
+        # 최적. 코드는 실험 스위치로 보존 (SCHED_PARALLEL=1 로만 활성).
+        if os.environ.get("SCHED_PARALLEL", "0") == "1" and self.args.num_gpus >= 2:
+            completed = self._run_parallel(max_tiles)
+        else:
+          while completed < max_tiles:
             tile = self._get_next_tile()
             if tile is None:
                 print("\n[Done] No more pending tiles.")
                 break
 
-            print("\n" + "=" * 60, flush=True)
-            print(f">>>  STARTING TILE: {tile.tile_id}  <<<", flush=True)
-            print("=" * 60, flush=True)
-            print(f"  BBox: {tile.bbox.to_string()}", flush=True)
-            print(f"  Size: ({tile.bbox.size[0]:.1f}, {tile.bbox.size[1]:.1f}, {tile.bbox.size[2]:.1f})", flush=True)
-
-            # Print level info
-            tile_area = tile.bbox.size[0] * tile.bbox.size[1]
-            current_level = self._get_tile_level(tile_area)
-            print(f"  Area: {tile_area:.1f}, Level: {current_level}", flush=True)
-            print(f"  [Level tracking] min_successful_level: {self.min_successful_level}", flush=True)
-
-            # Clear visualizations folder only once at the very beginning
-            if not hasattr(self, '_vis_cleared'):
-                self._clear_visualizations()
-                self._vis_cleared = True
-
-            # Visualize tile map before starting this tile
-            try:
-                self._visualize_tile_map(current_tile_id=tile.tile_id)
-            except Exception as e:
-                print(f"  [Visualization ERROR] {e}", flush=True)
-                import traceback
-                traceback.print_exc()
-
-            # Compute visible cameras
-            visible_cameras = self._compute_visible_cameras(
-                tile.bbox, self.args.tile_crop_margin,
-                tile_id=tile.tile_id, visual_debug=self.args.visual_debug
-            )
-            tile.num_cameras = len(visible_cameras)
-            print(f"  Visible cameras: {len(visible_cameras)} / {len(self.cam_infos)}")
-            if visible_cameras:
-                print(f"    Names: {visible_cameras[:5]}{'...' if len(visible_cameras) > 5 else ''}")
-
-            
-            # If visual_debug_only, generate images for all levels up to target
-            if self.args.visual_debug_only:
-                print(f"  [Visual Debug] Generated images for level {current_level}")
-                print(f"  Debug images saved to: {self.output_path}/visualizations/projection_debug/{tile.tile_id}/")
-                
-                if current_level == self.args.visual_debug_level:
-                    print("\n" + "=" * 60)
-                    print(f"Visual Debug Complete! Generated images for levels 0-{current_level}")
-                    print("Exiting (--visual-debug-only mode)")
-                    print("=" * 60)
-                    sys.exit(0)
-                elif current_level < self.args.visual_debug_level:
-                    print(f"  [Visual Debug] Continuing to level {current_level + 1} (target: level {self.args.visual_debug_level})")
-                    # Simulate OOM to force split for reaching next level
-                    print(f"  [Visual Debug] Simulating OOM to split tile")
-                    
-                    # Split tile logic (same as preemptive split)
-                    bbox_a, bbox_b = tile.bbox.split()
-                    tile_a_id = self._next_tile_id()
-                    tile_b_id = self._next_tile_id()
-                    
-                    tile.status = "split"
-                    tile.fail_iter = 0  # Mark as visual debug split
-                    tile.oom_type = "visual_debug"
-                    
-                    # Create child tiles
-                    child_a = TileInfo(tile_a_id, bbox_a, "pending")
-                    child_b = TileInfo(tile_b_id, bbox_b, "pending")
-                    
-                    # Add to tiles dict and save state
-                    self.tiles[tile_a_id] = child_a
-                    self.tiles[tile_b_id] = child_b
-                    self._save_state()
-                    
-                    print(f"  Split into {tile_a_id} and {tile_b_id} for visual debug")
-                    continue
-
-            if len(visible_cameras) == 0:
-                print(f"  [Warning] No cameras see this tile, skipping...")
-                tile.status = "completed"
-                self._save_state()
-                completed += 1
+            action, delta, visible_cameras, tile_area = self._prepare_tile(tile)
+            completed += delta
+            if action != "launch":
                 continue
-
-            # Preemptive split based on level:
-            # - If we know level N succeeds, try level N-1 (one step larger)
-            # - But don't try level N-2 or larger (2+ steps), split immediately
-            tile_area = tile.bbox.size[0] * tile.bbox.size[1]
-            current_level = self._get_tile_level(tile_area)
-
-            should_preemptive_split = False
-            if self.min_successful_level is not None:
-                # min_successful_level - 1 = one step larger (allowed to try)
-                # min_successful_level - 2 or less = two+ steps larger (preemptive split)
-                allowed_level = self.min_successful_level - 1
-                level_diff = self.min_successful_level - current_level
-                print(f"  [Level check] current={current_level}, min_success={self.min_successful_level}, allowed={allowed_level}, diff={level_diff}", flush=True)
-                if current_level < self.min_successful_level - 1:
-                    should_preemptive_split = True
-                    print(f"  [Level check] WILL PREEMPTIVE SPLIT (level {current_level} < allowed {allowed_level})", flush=True)
-                else:
-                    print(f"  [Level check] OK to try (level {current_level} >= allowed {allowed_level})", flush=True)
-            else:
-                print(f"  [Level check] No successful level yet, will try this tile", flush=True)
-
-            if should_preemptive_split:
-                print("\n" + "#" * 60, flush=True)
-                print("###  PREEMPTIVE SPLIT (2+ levels larger than known successful)  ###", flush=True)
-                print("#" * 60, flush=True)
-                print(f"  Current tile level: {current_level}")
-                print(f"  Min successful level: {self.min_successful_level}")
-                print(f"  (Level {self.min_successful_level - 1} would be tried, but {current_level} is too large)")
-
-                # Check minimum tile size before splitting
-                MIN_TILE_SIZE = 50.0
-                tile_size = tile.bbox.size
-                min_dim = min(tile_size[0], tile_size[1])
-
-                if min_dim < MIN_TILE_SIZE:
-                    print(f"  Cannot split further (min dimension {min_dim:.1f} < {MIN_TILE_SIZE})")
-                    print(f"  Will attempt training anyway...")
-                else:
-                    # Split tile without attempting training
-                    bbox_a, bbox_b = tile.bbox.split()
-                    tile_a_id = self._next_tile_id()
-                    tile_b_id = self._next_tile_id()
-
-                    tile.status = "split"
-                    tile.fail_iter = 0  # Mark as preemptive split (iter 0)
-
-                    # Calculate levels for new tiles
-                    size_a = bbox_a.size
-                    size_b = bbox_b.size
-                    area_a = size_a[0] * size_a[1]
-                    area_b = size_b[0] * size_b[1]
-                    level_a = self._get_tile_level(area_a)
-                    level_b = self._get_tile_level(area_b)
-
-                    print(f"  Split into:", flush=True)
-                    print(f"    {tile_a_id}: size=({size_a[0]:.1f}, {size_a[1]:.1f}, {size_a[2]:.1f}), level={level_a}", flush=True)
-                    print(f"    {tile_b_id}: size=({size_b[0]:.1f}, {size_b[1]:.1f}, {size_b[2]:.1f}), level={level_b}", flush=True)
-                    print("#" * 60 + "\n", flush=True)
-
-                    new_tiles = {}
-                    new_tiles[tile_a_id] = TileInfo(tile_a_id, bbox_a, "pending")
-                    new_tiles[tile_b_id] = TileInfo(tile_b_id, bbox_b, "pending")
-                    for tid, t in self.tiles.items():
-                        new_tiles[tid] = t
-                    self.tiles = new_tiles
-
-                    self._save_state()
-                    
-                    # Generate visual debug for new tiles
-                    self._generate_visual_debug_for_tile(bbox_a, tile_a_id)
-                    self._generate_visual_debug_for_tile(bbox_b, tile_b_id)
-                    
-                    continue
-
-            # Mark as in_progress
-            tile.status = "in_progress"
-            self._save_state()
-
-            # Run training
             exit_code, oom_info = self._run_torchrun(tile, visible_cameras)
-
-            # Count timeline 시각화: 매 타일 종료 후 두 aggregate PNG 갱신 (best-effort)
-            #  - all_tiles_timeline.png: x=학습 iter, 각 타일 색 분리
-            #  - oom_progression.png:    x=타일 처리 순서, wrapper 시퀀스 뷰
-            try:
-                count_dir = Path(self.args.output_path) / "visualizations" / "count_timeline"
-                if count_dir.exists() and any(count_dir.glob("*_rank*.jsonl")):
-                    sys.path.insert(0, str(ROOT / "Grendel-GS"))
-                    from utils.oom_viz import save_all_tiles_timeline_viz, save_oom_progression_viz
-
-                    agg_png = count_dir / "all_tiles_timeline.png"
-                    save_all_tiles_timeline_viz(count_dir, out_path=agg_png, target_count=None)
-                    prog_png = count_dir / "oom_progression.png"
-                    save_oom_progression_viz(count_dir, out_path=prog_png)
-                    print(f"  [viz] timeline updated -> {agg_png.name}, {prog_png.name}", flush=True)
-            except Exception as _ct_viz_e:
-                print(f"  [viz] count timeline skipped: {_ct_viz_e}", flush=True)
-
-            # Tile split tree 매 타일 처리 후 갱신 (best-effort)
-            try:
-                self._visualize_split_tree()
-            except Exception as _tree_e:
-                print(f"  [viz] tile split tree skipped: {_tree_e}", flush=True)
-
-            # Log exit code for debugging
-            print(f"\n[Tile {tile.tile_id}] torchrun exit_code = {exit_code}", flush=True)
-            print(f"  oom_info = {oom_info}", flush=True)
-            print(f"  EXIT_CODE_OOM = {self.EXIT_CODE_OOM}", flush=True)
-            print(f"  Recognized OOM codes: {self.EXIT_CODE_OOM}, -9, 143, -15, 137", flush=True)
-            if oom_info and oom_info.get("abort") == "render_debug":
-                print("  [Render debug] Aborting adaptive run due to render debug abort.", flush=True)
-                sys.exit(1)
-
-            if exit_code == self.EXIT_CODE_SUCCESS:
-                tile.status = "completed"
-                # 타일 품질 지표 로드 (train_internal 이 저장 시점에 기록)
-                done_info_path = self.output_path / "models" / tile.tile_id / "done_info.json"
-                if done_info_path.exists():
-                    try:
-                        with open(done_info_path) as f:
-                            tile.quality = json.load(f)
-                        print(f"  [quality] final_epoch_loss="
-                              f"{tile.quality.get('final_epoch_loss')} "
-                              f"({tile.quality.get('done_reason')})", flush=True)
-                    except Exception as e:
-                        print(f"  [quality] done_info 읽기 실패: {e}", flush=True)
-                # Track successful tile level (smaller level = larger tile)
-                tile_area = tile.bbox.size[0] * tile.bbox.size[1]
-                tile_level = self._get_tile_level(tile_area)
-                if self.min_successful_level is None or tile_level < self.min_successful_level:
-                    self.min_successful_level = tile_level
-                    print(f"  [Success] Updated min successful level: {tile_level} (area: {tile_area:.1f})")
-                self._save_state()
-                completed += 1
-                print(f"[Tile {tile.tile_id}] Completed successfully (level {tile_level}).")
-
-                # Copy completed PLY to ply folder with informative name
-                self._save_completed_ply(tile, tile_level)
-
-            elif exit_code == self.EXIT_CODE_OOM or exit_code == -9 or exit_code in (143, -15, 137):
-                # exit_code meanings:
-                #   42: EXIT_CODE_OOM (explicit OOM handling)
-                #   -9: SIGKILL (OS killed due to RAM OOM)
-                #   143: SIGTERM (128+15, torchrun shutdown - likely OOM from another rank)
-                #   -15: SIGTERM (negative signal)
-                #   137: SIGKILL (128+9, torchrun shutdown)
-                # Determine OOM type
-                is_ram_oom = (exit_code == -9)
-                is_sigterm = (exit_code in (143, -15, 137))
-                if is_sigterm:
-                    print(f"[Tile {tile.tile_id}] SIGTERM/SIGKILL exit ({exit_code}) - treating as OOM", flush=True)
-                oom_type_str = "RAM" if is_ram_oom else "GPU"
-
-                # RAM OOM: wait for OS to reclaim memory from dead processes
-                if is_ram_oom:
-                    import gc
-                    import psutil
-
-                    gc.collect()  # Force Python garbage collection
-
-                    # Wait until RAM usage drops below 70%
-                    max_wait = 300  # Maximum wait time: 5 minutes
-                    waited = 0
-                    mem = psutil.virtual_memory()
-                    print(f"\n[RAM OOM] Current RAM usage: {mem.percent:.1f}%", flush=True)
-
-                    while mem.percent > 70 and waited < max_wait:
-                        print(f"[RAM OOM] RAM usage {mem.percent:.1f}% > 70%, waiting... ({waited}s/{max_wait}s)", flush=True)
-                        time.sleep(10)
-                        waited += 10
-                        gc.collect()
-                        mem = psutil.virtual_memory()
-
-                    if mem.percent > 70:
-                        print(f"[RAM OOM] WARNING: RAM still at {mem.percent:.1f}% after {max_wait}s, proceeding anyway...", flush=True)
-                    else:
-                        print(f"[RAM OOM] RAM usage dropped to {mem.percent:.1f}%, resuming.", flush=True)
-
-                oom_iteration = oom_info.get("iteration") if oom_info else None
-                oom_category = oom_info.get("oom_category") if oom_info else None
-
-                print("\n" + "#" * 60, flush=True)
-                print(f"###  {oom_type_str} OOM DETECTED - SPLITTING TILE  ###", flush=True)
-                print("#" * 60, flush=True)
-                tile_area = tile.bbox.size[0] * tile.bbox.size[1]
-                tile_level = self._get_tile_level(tile_area)
-                print(f"[Tile {tile.tile_id}] {oom_type_str} OOM at iteration {oom_iteration}, level={tile_level}, splitting...", flush=True)
-                tile.fail_iter = oom_iteration
-                tile.oom_type = "ram" if is_ram_oom else "gpu"
-                tile.oom_category = oom_category
-
-                # Category 4: pre-trained gaussians too large before densification.
-                # Split and reuse parent PLY — no new PLY saving needed.
-                if oom_category == 4:
-                    print(f"  [Category 4] Pre-trained gaussians too large (iter {oom_iteration}, before densification).", flush=True)
-                    print(f"  Splitting tile. Children will reuse parent PLY filtered by bbox.", flush=True)
-
-                # Category 2: memory fragmentation, not a size problem.
-                # Retry the same tile — the torchrun process already exited,
-                # so GPU memory is freed and fragmentation is gone.
-                #
-                # 2026-08-10 진행 기반 재시도 정책. 완주 런 3개의 실측:
-                #   동일 iteration 재발(96→96→96→96, 103→103→103, 145→145→145→145)은
-                #   한 번도 성공 못 함 — 파편화가 아니라 결정론적 용량 초과라 재시도가
-                #   순수 낭비(스모크 런 벽시계의 10.3%). 반면 전진한 경우(125→153)는
-                #   재시도가 Cat3 도달(=가우시안 회수)로 이어짐.
-                # → 규칙: 직전 시도보다 iteration 이 "전진했을 때만" 재시도를 계속한다.
-                MAX_CAT2_RETRIES = 3
-                if oom_category == 2:
-                    cat2_retries = getattr(tile, '_cat2_retries', 0)
-                    prev_iter = getattr(tile, '_cat2_last_iter', None)
-                    no_progress = (prev_iter is not None
-                                   and oom_iteration is not None
-                                   and oom_iteration <= prev_iter)
-                    if no_progress:
-                        print(f"  [Category 2] No progress across retries "
-                              f"(iter {prev_iter} -> {oom_iteration}): deterministic "
-                              f"capacity limit, not fragmentation. Splitting now.", flush=True)
-                    elif cat2_retries < MAX_CAT2_RETRIES:
-                        tile._cat2_retries = cat2_retries + 1
-                        tile._cat2_last_iter = oom_iteration
-                        tile.status = "pending"
-                        tile.fail_iter = None
-                        tile.oom_type = None
-                        tile.oom_category = None
-                        print(f"  [Category 2 RETRY] Memory fragmentation OOM at iter {oom_iteration}.", flush=True)
-                        print(f"  Retrying same tile ({tile._cat2_retries}/{MAX_CAT2_RETRIES})...", flush=True)
-                        print("#" * 60 + "\n", flush=True)
-                        self._save_state()
-                        continue
-                    else:
-                        print(f"  [Category 2] Exhausted {MAX_CAT2_RETRIES} retries, falling through to split.", flush=True)
-                # Check minimum tile size before splitting
-                MIN_TILE_SIZE = 50.0  # Minimum size in world units
-                tile_size = tile.bbox.size
-                min_dim = min(tile_size)
-
-                if min_dim < MIN_TILE_SIZE:
-                    print(f"  WARNING: Tile is already very small: ({tile_size[0]:.1f}, {tile_size[1]:.1f}, {tile_size[2]:.1f})", flush=True)
-                    print(f"  Cannot split further (min dimension {min_dim:.1f} < {MIN_TILE_SIZE})", flush=True)
-                    print(f"  Marking tile as SKIPPED (too small to process)", flush=True)
-                    print("#" * 60 + "\n", flush=True)
-                    tile.status = "skipped"
-                    self._save_state()
-                    completed += 1
-                    continue
-
-                # Use tile IDs from state file if available (ensures PLY filename matches tile ID)
-                # Note: use "or {}" because get() returns None if key exists but value is None
-                tile_a_info = (oom_info.get("tile_a") or {}) if oom_info else {}
-                tile_b_info = (oom_info.get("tile_b") or {}) if oom_info else {}
-
-                # Split tile.
-                # ⚠ 자식 bbox 는 반드시 state 에 기록된 값을 그대로 쓴다.
-                # train_internal.py 가 그 bbox 로 가우시안을 걸러 PLY 를 저장했기 때문에,
-                # 여기서 다시 계산하면 (median 분할일 때) PLY 내용과 타일 영역이 어긋나
-                # 자식이 자기 bbox 밖 가우시안을 물려받고 자식 간 겹침/빈틈이 생긴다.
-                # 에러 없이 씬만 망가지는 종류라 재계산은 폴백으로만 남긴다.
-                if tile_a_info.get("bbox") and tile_b_info.get("bbox"):
-                    bbox_a = BBox.from_string(tile_a_info["bbox"])
-                    bbox_b = BBox.from_string(tile_b_info["bbox"])
-                    print(f"  [Using child bboxes from state (median-aware split)]", flush=True)
-                elif oom_category == 4 and tile.ply_path:
-                    # 2026-08-12 사다리 2단: Cat4(상속분이 로드 시점에 초과)는 부모의
-                    # 학습된 가우시안이 "디스크"에 있다 — Cat3 와 같은 원리로 그 분포의
-                    # median 에서 자른다. 중점으로 자르면 7/16 의 cat4 연쇄(밀집 자식
-                    # 재즉사 → 재분할 → skipped 전멸)가 재발한다. 실패 시 중점 폴백.
-                    bbox_a, bbox_b = self._median_split_from_ply(tile)
-                    print(f"  [Cat4: median split from inherited PLY]", flush=True)
-                else:
-                    # Cat1/Cat2 등 잴 분포가 무정보인 경로 — 중점 분할 (사다리 3단 fallback)
-                    bbox_a, bbox_b = tile.bbox.split()
-
-                if tile_a_info.get("tile_id") and tile_b_info.get("tile_id"):
-                    # Use IDs from train_internal.py to match PLY filenames
-                    tile_a_id = tile_a_info["tile_id"]
-                    tile_b_id = tile_b_info["tile_id"]
-                    # Update counter to avoid future collisions
-                    a_num = int(tile_a_id.split("_")[-1]) if "_" in tile_a_id else 0
-                    b_num = int(tile_b_id.split("_")[-1]) if "_" in tile_b_id else 0
-                    self.tile_counter = max(self.tile_counter, a_num + 1, b_num + 1)
-                    print(f"  [Using tile IDs from state: {tile_a_id}, {tile_b_id}]", flush=True)
-                else:
-                    # Fallback to sequential counter
-                    tile_a_id = self._next_tile_id()
-                    tile_b_id = self._next_tile_id()
-
-                # Calculate sizes for display
-                size_a = bbox_a.size
-                size_b = bbox_b.size
-
-                tile.status = "split"
-
-                # Calculate levels for new tiles
-                area_a = size_a[0] * size_a[1]
-                area_b = size_b[0] * size_b[1]
-                level_a = self._get_tile_level(area_a)
-                level_b = self._get_tile_level(area_b)
-
-                print(f"  Original tile: {tile.tile_id} (level {tile_level})", flush=True)
-                print(f"  Split into:", flush=True)
-                print(f"    {tile_a_id}: size=({size_a[0]:.1f}, {size_a[1]:.1f}, {size_a[2]:.1f}), level={level_a}", flush=True)
-                print(f"    {tile_b_id}: size=({size_b[0]:.1f}, {size_b[1]:.1f}, {size_b[2]:.1f}), level={level_b}", flush=True)
-
-                # For Category 3 OOM (increased gaussians), use saved PLY for resume
-                # For Category 4 OOM (pre-trained too large), reuse parent's PLY
-                ply_path_a = None
-                ply_path_b = None
-                if oom_category == 4 and tile.ply_path:
-                    # Reuse parent's PLY — children will filter by their bbox on load
-                    ply_path_a = tile.ply_path
-                    ply_path_b = tile.ply_path
-                    print(f"\n  >>> CATEGORY 4 OOM: Reusing parent PLY for children <<<", flush=True)
-                    print(f"    Parent PLY: {tile.ply_path}", flush=True)
-
-                elif oom_category == 3 and oom_info:
-                    print(f"\n  >>> CATEGORY 3 OOM: Pre-trained gaussians will be used <<<", flush=True)
-                    tile_a_info = oom_info.get("tile_a") or {}
-                    tile_b_info = oom_info.get("tile_b") or {}
-                    num_ranks = oom_info.get("num_ranks", 1)
-
-                    # Check if PLY files need to be merged (distributed save with local_only=True)
-                    ply_prefix_a = tile_a_info.get("ply_path")
-                    ply_prefix_b = tile_b_info.get("ply_path")
-                    is_prefix_a = tile_a_info.get("ply_is_prefix", False)
-                    is_prefix_b = tile_b_info.get("ply_is_prefix", False)
-
-                    # Merge rank files if needed
-                    # Try BOTH tiles before failing - so we at least save what we can
-                    merge_errors = []
-                    count_a = 0
-                    count_b = 0
-
-                    # Wait for PLY files to be saved (configurable timeout)
-                    if num_ranks > 1:
-                        wait_timeout = int(os.environ.get('PLY_WAIT_TIMEOUT', 3600))  # Default 1 hour
-                        print(f"  [Waiting] Checking for PLY files from {num_ranks} ranks (timeout: {wait_timeout}s)...", flush=True)
-                        wait_start = time.time()
-                        check_interval = 5  # Check every 5 seconds
-                        
-                        while time.time() - wait_start < wait_timeout:
-                            # Check if all rank files exist
-                            all_exist = True
-                            for prefix in [ply_prefix_a, ply_prefix_b]:
-                                if prefix and prefix != "None":
-                                    for rank in range(num_ranks):
-                                        rank_file = f"{prefix}_rank{rank}.ply"
-                                        if not Path(rank_file).exists():
-                                            all_exist = False
-                                            break
-                                if not all_exist:
-                                    break
-                            
-                            if all_exist:
-                                print(f"    All PLY files found after {time.time() - wait_start:.1f}s", flush=True)
-                                break
-                            
-                            time.sleep(check_interval)
-                        else:
-                            print(f"    WARNING: Timeout after {wait_timeout}s waiting for PLY files", flush=True)
-
-                    # Try Tile A merge
-                    if ply_prefix_a and is_prefix_a and num_ranks > 1:
-                        print(f"  [Merging] Tile A: {num_ranks} rank files...", flush=True)
-                        merged_path_a = f"{ply_prefix_a}_merged.ply"
-                        try:
-                            count_a = merge_ply_files(ply_prefix_a, num_ranks, merged_path_a, strict=True)
-                            ply_path_a = merged_path_a
-                            print(f"    Merged {count_a:,} gaussians -> {merged_path_a}", flush=True)
-                        except MergeError as e:
-                            merge_errors.append(f"Tile A: {e}")
-                            print(f"    FAILED: {e}", flush=True)
-                    elif ply_prefix_a and not is_prefix_a:
-                        # Single file path (legacy or single-GPU)
-                        if Path(ply_prefix_a).exists():
-                            ply_path_a = ply_prefix_a
-                        else:
-                            merge_errors.append(f"Tile A: PLY file not found: {ply_prefix_a}")
-
-                    # Try Tile B merge (even if Tile A failed)
-                    if ply_prefix_b and is_prefix_b and num_ranks > 1:
-                        print(f"  [Merging] Tile B: {num_ranks} rank files...", flush=True)
-                        merged_path_b = f"{ply_prefix_b}_merged.ply"
-                        try:
-                            count_b = merge_ply_files(ply_prefix_b, num_ranks, merged_path_b, strict=True)
-                            ply_path_b = merged_path_b
-                            print(f"    Merged {count_b:,} gaussians -> {merged_path_b}", flush=True)
-                        except MergeError as e:
-                            merge_errors.append(f"Tile B: {e}")
-                            print(f"    FAILED: {e}", flush=True)
-                    elif ply_prefix_b and not is_prefix_b:
-                        # Single file path (legacy or single-GPU)
-                        if Path(ply_prefix_b).exists():
-                            ply_path_b = ply_prefix_b
-                        else:
-                            merge_errors.append(f"Tile B: PLY file not found: {ply_prefix_b}")
-
-                    # Cat3 merged 시각화 (best-effort, multi-rank 인 경우만)
-                    try:
-                        if num_ranks > 1 and is_prefix_a and is_prefix_b and tile_a_info.get("bbox") and tile_b_info.get("bbox"):
-                            sys.path.insert(0, str(ROOT / "Grendel-GS"))
-                            from utils.oom_viz import save_merged_cat3_viz
-                            from scene.adaptive_tile_utils import TileBBox as _TBB
-                            parent_bbox_obj = tile.bbox
-                            tile_a_bbox_obj = _TBB.from_string(tile_a_info["bbox"])
-                            tile_b_bbox_obj = _TBB.from_string(tile_b_info["bbox"])
-                            iter_for_viz = oom_info.get("iteration", 0) if isinstance(oom_info, dict) else 0
-                            tile_id_for_viz = getattr(tile, "tile_id", "tile")
-                            viz_dir = Path(self.args.output_path) / "visualizations" / "cat3_oom"
-                            viz_dir.mkdir(parents=True, exist_ok=True)
-
-                            for child_label, child_prefix, child_bbox in [
-                                ("A", ply_prefix_a, tile_a_bbox_obj),
-                                ("B", ply_prefix_b, tile_b_bbox_obj),
-                            ]:
-                                if not child_prefix:
-                                    continue
-                                rank_files = [f"{child_prefix}_rank{r}.ply" for r in range(num_ranks)]
-                                rank_files = [p for p in rank_files if Path(p).exists()]
-                                if not rank_files:
-                                    continue
-                                out_png = viz_dir / f"cat3_iter{iter_for_viz}_{tile_id_for_viz}_child{child_label}_merged.png"
-                                save_merged_cat3_viz(
-                                    rank_files,
-                                    iteration=iter_for_viz,
-                                    tile_id=f"{tile_id_for_viz}_child{child_label}",
-                                    parent_bbox=parent_bbox_obj,
-                                    tile_a=tile_a_bbox_obj,
-                                    tile_b=tile_b_bbox_obj,
-                                    out_path=out_png,
-                                )
-                                print(f"  [viz] saved merged Cat3 viz -> {out_png}", flush=True)
-                    except Exception as _viz_e:
-                        print(f"  [viz] merged Cat3 viz skipped: {_viz_e}", flush=True)
-
-                    # If any merge failed, try to use partial results
-                    if merge_errors:
-                        print(f"\n{'!'*60}", flush=True)
-                        print(f"  WARNING: Category 3 OOM PLY merge partially failed!", flush=True)
-                        for err in merge_errors:
-                            print(f"  - {err}", flush=True)
-                        print(f"  ", flush=True)
-                        print(f"  This indicates that some GPU ranks did not complete saving.", flush=True)
-                        print(f"  Possible causes:", flush=True)
-                        print(f"    1. Ranks were killed before completing PLY save", flush=True)
-                        print(f"    2. Disk space or I/O error during save", flush=True)
-                        print(f"    3. SIGTERM timeout too short", flush=True)
-                        print(f"  ", flush=True)
-                        # Show which merges succeeded (if any)
-                        if ply_path_a:
-                            print(f"  [Partial success] Tile A merged: {ply_path_a}", flush=True)
-                        if ply_path_b:
-                            print(f"  [Partial success] Tile B merged: {ply_path_b}", flush=True)
-                        print(f"  ", flush=True)
-                        
-                        # Allow partial results if at least one tile has data
-                        if ply_path_a or ply_path_b:
-                            print(f"  [PARTIAL SUCCESS] Continuing with available PLY files:", flush=True)
-                            if ply_path_a:
-                                print(f"    - Tile A: {ply_path_a}", flush=True)
-                            if ply_path_b:
-                                print(f"    - Tile B: {ply_path_b}", flush=True)
-                            print(f"  Note: Missing rank data will result in incomplete gaussians", flush=True)
-                            print(f"{'!'*60}\n", flush=True)
-                        else:
-                            print(f"  FATAL: No PLY files available at all. Cannot continue.", flush=True)
-                            print(f"{'!'*60}\n", flush=True)
-                            sys.exit(1)
-
-                    if ply_path_a or ply_path_b:
-                        print(f"  [Category 3 Resume] Child tiles will load pre-trained gaussians:", flush=True)
-                        if ply_path_a:
-                            print(f"    {tile_a_id} -> {ply_path_a}", flush=True)
-                        if ply_path_b:
-                            print(f"    {tile_b_id} -> {ply_path_b}", flush=True)
-
-                        # Validate merged counts against expected counts from done files
-                        expected_counts = oom_info.get('expected_counts')
-                        if expected_counts and expected_counts.get('ranks_found', 0) == num_ranks:
-                            print(f"\n  [Validation] Checking merged gaussian counts...")
-                            expected_a = expected_counts.get('count_a', 0)
-                            expected_b = expected_counts.get('count_b', 0)
-                            actual_a = count_a if (ply_prefix_a and is_prefix_a) else 0
-                            actual_b = count_b if (ply_prefix_b and is_prefix_b) else 0
-
-                            valid = True
-                            if expected_a > 0:
-                                if actual_a == expected_a:
-                                    print(f"    ✓ Child A: {actual_a:,} == expected {expected_a:,}")
-                                else:
-                                    print(f"    ✗ Child A: {actual_a:,} != expected {expected_a:,} (diff: {actual_a - expected_a:+,})")
-                                    valid = False
-                            if expected_b > 0:
-                                if actual_b == expected_b:
-                                    print(f"    ✓ Child B: {actual_b:,} == expected {expected_b:,}")
-                                else:
-                                    print(f"    ✗ Child B: {actual_b:,} != expected {expected_b:,} (diff: {actual_b - expected_b:+,})")
-                                    valid = False
-
-                            if valid:
-                                print(f"    [Validation PASSED] All gaussian counts match!")
-                                # Write validation info for load-time check
-                                if ply_path_a:
-                                    val_file_a = Path(ply_path_a).with_suffix('.validation.json')
-                                    with open(val_file_a, 'w') as f:
-                                        json.dump({'expected_count': actual_a, 'num_ranks': num_ranks}, f)
-                                if ply_path_b:
-                                    val_file_b = Path(ply_path_b).with_suffix('.validation.json')
-                                    with open(val_file_b, 'w') as f:
-                                        json.dump({'expected_count': actual_b, 'num_ranks': num_ranks}, f)
-                            else:
-                                print(f"    [Validation FAILED] Gaussian count mismatch detected!")
-                                print(f"    This may indicate incomplete saves or merge issues.")
-                        elif expected_counts:
-                            print(f"\n  [Validation] Skipped: only {expected_counts.get('ranks_found', 0)}/{num_ranks} done files found")
-                    else:
-                        # This should not happen - Category 3 OOM should always have PLY paths
-                        print(f"\n{'!'*60}", flush=True)
-                        print(f"  FATAL ERROR: Category 3 OOM but no PLY paths in oom_info!", flush=True)
-                        print(f"  tile_a_info: {tile_a_info}", flush=True)
-                        print(f"  tile_b_info: {tile_b_info}", flush=True)
-                        print(f"{'!'*60}\n", flush=True)
-                        sys.exit(1)
-                else:
-                    print(f"  Category {oom_category} OOM: Child tiles will start from scratch", flush=True)
-
-                print("#" * 60 + "\n", flush=True)
-
-                # Insert split tiles at the beginning so they are processed immediately
-                # Rebuild tiles dict with split tiles first
-                new_tiles = {}
-                new_tiles[tile_a_id] = TileInfo(tile_a_id, bbox_a, "pending", ply_path=ply_path_a)
-                new_tiles[tile_b_id] = TileInfo(tile_b_id, bbox_b, "pending", ply_path=ply_path_b)
-                for tid, t in self.tiles.items():
-                    new_tiles[tid] = t
-                self.tiles = new_tiles
-
-                self._save_state()
-                
-                # Generate visual debug for new tiles after OOM split
-                self._generate_visual_debug_for_tile(bbox_a, tile_a_id)
-                self._generate_visual_debug_for_tile(bbox_b, tile_b_id)
-
-            else:
-                # Other failures (non-OOM exit).
-                #
-                # 2026-08-11 인프라 실패 재시도. 실측: 8/11 면적 팔 런에서 타일 2개가
-                # "ProcessGroupNCCL ... no GPUs found!" 로 학습 0 iteration 에 죽어
-                # 영구 FAILED = 최종 씬의 구멍이 됐다. 원인은 컨테이너의 일시적 GPU
-                # 유실(호스트 cgroup 이벤트로 장치 연결이 끊기는 알려진 고질병) —
-                # 같은 타일이 재개 런에서는 무수정으로 정상 완주했다(일시성 실증).
-                # 미션은 "어떤 GPU 에서든 무인 완주" — 딸꾹질하는 환경도 그 범위다.
-                # OOM 과 같은 철학으로: 예방하려 들지 말고, 분류하고 재시도한다.
-                #   1) 비 OOM 실패는 즉시 FAILED 가 아니라 최대 2회 재큐잉.
-                #      (일시 장애는 1회로 충분함이 실증됐고, 결정론적 버그면 3회
-                #       모두 몇 초 내에 죽어 비용이 거의 없다)
-                #   2) 재시도 전 nvidia-smi 로 환경 생사 확인 — GPU 가 아예 안 보이면
-                #      컨테이너 자체가 죽은 것이므로 재시도가 무의미. 특수 코드 77 로
-                #      종료해 바깥 감시 루프(run_forever.sh)가 컨테이너를 재기동하게 한다.
-                INFRA_MAX_RETRIES = 2
-                infra_retries = getattr(tile, '_infra_retries', 0)
-
-                gpu_alive = True
-                try:
-                    subprocess.run(["nvidia-smi", "-L"], capture_output=True,
-                                   timeout=30, check=True)
-                except Exception:
-                    gpu_alive = False
-
-                if not gpu_alive:
-                    print(f"[Tile {tile.tile_id}] Failed (exit {exit_code}) and "
-                          f"nvidia-smi sees NO GPUs — container lost device access.", flush=True)
-                    print(f"  Exiting with code 77 so an outer supervisor can restart "
-                          f"the container. State is saved; rerun resumes here.", flush=True)
-                    tile.status = "pending"   # 재기동 후 이 타일부터 재개
-                    self._save_state()
-                    sys.exit(77)
-                elif infra_retries < INFRA_MAX_RETRIES:
-                    tile._infra_retries = infra_retries + 1
-                    tile.status = "pending"
-                    print(f"[Tile {tile.tile_id}] Failed with exit code {exit_code} "
-                          f"(non-OOM; likely transient infra).", flush=True)
-                    print(f"  [INFRA RETRY] Re-queueing same tile "
-                          f"({tile._infra_retries}/{INFRA_MAX_RETRIES})...", flush=True)
-                    self._save_state()
-                    continue
-                else:
-                    print(f"[Tile {tile.tile_id}] Failed with exit code {exit_code} "
-                          f"after {INFRA_MAX_RETRIES} infra retries.", flush=True)
-                    print(f"  Marking tile as FAILED and continuing...", flush=True)
-                    tile.status = "failed"
-                    self._save_state()
-                    completed += 1
-
+            status, delta = self._handle_tile_result(tile, exit_code, oom_info, tile_area)
+            completed += delta
         # Final visualization showing all completed tiles
         try:
             self._visualize_tile_map(current_tile_id=None)

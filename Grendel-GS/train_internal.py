@@ -399,14 +399,24 @@ def set_oom_signal_monitor(monitor: Optional["OOMSignalMonitor"]):
 
 
 def get_oom_signal_path(args) -> Path:
-    """Get the path to the OOM signal file."""
+    """Get the path to the OOM signal file.
+
+    2026-08-12 병렬 스케줄러 대비: 조정 파일(signal/ack/done/state)을 타일별
+    하위 디렉터리 coord_{tile_id}/ 로 스코핑. 동시 실행되는 타일들이 같은
+    ply 디렉터리를 쓰므로, rank 이름만으로는 서로의 파일을 읽는 크로스톡이
+    난다. ack/done 은 이 경로의 parent 에서 파생되므로 여기 한 곳만 바꾸면
+    전부 따라온다.
+    """
+    tile_id = getattr(args, "tile_id", "tile_unknown")
     tile_output_dir = getattr(args, "tile_output_dir", "")
-    if tile_output_dir:
-        return Path(tile_output_dir) / OOM_SIGNAL_FILENAME
-    model_path = getattr(args, "model_path", "")
-    if model_path:
-        return Path(model_path) / OOM_SIGNAL_FILENAME
-    return Path(".") / OOM_SIGNAL_FILENAME
+    base = Path(tile_output_dir) if tile_output_dir else (
+        Path(getattr(args, "model_path", "")) if getattr(args, "model_path", "") else Path("."))
+    coord = base / f"coord_{tile_id}"
+    try:
+        coord.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return coord / OOM_SIGNAL_FILENAME
 
 
 def write_oom_signal(args, iteration: int, oom_cause: str, category: int):
@@ -936,7 +946,7 @@ def handle_oom_signal_from_other_rank(
 
     # Write adaptive_tile_state.json so the wrapper can merge/resume (Category 3)
     try:
-        state_file = getattr(args, "tile_state_file", "") or (tile_output_dir / "adaptive_tile_state.json")
+        state_file = getattr(args, "tile_state_file", "") or (get_oom_signal_path(args).parent / "adaptive_tile_state.json")
         state_file = Path(state_file)
         ply_path_a = str(tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{use_iteration}")
         ply_path_b = str(tile_output_dir / f"{tile_b_id}_L{child_level}_oom_iter{use_iteration}")
@@ -1769,7 +1779,7 @@ def handle_adaptive_tile_oom(
         print(f"  (No pre-trained gaussians saved)", flush=True)
 
     # All ranks save state file (race condition but same content, ensures at least one succeeds)
-    state_file = getattr(args, "tile_state_file", "") or (tile_output_dir / "adaptive_tile_state.json")
+    state_file = getattr(args, "tile_state_file", "") or (get_oom_signal_path(args).parent / "adaptive_tile_state.json")
     state_file = Path(state_file)
 
     # For Category 3, ply_path is a prefix; actual files are {prefix}_rank{0,1,2,3}.ply
@@ -2382,7 +2392,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 if tile_bbox_str is not None and (count_a + count_b) > 0:
                     _state_file = Path(
                         getattr(args, "tile_state_file", "")
-                        or (tile_output_dir / "adaptive_tile_state.json")
+                        or (get_oom_signal_path(args).parent / "adaptive_tile_state.json")
                     )
                     if not _state_file.exists():
                         _pfx_a = str(tile_output_dir / f"{tile_a_id}_L{child_level}_oom_iter{iteration}")
@@ -3304,7 +3314,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             if handled:
                 # Read the OOM category from the state file to determine if we should exit
                 tile_output_dir = Path(getattr(args, "tile_output_dir", "output/adaptive_test/ply"))
-                state_file = getattr(args, "tile_state_file", "") or (tile_output_dir / "adaptive_tile_state.json")
+                state_file = getattr(args, "tile_state_file", "") or (get_oom_signal_path(args).parent / "adaptive_tile_state.json")
                 state_file = Path(state_file)
                 
                 oom_category = None
