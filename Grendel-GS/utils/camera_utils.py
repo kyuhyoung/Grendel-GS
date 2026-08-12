@@ -103,16 +103,45 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False, cro
         if args.time_image_loading:
             start_time = time.time()
 
-        image = Image.open(cam_info.image_path)
-        orig_size = image.size  # (width, height)
+        # 2026-08-12 디코드 캐시 (콜드스타트 제거, IMAGE_CACHE=0 으로 끔):
+        # 타일마다 같은 원본 TIFF(1.96억 px)를 다시 디코딩하는 낭비 제거.
+        # 첫 사용 때 디코딩 결과를 .npy 로 저장, 이후엔 memmap 에서 크롭
+        # 구간만 잘라 읽는다 (디코딩 없음, 동작·수치 동일).
+        _cache_path = None
+        if os.environ.get("IMAGE_CACHE", "1") != "0":
+            _cache_dir = os.path.join(os.path.dirname(cam_info.image_path), "_decoded_cache")
+            _cache_path = os.path.join(
+                _cache_dir, os.path.basename(cam_info.image_path) + ".npy")
+        if _cache_path and os.path.exists(_cache_path):
+            _arr = np.load(_cache_path, mmap_mode="r")
+            orig_size = (_arr.shape[1], _arr.shape[0])  # (W, H)
+            if crop:
+                _arr = _arr[crop.y_min:crop.y_max, crop.x_min:crop.x_max]
+                worker_name = multiprocessing.current_process().name
+                worker_num = worker_name.split("-")[-1] if "-" in worker_name else worker_name
+                utils.print_rank_0(f"[loadCam] Camera {id+1}: cache-hit orig={orig_size}, crop=({crop.x_min},{crop.y_min})-({crop.x_max},{crop.y_max}) (worker {worker_num})")
+            image = Image.fromarray(np.ascontiguousarray(_arr))
+        else:
+            image = Image.open(cam_info.image_path)
+            orig_size = image.size  # (width, height)
+            if _cache_path:
+                try:
+                    os.makedirs(os.path.dirname(_cache_path), exist_ok=True)
+                    _tmp = _cache_path + f".tmp{os.getpid()}.npy"
+                    with open(_tmp, "wb") as _f:      # 파일 핸들 저장 — np.save 의 .npy 자동 부착 회피
+                        np.save(_f, np.asarray(image.convert("RGB"), dtype=np.uint8))
+                    os.replace(_tmp, _cache_path)  # 원자적 — 동시 기록 안전
+                    utils.print_rank_0(f"[loadCam] Camera {id+1}: cache-write {os.path.basename(_cache_path)}")
+                except Exception as _e:
+                    utils.print_rank_0(f"[loadCam] cache-write skip ({_e})")
 
-        # Apply crop during loading (saves memory - don't decode full image)
-        if crop:
-            # PIL crop: (left, upper, right, lower)
-            image = image.crop((crop.x_min, crop.y_min, crop.x_max, crop.y_max))
-            worker_name = multiprocessing.current_process().name
-            worker_num = worker_name.split("-")[-1] if "-" in worker_name else worker_name
-            utils.print_rank_0(f"[loadCam] Camera {id+1}: orig={orig_size}, crop=({crop.x_min},{crop.y_min})-({crop.x_max},{crop.y_max}), after_crop={image.size}, resolution={resolution} (worker {worker_num})")
+            # Apply crop during loading (saves memory - don't decode full image)
+            if crop:
+                # PIL crop: (left, upper, right, lower)
+                image = image.crop((crop.x_min, crop.y_min, crop.x_max, crop.y_max))
+                worker_name = multiprocessing.current_process().name
+                worker_num = worker_name.split("-")[-1] if "-" in worker_name else worker_name
+                utils.print_rank_0(f"[loadCam] Camera {id+1}: orig={orig_size}, crop=({crop.x_min},{crop.y_min})-({crop.x_max},{crop.y_max}), after_crop={image.size}, resolution={resolution} (worker {worker_num})")
 
         resized_image_rgb = PILtoTorch(
             image, resolution, args, log_file, decompressed_image=None
