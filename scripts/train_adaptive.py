@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import json
+import re
 import os
 import subprocess
 import sys
@@ -84,6 +85,28 @@ def read_expected_counts_from_done_files(ply_dir: Path, num_ranks: int) -> dict:
 class MergeError(Exception):
     """Exception raised when PLY merge fails due to missing files."""
     pass
+
+
+def verify_rank_plys(ply_prefix: str, num_ranks: int) -> int:
+    """병합 생략 모드: rank 파일 존재·개수만 헤더로 검산 (수 ms).
+
+    자식 로더가 rank 파일들을 직접 이어 읽으므로(merge-skip) merged.ply 를
+    만들 필요가 없다. 검증 계약(개수 합)은 유지 — validation.json 도 기록.
+    """
+    total = 0
+    for rank in range(num_ranks):
+        f = f"{ply_prefix}_rank{rank}.ply"
+        if not os.path.exists(f):
+            raise MergeError(f"Missing rank files: [{rank}] (prefix {ply_prefix})")
+        with open(f, "rb") as fp:
+            head = fp.read(2048).decode("latin1")
+        m = re.search(r"element vertex (\d+)", head)
+        if not m:
+            raise MergeError(f"Bad PLY header: {f}")
+        total += int(m.group(1))
+    with open(f"{ply_prefix}.validation.json", "w") as fp:
+        json.dump({"expected_count": total, "num_ranks": num_ranks}, fp)
+    return total
 
 
 def merge_ply_files(ply_prefix: str, num_ranks: int, output_path: str, strict: bool = True) -> int:
@@ -1054,7 +1077,16 @@ class AdaptiveTileTrainer:
         try:
             from plyfile import PlyData
             import numpy as np
-            v = PlyData.read(tile.ply_path)["vertex"]
+            import glob as _glob
+            _paths = ([tile.ply_path] if os.path.isfile(tile.ply_path)
+                      else sorted(_glob.glob(tile.ply_path + "_rank*.ply")))
+            if not _paths:
+                raise FileNotFoundError(tile.ply_path)
+            _vs = [PlyData.read(_p)["vertex"] for _p in _paths]
+            class _V:   # 여러 rank 파일을 하나처럼
+                def __getitem__(self, k):
+                    return np.concatenate([np.asarray(_v[k]) for _v in _vs])
+            v = _V()
             b = tile.bbox
             dx, dy = b.x_max - b.x_min, b.y_max - b.y_min
             axis, lo, hi = ("x", b.x_min, b.x_max) if dx >= dy else ("y", b.y_min, b.y_max)
@@ -2321,9 +2353,16 @@ class AdaptiveTileTrainer:
                     print(f"  [Merging] Tile A: {num_ranks} rank files...", flush=True)
                     merged_path_a = f"{ply_prefix_a}_merged.ply"
                     try:
-                        count_a = merge_ply_files(ply_prefix_a, num_ranks, merged_path_a, strict=True)
-                        ply_path_a = merged_path_a
-                        print(f"    Merged {count_a:,} gaussians -> {merged_path_a}", flush=True)
+                        if os.environ.get("MERGE_SKIP", "1") != "0":
+                            # 2026-08-12 병합 생략: 헤더 검산만 하고 prefix 전달 —
+                            # 자식 로더가 rank 파일 직접 이어 읽음 (I/O 왕복 제거)
+                            count_a = verify_rank_plys(ply_prefix_a, num_ranks)
+                            ply_path_a = ply_prefix_a
+                            print(f"    Verified {count_a:,} gaussians in {num_ranks} rank files (merge-skip)", flush=True)
+                        else:
+                            count_a = merge_ply_files(ply_prefix_a, num_ranks, merged_path_a, strict=True)
+                            ply_path_a = merged_path_a
+                            print(f"    Merged {count_a:,} gaussians -> {merged_path_a}", flush=True)
                     except MergeError as e:
                         merge_errors.append(f"Tile A: {e}")
                         print(f"    FAILED: {e}", flush=True)
@@ -2339,9 +2378,16 @@ class AdaptiveTileTrainer:
                     print(f"  [Merging] Tile B: {num_ranks} rank files...", flush=True)
                     merged_path_b = f"{ply_prefix_b}_merged.ply"
                     try:
-                        count_b = merge_ply_files(ply_prefix_b, num_ranks, merged_path_b, strict=True)
-                        ply_path_b = merged_path_b
-                        print(f"    Merged {count_b:,} gaussians -> {merged_path_b}", flush=True)
+                        if os.environ.get("MERGE_SKIP", "1") != "0":
+                            # 2026-08-12 병합 생략: 헤더 검산만 하고 prefix 전달 —
+                            # 자식 로더가 rank 파일 직접 이어 읽음 (I/O 왕복 제거)
+                            count_b = verify_rank_plys(ply_prefix_b, num_ranks)
+                            ply_path_b = ply_prefix_b
+                            print(f"    Verified {count_b:,} gaussians in {num_ranks} rank files (merge-skip)", flush=True)
+                        else:
+                            count_b = merge_ply_files(ply_prefix_b, num_ranks, merged_path_b, strict=True)
+                            ply_path_b = merged_path_b
+                            print(f"    Merged {count_b:,} gaussians -> {merged_path_b}", flush=True)
                     except MergeError as e:
                         merge_errors.append(f"Tile B: {e}")
                         print(f"    FAILED: {e}", flush=True)

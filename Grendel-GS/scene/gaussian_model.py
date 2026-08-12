@@ -931,22 +931,30 @@ class GaussianModel:
 
     def load_raw_ply(self, path):
         print("Loading ", path)
-        plydata = PlyData.read(path)
+        # 2026-08-12 병합 생략 (MERGE_SKIP): path 가 실재 파일이 아니고
+        # "{path}_rank*.ply" 들이 있으면 rank 파일들을 직접 이어 읽는다 —
+        # merged.ply 를 쓰고 다시 읽는 I/O 왕복 제거. 순서는 rank 번호순
+        # (기존 merge_ply_files 와 동일 순서 → 결과 동일).
+        _paths = [path]
+        if not os.path.isfile(path):
+            import glob as _glob
+            _cand = sorted(_glob.glob(path + "_rank*.ply"))
+            if _cand:
+                _paths = _cand
+                print(f"[load_raw_ply] merge-skip: reading {len(_cand)} rank files directly", flush=True)
+        _elems = [PlyData.read(_p).elements[0] for _p in _paths]
+        plydata = type("obj", (), {"elements": [_elems[0]]})()  # property 목록용
 
-        xyz = np.stack(
-            (
-                np.asarray(plydata.elements[0]["x"]),
-                np.asarray(plydata.elements[0]["y"]),
-                np.asarray(plydata.elements[0]["z"]),
-            ),
-            axis=1,
-        )
-        opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        def _A(name):
+            return np.concatenate([np.asarray(_e[name]) for _e in _elems])
+
+        xyz = np.stack((_A("x"), _A("y"), _A("z")), axis=1)
+        opacities = _A("opacity")[..., np.newaxis]
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
-        features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
-        features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
-        features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
+        features_dc[:, 0, 0] = _A("f_dc_0")
+        features_dc[:, 1, 0] = _A("f_dc_1")
+        features_dc[:, 2, 0] = _A("f_dc_2")
 
         extra_f_names = [
             p.name
@@ -957,7 +965,7 @@ class GaussianModel:
         assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
-            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            features_extra[:, idx] = _A(attr_name)
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape(
             (features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
@@ -971,7 +979,7 @@ class GaussianModel:
         scale_names = sorted(scale_names, key=lambda x: int(x.split("_")[-1]))
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
-            scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            scales[:, idx] = _A(attr_name)
 
         rot_names = [
             p.name for p in plydata.elements[0].properties if p.name.startswith("rot")
@@ -979,7 +987,7 @@ class GaussianModel:
         rot_names = sorted(rot_names, key=lambda x: int(x.split("_")[-1]))
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
-            rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            rots[:, idx] = _A(attr_name)
 
         args = utils.get_args()
         # The above computation/memory is replicated on all ranks. Because initialization is small, it's ok.
@@ -1067,8 +1075,9 @@ class GaussianModel:
             init_training_tensors: If True, initialize max_radii2D and sum_visible_count_in_one_batch
                                    (needed for resuming training from a PLY file)
         """
-        if path.endswith(".ply") and os.path.isfile(path):
-            # Direct PLY file path
+        import glob as _glob
+        if (path.endswith(".ply") and os.path.isfile(path)) or _glob.glob(str(path) + "_rank*.ply"):
+            # Direct PLY file path — 또는 merge-skip prefix (rank 파일 직접 읽기)
             self.one_file_load_ply(path, is_file_path=True)
         elif os.path.exists(os.path.join(path, "point_cloud.ply")):
             self.one_file_load_ply(path)

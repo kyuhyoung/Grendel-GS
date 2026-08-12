@@ -10,6 +10,7 @@
 #
 
 import os
+import glob
 import random
 import json
 from random import randint
@@ -509,7 +510,10 @@ class Scene:
             )
         elif hasattr(args, "load_ply_path") and args.load_ply_path:
             self.gaussians.load_ply(args.load_ply_path)
-        elif getattr(args, "pretrained_ply", "") and os.path.exists(args.pretrained_ply):
+        elif getattr(args, "pretrained_ply", "") and (
+            os.path.exists(args.pretrained_ply)
+            or glob.glob(args.pretrained_ply + "_rank*.ply")   # merge-skip prefix
+        ):
             # Load pre-trained gaussians from PLY file (for Category 3 OOM resume)
             print(f"\n{'='*60}", flush=True)
             print(f"[Category 3 Resume] Loading pre-trained gaussians", flush=True)
@@ -517,7 +521,9 @@ class Scene:
             print(f"  PLY file: {args.pretrained_ply}", flush=True)
             import os as _os
             import json as _json
-            ply_size = _os.path.getsize(args.pretrained_ply) / 1024 / 1024
+            ply_size = sum(_os.path.getsize(_p) for _p in
+                           ([args.pretrained_ply] if _os.path.exists(args.pretrained_ply)
+                            else glob.glob(args.pretrained_ply + "_rank*.ply"))) / 1024 / 1024
             print(f"  File size: {ply_size:.2f} MB", flush=True)
             self.gaussians.load_ply(args.pretrained_ply, init_training_tensors=True)
             num_gaussians_local = self.gaussians.get_xyz.shape[0]
@@ -528,7 +534,9 @@ class Scene:
             print(f"  Loaded gaussians: TOTAL {num_gaussians_total:,} (local: {num_gaussians_local:,})", flush=True)
 
             # Validate against expected count from merge validation file
-            val_file = args.pretrained_ply.replace('.ply', '.validation.json')
+            val_file = (args.pretrained_ply.replace('.ply', '.validation.json')
+                        if args.pretrained_ply.endswith('.ply')
+                        else args.pretrained_ply + '.validation.json')
             if _os.path.exists(val_file):
                 try:
                     with open(val_file) as f:
