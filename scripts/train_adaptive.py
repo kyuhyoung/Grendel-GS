@@ -1044,6 +1044,45 @@ class AdaptiveTileTrainer:
         self.tile_counter += 1
         return tile_id
 
+    def _median_split_from_ply(self, tile, max_ratio: float = 0.65):
+        """Cat4 용 사다리 2단: 디스크의 상속 PLY 분포 median 에서 분할.
+
+        Cat3 와 같은 원리(학습된 가우시안 = 미래 짐의 최선 추정치)를 래퍼에서 수행.
+        rank 동기화 불필요(래퍼 단일 프로세스). 어떤 실패든 중점 폴백 — Cat4 처리
+        경로에서 예외가 새면 타일이 통째로 죽는다.
+        """
+        try:
+            from plyfile import PlyData
+            import numpy as np
+            v = PlyData.read(tile.ply_path)["vertex"]
+            b = tile.bbox
+            dx, dy = b.x_max - b.x_min, b.y_max - b.y_min
+            axis, lo, hi = ("x", b.x_min, b.x_max) if dx >= dy else ("y", b.y_min, b.y_max)
+            coords = np.asarray(v[axis], dtype=np.float64)
+            # 상속 PLY 는 부모 영역 전체를 담을 수 있으므로 이 타일 bbox 안만 잰다
+            xs, ys = np.asarray(v["x"]), np.asarray(v["y"])
+            inside = (xs >= b.x_min) & (xs <= b.x_max) & (ys >= b.y_min) & (ys <= b.y_max)
+            coords = coords[inside]
+            if len(coords) < 1000:
+                raise ValueError(f"too few inherited points inside bbox: {len(coords)}")
+            med = float(np.median(coords))
+            span = hi - lo
+            cut = min(max(med, lo + (1.0 - max_ratio) * span), lo + max_ratio * span)
+            n_a = int((coords <= cut).sum())
+            print(f"  [cat4-median] axis={axis.upper()} n={len(coords):,} "
+                  f"median={med:.2f} cut={cut:.2f} ({100*(cut-lo)/span:.1f}% of parent"
+                  f"{', CLAMPED' if cut != med else ''}) balance={100*n_a/len(coords):.1f}/"
+                  f"{100*(1-n_a/len(coords)):.1f}", flush=True)
+            if axis == "x":
+                return (BBox(b.x_min, b.y_min, b.z_min, cut, b.y_max, b.z_max),
+                        BBox(cut, b.y_min, b.z_min, b.x_max, b.y_max, b.z_max))
+            else:
+                return (BBox(b.x_min, b.y_min, b.z_min, b.x_max, cut, b.z_max),
+                        BBox(b.x_min, cut, b.z_min, b.x_max, b.y_max, b.z_max))
+        except Exception as e:
+            print(f"  [cat4-median] WARNING: fallback to midpoint ({e})", flush=True)
+            return tile.bbox.split()
+
     def _get_tile_level(self, tile_area: float) -> int:
         """
         Calculate tile level based on area.
@@ -2339,8 +2378,15 @@ class AdaptiveTileTrainer:
                     bbox_a = BBox.from_string(tile_a_info["bbox"])
                     bbox_b = BBox.from_string(tile_b_info["bbox"])
                     print(f"  [Using child bboxes from state (median-aware split)]", flush=True)
+                elif oom_category == 4 and tile.ply_path:
+                    # 2026-08-12 사다리 2단: Cat4(상속분이 로드 시점에 초과)는 부모의
+                    # 학습된 가우시안이 "디스크"에 있다 — Cat3 와 같은 원리로 그 분포의
+                    # median 에서 자른다. 중점으로 자르면 7/16 의 cat4 연쇄(밀집 자식
+                    # 재즉사 → 재분할 → skipped 전멸)가 재발한다. 실패 시 중점 폴백.
+                    bbox_a, bbox_b = self._median_split_from_ply(tile)
+                    print(f"  [Cat4: median split from inherited PLY]", flush=True)
                 else:
-                    # Cat1/Cat2 등 state 에 bbox 가 없는 경로 — 기존대로 중점 분할
+                    # Cat1/Cat2 등 잴 분포가 무정보인 경로 — 중점 분할 (사다리 3단 fallback)
                     bbox_a, bbox_b = tile.bbox.split()
 
                 if tile_a_info.get("tile_id") and tile_b_info.get("tile_id"):
