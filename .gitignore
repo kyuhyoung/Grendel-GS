@@ -18,3 +18,17 @@ Grendel-GS/output/
 Grendel-GS/assets/
 *.ply
 *.pth
+
+# 대용량 데이터·산출물 (2026-08-28)
+benchmarks/
+ortho/
+data_scale_*/
+data_eval_*/
+logs_keep/
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.NTF
+*.tgz

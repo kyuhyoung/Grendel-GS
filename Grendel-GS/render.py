@@ -11,6 +11,9 @@
 
 import torch
 import torch.distributed as dist
+from PIL import Image
+# train.py 와 동일: 초대형 항공 이미지(1.96억 px)가 PIL 기본 한도(1.79억)를 넘음
+Image.MAX_IMAGE_PIXELS = None
 from scene import Scene, SceneDataset
 import os
 from tqdm import tqdm
@@ -138,6 +141,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 )
 
             gt_camera.original_image = None
+
+        # 초대형 이미지(1.96억 px) 렌더는 뷰당 수 GB 버퍼를 쓰므로 매 뷰 정리
+        # (안 하면 파편화로 2~3뷰째에 OOM — 2026-08-11 실측)
+        torch.cuda.empty_cache()
 
         if generated_cnt == args.generate_num:
             break

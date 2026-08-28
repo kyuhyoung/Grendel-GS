@@ -8,3 +8,7 @@ tmp/
 *.ply
 *.pth
 __pycache__/
+
+# 데이터셋(19.5GB) — 빌드에 불필요, 컨텍스트 전송만 느려짐
+data_scale_*/
+data_eval_*/

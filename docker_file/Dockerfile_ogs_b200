@@ -1,0 +1,63 @@
+# ogs — B200(Blackwell, sm_100) 판.
+# 2026-08-28: 기존 Dockerfile_ogs 는 CUDA 11.8 / torch 2.0 고정이라 Blackwell 미지원.
+# B200 머신에서 vanilla 3DGS 를 native venv 로 돌린 실측 스펙(NGC 25.12, torch 2.10a/CUDA 13.1,
+# TORCH_CUDA_ARCH_LIST=10.0+PTX, <cstdint> 패치, --no-build-isolation)을 이미지로 옮긴 것.
+#
+# 주의: 여기서 빌드하는 rasterizer 는 stock 3DGS 가 아니라 **Grendel-GS 분산판**이다
+#       (픽셀 분할 렌더·distributed backward). 반드시 이 저장소의 서브모듈을 쓸 것.
+#
+# 빌드: docker build -f docker_file/Dockerfile_ogs_b200 -t ogs_b200 .
+#       (B200 머신에서 실행 — 컴파일은 GPU 불필요하나 스모크 검증은 GPU 필요)
+FROM nvcr.io/nvidia/pytorch:25.12-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+# Blackwell sm_100 (+PTX 로 상위 호환). 이 변수가 없으면 커널이 B200 용으로 안 만들어짐.
+ENV TORCH_CUDA_ARCH_LIST="10.0+PTX"
+
+# libcusparseLt soname 심링크가 로더 경로에 없어 import torch 가 죽는 문제 (실측)
+RUN set -eux; \
+    LIB=$(find / -name "libcusparseLt.so*" -not -name "*.so" 2>/dev/null | head -1); \
+    if [ -n "${LIB:-}" ]; then \
+      d=$(dirname "$LIB"); \
+      [ -e "$d/libcusparseLt.so.0" ] || ln -s "$LIB" "$d/libcusparseLt.so.0"; \
+      echo "$d" > /etc/ld.so.conf.d/cusparselt.conf; ldconfig; \
+    fi; \
+    python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential libgl1 libglib2.0-0 colmap xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+# 파이썬 의존성 (NGC 의 torch/torchvision 은 건드리지 않는다)
+RUN pip install --no-cache-dir \
+    plyfile tqdm opencv-python-headless imageio imageio-ffmpeg \
+    scikit-image scipy scikit-learn pandas matplotlib psutil \
+    lpips tifffile einops omegaconf configargparse rich \
+    tensorboard wandb h5py trimesh networkx pyyaml ninja
+
+# CUDA 확장 소스 (Grendel-GS 분산판)
+COPY Grendel-GS/submodules /workspace/submodules
+
+# 패치 A — 2023년 코드라 CUDA 13/최신 GCC 에서 uint32_t 등 미정의 (실측 함정)
+RUN set -eux; \
+    for f in $(grep -rlE "uint32_t|uint64_t|uintptr_t|int64_t" /workspace/submodules \
+                 --include=*.h --include=*.cu --include=*.cuh --include=*.cpp); do \
+      grep -qE "#include <cstdint>|#include <stdint.h>" "$f" || \
+        sed -i '1i #include <cstdint>' "$f"; \
+    done; \
+    echo "cstdint 패치 완료"
+
+# 빌드 — isolation 끄고 NGC torch 를 그대로 사용
+RUN pip install --no-build-isolation --no-cache-dir /workspace/submodules/simple-knn && \
+    pip install --no-build-isolation --no-cache-dir /workspace/submodules/diff-gaussian-rasterization && \
+    pip install --no-build-isolation --no-cache-dir gsplat==1.4.0 fused-ssim || \
+    echo "[warn] gsplat/fused-ssim 실패 — 정사영상·fused SSIM 만 영향, 학습은 가능"
+
+# 스모크 (import 수준; 커널 실행 검증은 GPU 있는 런타임에서)
+RUN python -c "\
+import torch, diff_gaussian_rasterization, simple_knn._C, plyfile;\
+print('torch', torch.__version__, torch.version.cuda);\
+print('rasterizer/simple-knn OK')"
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

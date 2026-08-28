@@ -951,7 +951,7 @@ class GaussianModel:
         xyz = np.stack((_A("x"), _A("y"), _A("z")), axis=1)
         opacities = _A("opacity")[..., np.newaxis]
 
-        features_dc = np.zeros((xyz.shape[0], 3, 1))
+        features_dc = np.zeros((xyz.shape[0], 3, 1), dtype=np.float32)
         features_dc[:, 0, 0] = _A("f_dc_0")
         features_dc[:, 1, 0] = _A("f_dc_1")
         features_dc[:, 2, 0] = _A("f_dc_2")
@@ -963,7 +963,7 @@ class GaussianModel:
         ]
         extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
         assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
-        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)), dtype=np.float32)
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = _A(attr_name)
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
@@ -977,7 +977,7 @@ class GaussianModel:
             if p.name.startswith("scale_")
         ]
         scale_names = sorted(scale_names, key=lambda x: int(x.split("_")[-1]))
-        scales = np.zeros((xyz.shape[0], len(scale_names)))
+        scales = np.zeros((xyz.shape[0], len(scale_names)), dtype=np.float32)
         for idx, attr_name in enumerate(scale_names):
             scales[:, idx] = _A(attr_name)
 
@@ -985,9 +985,15 @@ class GaussianModel:
             p.name for p in plydata.elements[0].properties if p.name.startswith("rot")
         ]
         rot_names = sorted(rot_names, key=lambda x: int(x.split("_")[-1]))
-        rots = np.zeros((xyz.shape[0], len(rot_names)))
+        rots = np.zeros((xyz.shape[0], len(rot_names)), dtype=np.float32)
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = _A(attr_name)
+
+        # 파싱 끝. 원본 PlyData 는 여기서 즉시 해제한다 — 71.5M 가우시안이면
+        # 랭크당 16.9GB 이고, 랭크 4개면 그것만으로 68GB 다.
+        # (2026-08-17 eval_ours: 랭크당 51GB x 4 로 호스트 램이 터져 커널이
+        #  랭크 0~2 를 죽였고, 30장 중 2장만 렌더됨)
+        del _elems, plydata
 
         args = utils.get_args()
         # The above computation/memory is replicated on all ranks. Because initialization is small, it's ok.

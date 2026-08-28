@@ -81,5 +81,14 @@ RUN echo ". activate citygs-x" >> ~/.bashrc
 SHELL ["/bin/bash", "-c", "source activate citygs-x && bash"]
 RUN conda init bash && conda info --envs
 
+# gsplat CUDA 커널을 이미지에 미리 컴파일 (2026-08-18)
+# - pip 의 gsplat 은 첫 사용 때 JIT 컴파일(~10분)하는데, --rm 컨테이너에선
+#   캐시가 증발해 매 실행 반복된다. 빌드 때 한 번 구워 넣는다.
+# - lib64 심링크: JIT 링커가 -lcudart 를 $CUDA_HOME/lib64 에서 찾는데
+#   conda 배치는 lib 라서 링크 실패 → 심링크로 해결 (2026-08-18 실측)
+ENV CUDA_HOME=/opt/conda/envs/citygs-x
+RUN ln -sfn /opt/conda/envs/citygs-x/lib /opt/conda/envs/citygs-x/lib64 && \
+    conda run -n citygs-x python -c "from gsplat.rendering import rasterization; print('gsplat kernels compiled')"
+
 # Set default command
 CMD ["/bin/bash"]
