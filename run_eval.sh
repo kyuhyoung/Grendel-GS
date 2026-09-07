@@ -18,8 +18,8 @@ LOG_FILE="${SCRIPT_DIR}/run_eval.log"
 rm -f "${LOG_FILE}"; : > "${LOG_FILE}"
 exec > >(stdbuf -oL -eL tee "${LOG_FILE}") 2>&1
 
-DEVICES="${DEVICES:-0,1,2,3}"
-NPROC="${NPROC:-4}"
+DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"  # 4랭크는 호스트 램 초과로 랭크 사망 2회 재발 (8/18, 9/4) — 8랭크가 검증된 구성
+NPROC="${NPROC:-8}"
 EXPECT="${EXPECT:-30}"            # data_eval_half/images 의 tif 장수
 ARMS="${ARMS:-ours fmedian fmidpoint}"
 docker_name=ogs
@@ -30,6 +30,7 @@ dir_data=/media2/data/dataset_stereo/non-sat
 ply_of () {
     case "$1" in
         ours)      echo "/w/output/ours_2gpu/merged/scene_point_cloud.ply" ;;
+        lic)       echo "/w/output/lic_2gpu/merged/scene_point_cloud.ply" ;;
         fmedian)   echo "/w/output/final_median/merged/scene_point_cloud.ply" ;;
         fmidpoint) echo "/w/output/final_midpoint/merged/scene_point_cloud.ply" ;;
         oracle3e5) echo "/w/output/oracle_8gpu_thr3e-5/point_cloud/iteration_30000/point_cloud.ply" ;;

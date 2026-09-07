@@ -90,5 +90,11 @@ ENV CUDA_HOME=/opt/conda/envs/citygs-x
 RUN ln -sfn /opt/conda/envs/citygs-x/lib /opt/conda/envs/citygs-x/lib64 && \
     conda run -n citygs-x python -c "from gsplat.rendering import rasterization; print('gsplat kernels compiled')"
 
+# fused-ssim: SSIM 을 단일 CUDA 커널로 (속도 + 임시버퍼發 거짓 Cat1 OOM 제거)
+# 코드 쪽은 FUSED_SSIM=1 일 때만 사용, 미설치/실패 시 legacy 폴백 (loss_utils.py)
+# (호스트에서 클론해 COPY — 컨테이너 빌드 중 외부 네트워크가 안 됨, 2026-09-07 실측)
+RUN conda run -n citygs-x pip install --no-build-isolation /workspace/submodules/fused-ssim && \
+    conda run -n citygs-x python -c "import fused_ssim; print('fused_ssim OK')"
+
 # Set default command
 CMD ["/bin/bash"]
