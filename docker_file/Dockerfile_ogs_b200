@@ -49,9 +49,12 @@ RUN set -eux; \
 
 # 빌드 — isolation 끄고 NGC torch 를 그대로 사용
 RUN pip install --no-build-isolation --no-cache-dir /workspace/submodules/simple-knn && \
-    pip install --no-build-isolation --no-cache-dir /workspace/submodules/diff-gaussian-rasterization && \
-    pip install --no-build-isolation --no-cache-dir gsplat==1.4.0 fused-ssim || \
-    echo "[warn] gsplat/fused-ssim 실패 — 정사영상·fused SSIM 만 영향, 학습은 가능"
+    pip install --no-build-isolation --no-cache-dir /workspace/submodules/diff-gaussian-rasterization
+# fused-ssim: 9/7 채택 확정 (가짜 cat1 제거 + 2.6배) — 벤더링된 로컬 소스에서 필수 설치
+RUN pip install --no-build-isolation --no-cache-dir /workspace/submodules/fused-ssim && \
+    python -c "import fused_ssim; print('fused_ssim OK')"
+RUN pip install --no-build-isolation --no-cache-dir gsplat==1.4.0 || \
+    echo "[warn] gsplat 실패 — 정사영상만 영향, 학습은 가능"
 
 # 스모크 (import 수준; 커널 실행 검증은 GPU 있는 런타임에서)
 RUN python -c "\
