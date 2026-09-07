@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "forward.cuh"
 #include "helpers.cuh"
 #include <algorithm>

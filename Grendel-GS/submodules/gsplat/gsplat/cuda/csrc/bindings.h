@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 #include <tuple>

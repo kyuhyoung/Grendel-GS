@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "backward.cuh"
 #include "bindings.h"
 #include "forward.cuh"

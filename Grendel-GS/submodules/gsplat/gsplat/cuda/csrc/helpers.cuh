@@ -1,3 +1,4 @@
+#include <cstdint>
 #ifndef GSPLAT_CUDA_HELPERS_H
 #define GSPLAT_CUDA_HELPERS_H
 

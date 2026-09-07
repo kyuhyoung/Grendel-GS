@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "bindings.h"
 
 // Equation (9) in "3D Gaussian Splatting as Markov Chain Monte Carlo"

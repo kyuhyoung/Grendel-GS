@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <glm/integer.hpp>
 #include <glm/vector_relational.hpp>
 #include <glm/ext/vector_int1.hpp>

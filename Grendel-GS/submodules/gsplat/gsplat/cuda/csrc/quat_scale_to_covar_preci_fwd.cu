@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "bindings.h"
 #include "helpers.cuh"
 #include "utils.cuh"

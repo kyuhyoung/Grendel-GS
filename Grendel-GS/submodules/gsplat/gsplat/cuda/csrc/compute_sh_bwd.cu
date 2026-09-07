@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "bindings.h"
 #include "spherical_harmonics.cuh"
 #include "types.cuh"
