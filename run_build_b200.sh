@@ -31,13 +31,22 @@ fi
 source "$VENV/bin/activate"
 python -V; python -c "import torch;print('torch',torch.__version__,'cuda',torch.version.cuda,'cap',torch.cuda.get_device_capability(0))"
 pip install --no-cache-dir -q -U pip setuptools wheel || die "pip/setuptools"
+# torchrun 래퍼: 시스템 torchrun(/usr/local/bin) 은 /usr/bin/python 으로 자식을 띄워 venv 패키지를 못 본다 (실측: ModuleNotFoundError)
+cat > "$VENV/bin/torchrun" <<EOT
+#!$VENV/bin/python
+import sys
+from torch.distributed.run import main
+if __name__ == "__main__":
+    sys.exit(main())
+EOT
+chmod +x "$VENV/bin/torchrun"
 
 step "2) 파이썬 의존성 (torch/torchvision 제외)"
 pip install --no-cache-dir \
   plyfile tqdm opencv-python-headless imageio imageio-ffmpeg \
   scikit-image scipy scikit-learn pandas matplotlib psutil \
   lpips tifffile einops omegaconf configargparse rich \
-  tensorboard wandb h5py trimesh networkx pyyaml ninja || die "deps"
+  tensorboard wandb h5py trimesh networkx pyyaml ninja mlflow || die "deps"
 
 step "3) 패치 A — <cstdint> (2023 코드 + CUDA13/GCC13 함정)"
 n=0
