@@ -763,17 +763,17 @@ def compute_tile_crop_for_camera(tile_bbox: TileBBox,
         CropRegion if tile is visible, None otherwise
         If return_debug_info is True, returns (CropRegion, ProjectionDebugInfo) or (None, None)
     """
-    # Check if camera is inside the bounding box
+    # Camera inside the bounding box (드론 근접 선회 등, 2026-09-18 수원 화성에서 실측):
+    # 8 모서리 투영이 카메라 뒤로 넘어가 범위가 무의미해지므로, 잘라내지 않고 화면 전체를 crop 으로 쓴다.
+    # 항공(카메라가 항상 장면 위) 경로는 이 분기에 들어오지 않으므로 기존 동작 불변.
     if camera_position is not None:
         if tile_bbox.contains_point(camera_position):
-            raise RuntimeError(
-                f"Camera is inside the tile bounding box! "
-                f"Camera position: ({camera_position[0]:.2f}, {camera_position[1]:.2f}, {camera_position[2]:.2f}), "
-                f"Tile bbox: X[{tile_bbox.x_min:.2f}, {tile_bbox.x_max:.2f}], "
-                f"Y[{tile_bbox.y_min:.2f}, {tile_bbox.y_max:.2f}], "
-                f"Z[{tile_bbox.z_min:.2f}, {tile_bbox.z_max:.2f}]. "
-                f"This case is not supported."
-            )
+            crop = CropRegion(0, 0, img_width, img_height)
+            if return_debug_info:
+                return crop, ProjectionDebugInfo(
+                    num_valid_points=8, raw_x_min=0.0, raw_x_max=float(img_width),
+                    raw_y_min=0.0, raw_y_max=float(img_height))
+            return crop
 
     # Get 8 corners of the bounding box
     corners = tile_bbox.get_corners()  # (8, 3)

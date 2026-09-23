@@ -1896,6 +1896,7 @@ class AdaptiveTileTrainer:
             "--model_path", str(tile_model_path),
             "--log_folder", str(tile_log_path),
             "--iterations", str(eff_iterations),
+            *( ["--save_iterations", *os.environ["SAVE_ITERS"].split(",")] if os.environ.get("SAVE_ITERS") else [] ),
             # LR 감쇠 길이를 타일의 실제 학습량에 맞춤 (기본 30k 고정이면
             # 짧은 타일은 감쇠가 덜 된 높은 LR 로 끝나 후반 정련이 부족해짐)
             "--position_lr_max_steps", str(eff_iterations),

@@ -3121,7 +3121,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 ]
             )
             # In adaptive mode, only save at final iteration (handled by adaptive_trainer.py)
-            if should_save and not args.adaptive_tile_enabled:
+            # ADAPTIVE_DEBUG_SAVE=1 이면 adaptive 모드에서도 중간 저장 (디버깅용; 최종 저장은 adaptive_trainer 가 별도 처리)
+            if should_save and (not args.adaptive_tile_enabled or os.environ.get("ADAPTIVE_DEBUG_SAVE") == "1"):
                 end2end_timers.stop()
                 end2end_timers.print_time(log_file, iteration + args.bsz)
                 utils.print_rank_0("\n[ITER {}] Saving Gaussians".format(iteration))

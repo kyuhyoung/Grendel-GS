@@ -42,21 +42,44 @@ source "${VENV}/bin/activate" || { echo "!!! venv 없음: ${VENV} (run_build_b20
 [ -d "${SRC}/sparse" ] || { echo "!!! 데이터 없음: ${SRC} (run_prep_data_b200.sh 먼저)"; exit 1; }
 [ -x "${VENV}/bin/torchrun" ] || { echo "!!! venv torchrun 래퍼 없음 — 시스템 torchrun 은 venv 패키지를 못 봄"; exit 1; }
 
-# ---------- GPU 자동 판정: used < 500MiB 만 ----------
-probe_free_gpus() {   # → FREE_IDS[], N_FREE
-    mapfile -t FREE_IDS < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
-                             | awk -F', *' '$2 < 500 {print $1}')
+# ---------- GPU 자동 판정: used < 500MiB, 또는 aica dummy 만 잡고 있는 카드 ----------
+# aica 스케줄러(X.sh)의 dummy 는 우리 프로세스가 뜨면 0.2s 내 자동 양보(3장 이상이면 전면 철수)하므로
+# 빈 카드로 취급한다. 근거: nvidia-smi 의 pid 전부가 aica/.run/gpu<N> 에 적힌 dummy PID 와 같을 때.
+# 스크립트 이름(train_*/trn_*)은 매번 바뀌므로 이름으로 판정하지 않는다. DUMMY_AS_FREE=0 이면 이 예외를 끈다.
+AICA_RUN="${AICA_RUN:-/NHNHOME/WORKSPACE/26molit001_dbo/kevin/work/dabeeo/aica/.run}"
+DUMMY_AS_FREE="${DUMMY_AS_FREE:-1}"
+declare -A GPU_NOTE=()
+probe_free_gpus() {   # → FREE_IDS[], N_FREE, GPU_NOTE[]
+    FREE_IDS=(); GPU_NOTE=()
+    local -A BUS2IDX=() PIDS=()
+    local i b p used dummy foreign
+    while IFS=', ' read -r i b; do BUS2IDX[$b]=$i; done \
+        < <(nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader,nounits)
+    while IFS=', ' read -r b p; do [ -n "${p:-}" ] && PIDS[${BUS2IDX[$b]:-x}]+="$p "; done \
+        < <(nvidia-smi --query-compute-apps=gpu_bus_id,pid --format=csv,noheader,nounits)
+    while IFS=', ' read -r i used; do
+        if [ "$used" -lt 500 ]; then FREE_IDS+=("$i"); GPU_NOTE[$i]="free"; continue; fi
+        dummy=$(cat "${AICA_RUN}/gpu$i" 2>/dev/null | tr -d '[:space:]')
+        foreign=0; for p in ${PIDS[$i]:-}; do [ "$p" = "$dummy" ] || foreign=1; done
+        if [ "${DUMMY_AS_FREE}" = 1 ] && [ -n "$dummy" ] && [ $foreign -eq 0 ]; then
+            FREE_IDS+=("$i"); GPU_NOTE[$i]="dummy(${dummy})"
+        else
+            GPU_NOTE[$i]="busy(${PIDS[$i]:-?})"
+        fi
+    done < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits)
     N_FREE=${#FREE_IDS[@]}
 }
+gpu_note_line() { local i o=""; for i in $(printf '%s\n' "${!GPU_NOTE[@]}" | sort -n); do o+="$i:${GPU_NOTE[$i]} "; done; echo "$o"; }
 echo "GPU 상태:"; nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader | sed 's/^/  /'
 probe_free_gpus
+echo "판정: $(gpu_note_line)"
 if ${WAIT_MODE}; then
     # 대기 모드: 빈 카드 ≥ WAIT_GPUS 될 때까지 WAIT_INTERVAL 마다 재판정, MAX_WAIT_H 초과 시 rc=3
     [ "${WAIT_GPUS}" -ge 2 ] || { echo "!!! WAIT_GPUS=${WAIT_GPUS} (<2)"; exit 2; }
     WAIT_T0=$(date +%s); WAIT_MAX_S=$(awk "BEGIN{print int(${MAX_WAIT_H}*3600)}")
     echo "[wait] 대기 모드: 빈 카드 ≥${WAIT_GPUS}장 대기, ${WAIT_INTERVAL}s 간격, 최대 ${MAX_WAIT_H}h ($(date))"
     while [ "${N_FREE}" -lt "${WAIT_GPUS}" ]; do
-        echo "[wait] $(date '+%m/%d %H:%M:%S') 빈 카드 ${N_FREE}장 [${FREE_IDS[*]:-없음}] < ${WAIT_GPUS} — 대기"
+        echo "[wait] $(date '+%m/%d %H:%M:%S') 빈 카드 ${N_FREE}장 [${FREE_IDS[*]:-없음}] < ${WAIT_GPUS} — 대기 ($(gpu_note_line))"
         if [ $(( $(date +%s) - WAIT_T0 )) -ge "${WAIT_MAX_S}" ]; then
             echo "!!! 최대 대기 ${MAX_WAIT_H}h 초과 — 종료 (rc=3)"; exit 3
         fi
@@ -84,6 +107,7 @@ export PET_MASTER_PORT="${MASTER_PORT}"          # torchrun --master_port 의 en
 
 echo "============================================"
 echo "=== LET IT CRASH RUN (B200 venv): ${N_USE} GPU (물리 ${GPU_IDS}) ==="
+echo "  gpu판정: $(gpu_note_line)"
 echo "  output : ${OUT}"
 echo "  env    : ${ENV_TAG}  ($(python -c 'import torch;print("torch",torch.__version__,"cuda",torch.version.cuda)'))"
 echo "  port   : ${MASTER_PORT}"
